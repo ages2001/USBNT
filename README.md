@@ -1,4 +1,4 @@
-# USBNT - USB Driver for Windows NT 3.1 / 3.5 / 3.51 / 4.0
+# USBNT - USB Driver for Windows NT 3.1 / 3.50 / 3.51 / 4.0
 
 ## Overview
 
@@ -7,8 +7,7 @@ driver file, `usbnt.sys`, runs unchanged on **NT 3.1, NT 3.5, NT 3.51 and
 NT 4.0** and covers every common USB host controller, keyboards, mice,
 tablets and mass storage, including USB 3 SuperSpeed and UAS.
 
-None of these Windows versions has USB support of its own. A Turkish user
-guide that ships with the release package is in [README.TXT](README.TXT).
+None of these Windows versions has USB support of its own.
 
 ## Why?
 
