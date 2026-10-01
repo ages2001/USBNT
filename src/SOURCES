@@ -1,0 +1,27 @@
+# NT4 DDK build file for usbnt.sys (also runs on NT 3.51).
+# In a DDK free build window: cd to this directory and run "build -cZ";
+# the driver is written to %BASEDIR%\lib\i386\free\usbnt.sys.
+
+TARGETNAME=usbnt
+TARGETPATH=$(BASEDIR)\lib
+TARGETTYPE=DRIVER
+
+INCLUDES=$(BASEDIR)\src\storage\inc;$(BASEDIR)\src\input\inc
+
+SUBSYSTEM_VERSION=3.10
+
+SOURCES=usbutil.c  \
+        dmapool.c  \
+        usbcore.c  \
+        usbhub.c   \
+        usbmsc.c   \
+        usbhid.c   \
+        hidparse.c \
+        hcxhci.c   \
+        hcehci.c   \
+        hcuhci.c   \
+        hcohci.c   \
+        ntos.c     \
+        ntmain.c   \
+        ntscsi.c   \
+        ntinput.c

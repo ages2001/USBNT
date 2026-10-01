@@ -1,0 +1,20 @@
+# Windows line endings for everything that ends up on the NT machine
+* text=auto eol=crlf
+
+# Scripts and files used by the Linux test environment keep LF
+*.sh   text eol=lf
+*.py   text eol=lf
+*.S    text eol=lf
+*.ld   text eol=lf
+*.exp  text eol=lf
+.gitattributes text eol=lf
+.gitignore     text eol=lf
+
+*.sys  binary
+*.exe  binary
+*.dll  binary
+*.png  binary
+*.img  binary
+*.iso  binary
+*.zip  binary
+*.7z   binary

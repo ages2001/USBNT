@@ -1,0 +1,11 @@
+harness/obj/
+harness/*.elf
+build/out/
+*.pyc
+__pycache__/
+*.obj
+SRC/obj/
+src/obj/
+build.log
+build.err
+build.wrn
