@@ -17,12 +17,14 @@
 typedef unsigned char   UCHAR;
 typedef unsigned short  USHORT;
 typedef unsigned long   ULONG;
+typedef unsigned long long ULONGLONG;
 typedef char            CHAR;
 typedef short           SHORT;
 typedef long            LONG;
 typedef unsigned char   BOOLEAN;
 typedef void           *PVOID;
 typedef ULONG           OS_IRQL;
+typedef ULONG           USB_UPTR;       /* integer as wide as a pointer */
 
 #ifndef TRUE
 #define TRUE  1
@@ -41,6 +43,7 @@ typedef struct _OS_EVENT {
 #include <ntddk.h>
 
 typedef KIRQL OS_IRQL;
+typedef ULONG_PTR USB_UPTR;             /* integer as wide as a pointer */
 
 typedef struct _OS_EVENT {
     KEVENT Event;
@@ -66,6 +69,7 @@ void    OsPciWrite(UCHAR Bus, UCHAR Dev, UCHAR Fn, ULONG Off, ULONG Val, int Siz
 
 /* Register access */
 void   *OsMapMmio(UCHAR Bus, ULONG Phys, ULONG Len);
+void    OsUnmapMmio(void *Va, ULONG Len);
 UCHAR   OsIn8(ULONG Port);
 USHORT  OsIn16(ULONG Port);
 ULONG   OsIn32(ULONG Port);
@@ -84,6 +88,10 @@ void    OsOut32(ULONG Port, ULONG Val);
 OS_IRQL OsLock(void);
 void    OsUnlock(OS_IRQL Irql);
 
+/* No thread switches until OsLower (short timed register sequences) */
+OS_IRQL OsRaise(void);
+void    OsLower(OS_IRQL Irql);
+
 /* Events used by the worker to wait for completions */
 void    OsEventInit(OS_EVENT *Ev);
 void    OsEventSet(OS_EVENT *Ev);
@@ -92,12 +100,21 @@ BOOLEAN OsEventWait(OS_EVENT *Ev, ULONG TimeoutMs);  /* worker context only */
 
 /* Wakes the worker (hub change, pending requests) */
 void    OsWakeWorker(void);
+BOOLEAN OsInWorker(void);                   /* running in the worker (or a single threaded host) */
 
 /* Diagnostics */
 void    OsLogStr(const char *Str);
+ULONG   OsLogRead(char *Out, ULONG Max);       /* NT: the latest log text */
 extern  ULONG UsbDebugLevel;
 
 /* Registry style configuration, returns Default when not present */
 ULONG   OsGetConfig(const char *Name, ULONG Default);
+
+/* Small binary values kept across boots (Thunderbolt device keys), worker context */
+BOOLEAN OsStoreGet(const char *Name, void *Data, ULONG Len);  /* FALSE when not there */
+BOOLEAN OsStoreSet(const char *Name, const void *Data, ULONG Len);
+
+/* Timer noise for random numbers */
+ULONGLONG OsEntropy(void);
 
 #endif

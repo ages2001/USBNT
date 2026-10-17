@@ -9,8 +9,12 @@ CC=i686-w64-mingw32-gcc
 CF="-c -O2 -march=i486 -mtune=generic -std=gnu89 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wdeclaration-after-statement \
  -fno-builtin -ffreestanding -fno-stack-protector -fno-asynchronous-unwind-tables -mno-stack-arg-probe -mno-sse -mno-mmx \
  -D_X86_=1 -DNDEBUG -I/usr/share/mingw-w64/include/ddk -I$SRC"
+# every parameter the driver reads must be in the registry table of ntos.c
+for n in $(grep -oh 'OsGetConfig("[A-Za-z0-9]*"' $SRC/*.c | sed 's/OsGetConfig("//;s/"//' | sort -u); do
+  grep -q "{ \"$n\"," $SRC/ntos.c || { echo "parameter $n is missing in the Config table of ntos.c"; exit 1; }
+done
 OBJS=""
-for f in usbutil dmapool usbcore usbhub usbmsc usbhid hidparse hcxhci hcehci hcuhci hcohci ntos ntmain ntscsi ntinput; do
+for f in usbutil dmapool usbcore usbhub usbmsc usbhid hidparse hcxhci hcehci hcuhci hcohci usbaudio ntos ntmain ntscsi ntinput ntaudio ntps2 sdcard sdhci rtsxusb rtsxpci usbvideo i2chid acpi aml gpio ptp ps2pad nvmehp tbt smbus smbtp smbtpdec; do
   $CC $CF $SRC/$f.c -o $OUT/$f.o
   OBJS="$OBJS $OUT/$f.o"
 done

@@ -31,6 +31,16 @@ typedef struct _HID_DEV {
     ULONG               BufSize;
     UCHAR               Prev[8];
     HID_MOUSE_LAYOUT    Layout;
+    HID_KBD_LAYOUT      Kbd;            /* report protocol keyboard (UseKbd) */
+    UCHAR               UseKbd;
+    UCHAR               PrevTip;
+    UCHAR               Ext;            /* not a USB device (HID over I2C) */
+    LONG                PrevX;
+    LONG                PrevY;
+    LONG                RemX;
+    LONG                RemY;
+    HID_LED_FN          LedFn;
+    void               *LedCtx;
 } HID_DEV;
 
 static HID_DEV *HidDevs[HID_MAX];
@@ -213,6 +223,49 @@ static LONG ScaleAbs(LONG v, const HID_FIELD *f)
     return (LONG)(val * 65535UL / range);
 }
 
+/* buttons 1-5 of a report (bit 0 = button 1); the buttons may come in two
+   fields and need not start at button 1 */
+static UCHAR HidButtons(const HID_MOUSE_LAYOUT *L, const UCHAR *Rep, ULONG Len)
+{
+    UCHAR b = 0;
+    int f, i;
+
+    for (f = 0; f < 2; f++) {
+        const HID_FIELD *fl = f ? &L->Buttons2 : &L->Buttons;
+        ULONG first = f ? L->Buttons2First : L->ButtonsFirst;
+        if (!fl->Valid) {
+            continue;
+        }
+        if (first == 0) {
+            first = 1;
+        }
+        for (i = 0; i < fl->Count && first + i <= 5; i++) {
+            if (HidGetField(Rep, Len, fl, (ULONG)i)) {
+                b |= (UCHAR)(1 << (first + i - 1));
+            }
+        }
+    }
+    return b;
+}
+
+/* highest button number (up to 5) of a layout */
+static ULONG HidButtonCount(const HID_MOUSE_LAYOUT *L)
+{
+    ULONG n = 0;
+    ULONG top;
+
+    if (L->Buttons.Valid) {
+        n = (L->ButtonsFirst ? L->ButtonsFirst : 1) + L->Buttons.Count - 1;
+    }
+    if (L->Buttons2.Valid) {
+        top = (L->Buttons2First ? L->Buttons2First : 1) + L->Buttons2.Count - 1;
+        if (top > n) {
+            n = top;
+        }
+    }
+    return n > 5 ? 5 : n;
+}
+
 static void MouseReport(HID_DEV *h, const UCHAR *Rep, ULONG Len)
 {
     USB_MOUSE_EVENT e;
@@ -227,7 +280,9 @@ static void MouseReport(HID_DEV *h, const UCHAR *Rep, ULONG Len)
         if (Len < 3) {
             return;
         }
-        buttons = (UCHAR)(Rep[0] & 0x07);
+        /* bits 3 and 4 are buttons 4 and 5 on the mice that have them (the
+           boot report leaves bits 3-7 to the device) */
+        buttons = (UCHAR)(Rep[0] & 0x1F);
         e.X = (CHAR)Rep[1];
         e.Y = (CHAR)Rep[2];
     } else {
@@ -239,14 +294,35 @@ static void MouseReport(HID_DEV *h, const UCHAR *Rep, ULONG Len)
             Rep++;
             Len--;
         }
-        if (l->Buttons.Valid) {
-            for (i = 0; i < l->Buttons.Count && i < 5; i++) {
-                if (HidGetField(Rep, Len, &l->Buttons, (ULONG)i)) {
-                    buttons |= (UCHAR)(1 << i);
-                }
+        buttons = HidButtons(l, Rep, Len);
+        if (l->Kind == HID_PTR_DIGITIZER) {
+            if (l->Tip.Valid && HidGetField(Rep, Len, &l->Tip, 0)) {
+                buttons |= 1;
+            }
+            if (l->Barrel.Valid && HidGetField(Rep, Len, &l->Barrel, 0)) {
+                buttons |= 2;
             }
         }
-        if (l->X.Relative) {
+        if (l->Kind == HID_PTR_TOUCHPAD) {
+            /* finger position to relative motion while the finger is down */
+            LONG x = HidGetField(Rep, Len, &l->X, 0);
+            LONG y = HidGetField(Rep, Len, &l->Y, 0);
+            UCHAR tip = (UCHAR)(l->Tip.Valid ? (HidGetField(Rep, Len, &l->Tip, 0) != 0) : 1);
+            LONG range = l->X.Max - l->X.Min;
+            if (tip && h->PrevTip && range > 0) {
+                LONG dx = (x - h->PrevX) * 1600 + h->RemX;
+                LONG dy = (y - h->PrevY) * 1600 + h->RemY;
+                e.X = dx / range;
+                e.Y = dy / range;
+                h->RemX = dx - e.X * range;
+                h->RemY = dy - e.Y * range;
+            } else {
+                h->RemX = h->RemY = 0;
+            }
+            h->PrevTip = tip;
+            h->PrevX = x;
+            h->PrevY = y;
+        } else if (l->X.Relative) {
             e.X = HidGetField(Rep, Len, &l->X, 0);
             e.Y = HidGetField(Rep, Len, &l->Y, 0);
         } else {
@@ -290,7 +366,12 @@ static void HidDone(USB_XFER *X)
     if (X->Status == USB_OK) {
         h->Errors = 0;
         if (X->Actual != 0) {
-            if (h->Kind == HID_KBD) {
+            if (h->Kind == HID_KBD && h->UseKbd) {
+                UCHAR boot[8];
+                if (HidKbdToBoot(&h->Kbd, h->Buf, X->Actual, boot)) {
+                    KbdReport(h, boot, 8);
+                }
+            } else if (h->Kind == HID_KBD) {
                 KbdReport(h, h->Buf, X->Actual);
             } else {
                 MouseReport(h, h->Buf, X->Actual);
@@ -340,8 +421,10 @@ int HidAttach(USB_DEV *Dev, const UCHAR *If, const UCHAR *End)
     UCHAR iface = If[2];
     HID_DEV *h;
     HID_MOUSE_LAYOUT layout;
+    HID_KBD_LAYOUT kbd;
     UCHAR kind = 0;
     UCHAR boot = 0;
+    UCHAR useKbd = 0;
     int slot;
     int r;
 
@@ -354,6 +437,7 @@ int HidAttach(USB_DEV *Dev, const UCHAR *If, const UCHAR *End)
         return USB_ERR_PARAM;
     }
     UsbMemSet(&layout, 0, sizeof(layout));
+    UsbMemSet(&kbd, 0, sizeof(kbd));
 
     if (sub == 1 && proto == 1) {
         kind = HID_KBD;
@@ -371,6 +455,9 @@ int HidAttach(USB_DEV *Dev, const UCHAR *If, const UCHAR *End)
                                USB_DT_REPORT << 8, iface, rlen, desc, 1000, &got);
                 if (r == USB_OK && HidParseMouse(desc, got, &layout) == USB_OK) {
                     kind = HID_MOUSE;
+                } else if (r == USB_OK && HidParseKeyboard(desc, got, &kbd) == USB_OK) {
+                    kind = HID_KBD;
+                    useKbd = 1;
                 }
                 OsFree(desc);
             }
@@ -402,6 +489,8 @@ int HidAttach(USB_DEV *Dev, const UCHAR *If, const UCHAR *End)
     h->Kind = kind;
     h->BootMode = boot;
     h->Layout = layout;
+    h->Kbd = kbd;
+    h->UseKbd = useKbd;
     h->LedSent = 0xFF;
 
     if (sub == 1) {
@@ -434,7 +523,7 @@ int HidAttach(USB_DEV *Dev, const UCHAR *If, const UCHAR *End)
         }
     }
     HidDevs[slot] = h;
-    Dev->Function |= (kind == HID_KBD) ? USB_FUNC_KEYBOARD : (!boot && !layout.X.Relative) ? USB_FUNC_TABLET : USB_FUNC_MOUSE;
+    Dev->Function |= (kind == HID_KBD) ? USB_FUNC_KEYBOARD : (!boot && !layout.X.Relative && layout.Kind != HID_PTR_TOUCHPAD) ? USB_FUNC_TABLET : USB_FUNC_MOUSE;
 
     if (kind == HID_KBD) {
         UsbLog(LOG_INFO, "device %u: keyboard\n", Dev->Index);
@@ -443,7 +532,7 @@ int HidAttach(USB_DEV *Dev, const UCHAR *If, const UCHAR *End)
     } else {
         UsbLog(LOG_INFO, "device %u: %s, %u buttons%s%s\n", Dev->Index,
                layout.X.Relative ? "mouse" : "absolute pointer",
-               layout.Buttons.Valid ? layout.Buttons.Count : 0,
+               HidButtonCount(&layout),
                layout.Wheel.Valid ? ", wheel" : "", layout.Pan.Valid ? ", pan" : "");
     }
     HidArm(h);
@@ -502,7 +591,17 @@ void HidService(void)
     hidLeds = (UCHAR)(((want & ULED_NUM) ? 1 : 0) | ((want & ULED_CAPS) ? 2 : 0) | ((want & ULED_SCROLL) ? 4 : 0));
     for (i = 0; i < HID_MAX; i++) {
         HID_DEV *h = HidDevs[i];
-        if (h == NULL || h->Gone || h->Dev->Gone) {
+        if (h == NULL || h->Gone) {
+            continue;
+        }
+        if (h->Ext) {
+            if (h->Kind == HID_KBD && h->LedSent != hidLeds && h->LedFn != NULL) {
+                h->LedSent = hidLeds;
+                h->LedFn(h->LedCtx, hidLeds);
+            }
+            continue;
+        }
+        if (h->Dev->Gone) {
             continue;
         }
         if (h->NeedService) {
@@ -515,7 +614,15 @@ void HidService(void)
             }
             HidArm(h);
         }
-        if (h->Kind == HID_KBD && h->LedSent != hidLeds) {
+        if (h->Kind == HID_KBD && h->LedSent != hidLeds && h->UseKbd) {
+            UCHAR rep[8];
+            ULONG n = HidKbdLedReport(&h->Kbd, hidLeds, rep, sizeof(rep));
+            if (n != 0) {
+                HidClassReq(h->Dev, HID_REQ_SET_REPORT, (USHORT)(0x0200 | (h->Kbd.UsesIds ? h->Kbd.LedId : 0)),
+                            h->Iface, (USHORT)n, rep);
+            }
+            h->LedSent = hidLeds;
+        } else if (h->Kind == HID_KBD && h->LedSent != hidLeds) {
             if (HidClassReq(h->Dev, HID_REQ_SET_REPORT, 0x0200, h->Iface, 1, &hidLeds) == USB_OK) {
                 h->LedSent = hidLeds;
             } else {
@@ -598,9 +705,8 @@ ULONG HidMouseButtons(void)
 
     for (i = 0; i < HID_MAX; i++) {
         HID_DEV *h = HidDevs[i];
-        if (h != NULL && h->Kind == HID_MOUSE && !h->BootMode && h->Layout.Buttons.Valid &&
-            h->Layout.Buttons.Count > n) {
-            n = h->Layout.Buttons.Count > 5 ? 5 : h->Layout.Buttons.Count;
+        if (h != NULL && h->Kind == HID_MOUSE && !h->BootMode && HidButtonCount(&h->Layout) > n) {
+            n = HidButtonCount(&h->Layout);
         }
     }
     return n;
@@ -617,4 +723,117 @@ BOOLEAN HidMouseHasWheel(void)
         }
     }
     return OsGetConfig("ReportWheel", 1) ? TRUE : FALSE;
+}
+
+/* ------------------------------------------------------------------ */
+/* keyboards and pointers that are not USB devices                     */
+
+void *HidExtAdd(UCHAR Kind, const HID_MOUSE_LAYOUT *Layout, HID_LED_FN LedFn, void *LedCtx)
+{
+    HID_DEV *h;
+    int slot;
+
+    for (slot = 0; slot < HID_MAX; slot++) {
+        if (HidDevs[slot] == NULL) {
+            break;
+        }
+    }
+    if (slot == HID_MAX) {
+        return NULL;
+    }
+    h = (HID_DEV *)OsAlloc(sizeof(HID_DEV));
+    if (h == NULL) {
+        return NULL;
+    }
+    h->Ext = 1;
+    h->Kind = (Kind == HID_EXT_KBD) ? HID_KBD : HID_MOUSE;
+    if (Layout != NULL) {
+        h->Layout = *Layout;
+    }
+    h->LedFn = LedFn;
+    h->LedCtx = LedCtx;
+    h->LedSent = 0xFF;
+    HidDevs[slot] = h;
+    OsWakeWorker();
+    return h;
+}
+
+/* a mouse report in the layout given to HidExtAdd, or a keyboard report in
+   the boot format; worker context */
+void HidExtReport(void *Handle, const UCHAR *Rep, ULONG Len)
+{
+    HID_DEV *h = (HID_DEV *)Handle;
+
+    if (h == NULL || h->Gone) {
+        return;
+    }
+    if (h->Kind == HID_KBD) {
+        KbdReport(h, Rep, Len);
+    } else {
+        MouseReport(h, Rep, Len);
+    }
+}
+
+void HidExtMouse(void *Handle, UCHAR Buttons, LONG Dx, LONG Dy, SHORT Wheel, SHORT Pan)
+{
+    HID_DEV *h = (HID_DEV *)Handle;
+    static const USHORT down[5] = { UMOU_LEFT_DOWN, UMOU_RIGHT_DOWN, UMOU_MIDDLE_DOWN, UMOU_B4_DOWN, UMOU_B5_DOWN };
+    static const USHORT up[5] = { UMOU_LEFT_UP, UMOU_RIGHT_UP, UMOU_MIDDLE_UP, UMOU_B4_UP, UMOU_B5_UP };
+    USB_MOUSE_EVENT e;
+    UCHAR diff;
+    int i;
+
+    if (h == NULL || h->Gone) {
+        return;
+    }
+    UsbMemSet(&e, 0, sizeof(e));
+    diff = (UCHAR)((Buttons ^ h->PrevButtons) & 0x1F);
+    for (i = 0; i < 5; i++) {
+        if (diff & (1 << i)) {
+            e.ButtonFlags |= (Buttons & (1 << i)) ? down[i] : up[i];
+        }
+    }
+    h->PrevButtons = (UCHAR)(Buttons & 0x1F);
+    e.X = Dx;
+    e.Y = Dy;
+    e.Wheel = Wheel;
+    e.Pan = Pan;
+    if (Wheel != 0) {
+        e.ButtonFlags |= UMOU_WHEEL;
+    }
+    if (e.ButtonFlags == 0 && Dx == 0 && Dy == 0 && Pan == 0) {
+        return;
+    }
+    OsMouseInput(&e);
+}
+
+void HidExtRemove(void *Handle)
+{
+    HID_DEV *h = (HID_DEV *)Handle;
+    int j;
+
+    if (h == NULL) {
+        return;
+    }
+    if (h->Kind == HID_KBD) {
+        UCHAR empty[8];
+        UsbMemSet(empty, 0, sizeof(empty));
+        KbdReport(h, empty, 8);
+    } else if (h->PrevButtons != 0) {
+        USB_MOUSE_EVENT e;
+        UsbMemSet(&e, 0, sizeof(e));
+        if (h->PrevButtons & 1) e.ButtonFlags |= UMOU_LEFT_UP;
+        if (h->PrevButtons & 2) e.ButtonFlags |= UMOU_RIGHT_UP;
+        if (h->PrevButtons & 4) e.ButtonFlags |= UMOU_MIDDLE_UP;
+        if (h->PrevButtons & 8) e.ButtonFlags |= UMOU_B4_UP;
+        if (h->PrevButtons & 16) e.ButtonFlags |= UMOU_B5_UP;
+        OsMouseInput(&e);
+    }
+    h->Gone = 1;
+    for (j = 0; j < HID_MAX; j++) {
+        if (HidDevs[j] == h) {
+            HidDevs[j] = NULL;
+        }
+    }
+    OsFree(h);
 }

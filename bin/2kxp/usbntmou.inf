@@ -1,0 +1,54 @@
+[Version]
+Signature="$Windows NT$"
+Class=Mouse
+ClassGUID={4D36E96F-E325-11CE-BFC1-08002BE10318}
+Provider=%USBNT%
+DriverVer=06/01/1999,1.2.0.0
+
+[SourceDisksNames.x86]
+1 = %Disk%,,,\i386
+
+[SourceDisksNames.amd64]
+1 = %Disk%,,,\amd64
+
+[SourceDisksFiles]
+usbnt.sys = 1
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[Manufacturer]
+%USBNT% = USBNT, NTamd64
+
+[USBNT]
+%Dev.Desc% = USBNT_Dev, USBNT\Mouse
+
+[USBNT.NTamd64]
+%Dev.Desc% = USBNT_Dev, USBNT\Mouse
+
+[USBNT_Dev.NT]
+CopyFiles = USBNT_Files
+
+[USBNT_Dev.NT.Services]
+AddService = usbnt, 0x00000002, USBNT_Service
+
+[USBNT_Service]
+DisplayName    = %SvcDesc%
+ServiceType    = 1
+StartType      = 0
+ErrorControl   = 1
+ServiceBinary  = %12%\usbnt.sys
+LoadOrderGroup = SCSI miniport
+AddReg         = USBNT_Params
+
+[USBNT_Params]
+HKR,Parameters,DebugLevel,0x00010003,2
+
+[USBNT_Files]
+usbnt.sys
+
+[Strings]
+USBNT = "USBNT"
+Disk = "USBNT disk"
+SvcDesc = "USBNT USB driver"
+Dev.Desc = "USBNT USB Mouse"

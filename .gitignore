@@ -9,3 +9,5 @@ src/obj/
 build.log
 build.err
 build.wrn
+dist/
+test/host/tfsdetect

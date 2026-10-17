@@ -1,0 +1,865 @@
+diff --git a/hw/i2c/smbus_rmi4tp.c b/hw/i2c/smbus_rmi4tp.c
+new file mode 100644
+index 0000000..9a2d411
+--- /dev/null
++++ b/hw/i2c/smbus_rmi4tp.c
+@@ -0,0 +1,361 @@
++/*
++ * smbus_rmi4tp.c - a Synaptics RMI4 touch pad on SMBus ("InterTouch") for
++ * the USBNT tests (Linux drivers/input/rmi4/rmi_smbus.c is the reference of
++ * the transport).
++ *
++ *   -device smbus-rmi4tp,bus=i2c,address=0x2c[,f11=on][,f3a=on]
++ *
++ * SMBus: FDh = version - 1 (SMBus version 2), 80h-87h block write = mapping
++ * table entry (RMI address, read count, write flag), 00h-07h block read /
++ * write = the RMI registers of that entry.  Register map: page description
++ * table at 00E9h down: F01 (device control, interrupt status), F12 with
++ * register descriptors (or F11 with f11=on), F30 GPIO buttons (or F3A).
++ * F12's descriptors, sensor tuning and object data are packet registers (one
++ * address, several bytes), as on real devices.
++ *
++ * Input (QEMU absolute pointer, as i2c-hid kind=ptp): the position is finger
++ * 1, put on the pad with the left button; the right button puts finger 2 300
++ * units to its right; the middle button is the pad's click (GPIO 0, low while
++ * pressed).  RMI4 InterTouch pads count Y upwards.
++ *
++ * QOM read-outs: configured (F01 control 0 bit 7), irq-enable, reports (2D
++ * data reads), map-writes, version-reads, bad (reads through an unset mapping
++ * entry, a read count other than the entry's).
++ */
++#include "qemu/osdep.h"
++#include "hw/i2c/i2c.h"
++#include "hw/i2c/smbus_slave.h"
++#include "hw/qdev-properties.h"
++#include "qemu/module.h"
++#include "qom/object.h"
++#include "ui/input.h"
++
++#define TYPE_SMBUS_RMI4TP "smbus-rmi4tp"
++OBJECT_DECLARE_SIMPLE_TYPE(Rmi4Tp, SMBUS_RMI4TP)
++
++#define MAXX        3000
++#define MAXY        2000
++#define NOBJ        5
++
++/* register addresses */
++#define F01_Q       0x00
++#define F01_CMD     0x70
++#define F01_CTRL    0x71
++#define F01_DATA    0x73
++#define F2D_Q       0x20
++#define F2D_CTRL    0x30
++#define F2D_DATA    0x40
++#define GPIO_Q      0x18
++#define GPIO_CTRL   0x78
++#define GPIO_DATA   0x7C
++
++struct Rmi4Tp {
++    SMBusDevice parent;
++    bool f11, f3a;
++    uint8_t mem[0x400];
++    struct { uint16_t addr; uint8_t count, flags, set; } map[8];
++    uint8_t out[40];
++    int out_len, out_pos;
++    uint8_t data1[NOBJ * 8];            /* F12 data 1 */
++    uint8_t irq_status;
++    int irq_2d, irq_gpio;
++    int absx, absy, buttons, last_buttons;
++    uint32_t configured, irq_enable, reports, map_writes, version_reads, bad;
++    QemuInputHandlerState *hs;
++};
++
++/* F12 register descriptors: query (register 0, 1 byte), control (register 8:
++   max X / Y, 4 bytes), data (register 1: 5 objects of 8 bytes) */
++static const uint8_t q_desc[] = { 2 }, q_pres[] = { 2, 0x01 }, q_struct[] = { 1, 0x01 };
++static const uint8_t c_desc[] = { 3 }, c_pres[] = { 2, 0x00, 0x01 }, c_struct[] = { 4, 0x01 };
++static const uint8_t d_desc[] = { 2 }, d_pres[] = { 2, 0x02 }, d_struct[] = { NOBJ * 8, 0x1F };
++
++/* the bytes of the register at addr (packet registers are longer than one) */
++static int reg_bytes(Rmi4Tp *s, uint16_t a, uint8_t *b)
++{
++    static const struct { uint16_t a; const uint8_t *p; int n; } pk[] = {
++        { F2D_Q + 1, q_desc, 1 }, { F2D_Q + 2, q_pres, 2 }, { F2D_Q + 3, q_struct, 2 },
++        { F2D_Q + 4, c_desc, 1 }, { F2D_Q + 5, c_pres, 3 }, { F2D_Q + 6, c_struct, 2 },
++        { F2D_Q + 7, d_desc, 1 }, { F2D_Q + 8, d_pres, 2 }, { F2D_Q + 9, d_struct, 2 },
++    };
++    int i;
++
++    if (!s->f11) {
++        for (i = 0; i < ARRAY_SIZE(pk); i++) {
++            if (pk[i].a == a) {
++                memcpy(b, pk[i].p, pk[i].n);
++                return pk[i].n;
++            }
++        }
++        if (a == F2D_CTRL) {                    /* control 8: sensor tuning */
++            stw_le_p(b, MAXX);
++            stw_le_p(b + 2, MAXY);
++            return 4;
++        }
++        if (a == F2D_DATA) {
++            memcpy(b, s->data1, sizeof(s->data1));
++            return sizeof(s->data1);
++        }
++    }
++    if (a == F01_DATA + 1) {
++        b[0] = s->irq_status;
++        return 1;
++    }
++    if (a == F01_DATA) {
++        b[0] = (s->mem[F01_CTRL] & 0x80) ? 0x00 : 0x80;     /* unconfigured until set up */
++        return 1;
++    }
++    b[0] = a < sizeof(s->mem) ? s->mem[a] : 0;
++    return 1;
++}
++
++static void rmi_read(Rmi4Tp *s, uint16_t a, int count)
++{
++    uint8_t tmp[64];
++    bool irq = false;
++
++    s->out_len = 0;
++    while (s->out_len < count) {
++        int n = reg_bytes(s, a, tmp), k;
++        if (a == F01_DATA + 1) irq = true;
++        if (a == F2D_DATA) s->reports++;
++        for (k = 0; k < n && s->out_len < count; k++) {
++            s->out[s->out_len++] = tmp[k];
++        }
++        a++;
++    }
++    if (irq) {
++        s->irq_status = 0;                      /* reading the status clears it */
++    }
++}
++
++static void rmi_write(Rmi4Tp *s, uint16_t a, const uint8_t *b, int n)
++{
++    int i;
++
++    for (i = 0; i < n; i++, a++) {
++        if (a < sizeof(s->mem)) {
++            s->mem[a] = b[i];
++        }
++    }
++    s->configured = (s->mem[F01_CTRL] & 0x80) != 0;
++    s->irq_enable = s->mem[F01_CTRL + 1];
++}
++
++static void update(Rmi4Tp *s)
++{
++    int x0 = s->absx * MAXX / 0x7fff, y0 = s->absy * MAXY / 0x7fff, i;
++    int on[2] = { s->buttons & 1, (s->buttons & 2) != 0 };
++    int x[2] = { x0, MIN(x0 + 300, MAXX) };
++    bool click = s->buttons & 4, was = s->last_buttons & 4;
++
++    if (s->f11) {
++        uint8_t *d = s->mem + F2D_DATA;
++        memset(d, 0, 2 + NOBJ * 5);
++        for (i = 0; i < 2; i++) {
++            int ry = MAXY - y0;
++            if (!on[i]) continue;
++            d[0] |= 1 << (2 * i);
++            d[2 + i * 5] = x[i] >> 4;
++            d[2 + i * 5 + 1] = ry >> 4;
++            d[2 + i * 5 + 2] = ((ry & 15) << 4) | (x[i] & 15);
++            d[2 + i * 5 + 3] = 0x44;
++            d[2 + i * 5 + 4] = 50;
++        }
++    } else {
++        memset(s->data1, 0, sizeof(s->data1));
++        for (i = 0; i < 2; i++) {
++            uint8_t *o = s->data1 + i * 8;
++            if (!on[i]) continue;
++            o[0] = 1;                           /* finger */
++            stw_le_p(o + 1, x[i]);
++            stw_le_p(o + 3, MAXY - y0);
++            o[5] = 50; o[6] = 4; o[7] = 4;
++        }
++    }
++    s->irq_status |= 1 << s->irq_2d;
++    if (click != was) {
++        s->mem[GPIO_DATA] = click ? 0xFE : 0xFF;
++        s->irq_status |= 1 << s->irq_gpio;
++    }
++    s->last_buttons = s->buttons;
++}
++
++static int rmi_write_data(SMBusDevice *dev, uint8_t *buf, uint8_t len)
++{
++    Rmi4Tp *s = SMBUS_RMI4TP(dev);
++    uint8_t cmd = buf[0];
++
++    s->out_len = s->out_pos = 0;
++    if (len == 1) {
++        if (cmd == 0xFD) {
++            s->out[0] = 1;                      /* SMBus version 2 */
++            s->out_len = 1;
++            s->version_reads++;
++        } else if (cmd < 8) {
++            if (!s->map[cmd].set || (s->map[cmd].flags & 1)) {
++                s->bad++;
++                return 0;
++            }
++            rmi_read(s, s->map[cmd].addr, s->map[cmd].count);
++            memmove(s->out + 1, s->out, s->out_len);
++            s->out[0] = s->map[cmd].count;      /* the block count first */
++            s->out_len++;
++        }
++        return 0;
++    }
++    if (len < 2 || buf[1] + 2 > len) {
++        s->bad++;
++        return 0;
++    }
++    if (cmd >= 0x80 && cmd < 0x88 && buf[1] == 4) {
++        int i = cmd - 0x80;
++        s->map[i].addr = lduw_le_p(buf + 2);
++        s->map[i].count = buf[4];
++        s->map[i].flags = buf[5];
++        s->map[i].set = 1;
++        s->map_writes++;
++    } else if (cmd < 8 && s->map[cmd].set && (s->map[cmd].flags & 1)) {
++        rmi_write(s, s->map[cmd].addr, buf + 2, buf[1]);
++    } else {
++        s->bad++;
++    }
++    return 0;
++}
++
++static uint8_t rmi_receive_byte(SMBusDevice *dev)
++{
++    Rmi4Tp *s = SMBUS_RMI4TP(dev);
++
++    if (s->out_pos < s->out_len) {
++        return s->out[s->out_pos++];
++    }
++    return 0xff;
++}
++
++static void rmi_event(DeviceState *dev, QemuConsole *src, InputEvent *evt)
++{
++    Rmi4Tp *s = SMBUS_RMI4TP(dev);
++    InputMoveEvent *move;
++    InputBtnEvent *btn;
++    int bit;
++
++    switch (evt->type) {
++    case INPUT_EVENT_KIND_ABS:
++        move = evt->u.abs.data;
++        if (move->axis == INPUT_AXIS_X) {
++            s->absx = move->value;
++        } else if (move->axis == INPUT_AXIS_Y) {
++            s->absy = move->value;
++        }
++        break;
++    case INPUT_EVENT_KIND_BTN:
++        btn = evt->u.btn.data;
++        bit = btn->button == INPUT_BUTTON_LEFT ? 1 : btn->button == INPUT_BUTTON_RIGHT ? 2 :
++              btn->button == INPUT_BUTTON_MIDDLE ? 4 : 0;
++        if (bit) {
++            s->buttons = btn->down ? (s->buttons | bit) : (s->buttons & ~bit);
++        }
++        break;
++    default:
++        break;
++    }
++}
++
++static void rmi_sync(DeviceState *dev)
++{
++    update(SMBUS_RMI4TP(dev));
++}
++
++static const QemuInputHandler rmi_handler = {
++    .name = "RMI4 SMBus touch pad",
++    .mask = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_ABS,
++    .event = rmi_event,
++    .sync = rmi_sync,
++};
++
++static void pdt(Rmi4Tp *s, uint16_t a, uint8_t q, uint8_t c, uint8_t ct, uint8_t d, uint8_t irqs, uint8_t fn)
++{
++    uint8_t *e = s->mem + a;
++    e[0] = q; e[1] = c; e[2] = ct; e[3] = d; e[4] = irqs; e[5] = fn;
++}
++
++static void rmi_realize(DeviceState *dev, Error **errp)
++{
++    Rmi4Tp *s = SMBUS_RMI4TP(dev);
++    static const char prod[] = "TM3053-003";
++
++    memset(s->mem, 0, sizeof(s->mem));
++    /* F01 query: manufacturer 1 (Synaptics), product id at query 11 */
++    s->mem[F01_Q] = 1;
++    memcpy(s->mem + F01_Q + 11, prod, 10);
++    pdt(s, 0xE9, F01_Q, F01_CMD, F01_CTRL, F01_DATA, 1, 0x01);
++    if (s->f11) {
++        s->mem[F2D_Q] = 0;
++        s->mem[F2D_Q + 1] = 0x10 | 4;           /* absolute data, 5 fingers */
++        s->mem[F2D_Q + 2] = 20; s->mem[F2D_Q + 3] = 12; s->mem[F2D_Q + 4] = 32;
++        stw_le_p(s->mem + F2D_CTRL + 6, MAXX);
++        stw_le_p(s->mem + F2D_CTRL + 8, MAXY);
++        pdt(s, 0xE3, F2D_Q, 0, F2D_CTRL, F2D_DATA, 1, 0x11);
++        s->irq_2d = 1;
++        s->irq_gpio = 2;
++    } else {
++        s->mem[F2D_Q] = 0x01;                   /* register descriptors */
++        pdt(s, 0xE3, F2D_Q, 0, F2D_CTRL, F2D_DATA, 2, 0x12);
++        s->irq_2d = 1;
++        s->irq_gpio = 3;
++    }
++    if (s->f3a) {
++        s->mem[GPIO_Q] = 2;                     /* 2 GPIOs */
++        s->mem[GPIO_Q + 1] = 0x01;              /* GPIO 0 exists */
++        s->mem[GPIO_CTRL + 1] = 0x00;           /* input */
++        pdt(s, 0xDD, GPIO_Q, 0, GPIO_CTRL, GPIO_DATA, 1, 0x3A);
++    } else {
++        s->mem[GPIO_Q] = 0x08;                  /* has GPIOs */
++        s->mem[GPIO_Q + 1] = 2;
++        s->mem[GPIO_CTRL + 1] = 0x00;           /* control 2: direction input */
++        s->mem[GPIO_CTRL + 2] = 0x01;           /* control 3: GPIO 0 is a button */
++        pdt(s, 0xDD, GPIO_Q, 0, GPIO_CTRL, GPIO_DATA, 1, 0x30);
++    }
++    s->mem[GPIO_DATA] = 0xFF;
++    s->hs = qemu_input_handler_register(dev, &rmi_handler);
++    qemu_input_handler_activate(s->hs);
++}
++
++static Property rmi_props[] = {
++    DEFINE_PROP_BOOL("f11", Rmi4Tp, f11, false),
++    DEFINE_PROP_BOOL("f3a", Rmi4Tp, f3a, false),
++    DEFINE_PROP_UINT32("configured", Rmi4Tp, configured, 0),
++    DEFINE_PROP_UINT32("irq-enable", Rmi4Tp, irq_enable, 0),
++    DEFINE_PROP_UINT32("reports", Rmi4Tp, reports, 0),
++    DEFINE_PROP_UINT32("map-writes", Rmi4Tp, map_writes, 0),
++    DEFINE_PROP_UINT32("version-reads", Rmi4Tp, version_reads, 0),
++    DEFINE_PROP_UINT32("bad", Rmi4Tp, bad, 0),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void rmi_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    SMBusDeviceClass *sc = SMBUS_DEVICE_CLASS(klass);
++
++    dc->realize = rmi_realize;
++    sc->write_data = rmi_write_data;
++    sc->receive_byte = rmi_receive_byte;
++    device_class_set_props(dc, rmi_props);
++    dc->desc = "Synaptics RMI4 touch pad on SMBus (test device)";
++}
++
++static const TypeInfo rmi_info = {
++    .name = TYPE_SMBUS_RMI4TP,
++    .parent = TYPE_SMBUS_DEVICE,
++    .instance_size = sizeof(Rmi4Tp),
++    .class_init = rmi_class_init,
++};
++
++static void rmi_register_types(void)
++{
++    type_register_static(&rmi_info);
++}
++
++type_init(rmi_register_types)
+diff --git a/hw/i2c/smbus_elantp.c b/hw/i2c/smbus_elantp.c
+new file mode 100644
+index 0000000..8cde9c7
+--- /dev/null
++++ b/hw/i2c/smbus_elantp.c
+@@ -0,0 +1,223 @@
++/*
++ * smbus_elantp.c - an Elan touch pad on SMBus for the USBNT tests (Linux
++ * drivers/input/mouse/elan_i2c_smbus.c and elan_i2c_core.c are the reference).
++ *
++ *   -device smbus-elantp,bus=i2c,address=0x15[,clickpad=off]
++ *
++ * Commands: A7h hello packet (5 x 55h), 20h enable, 00h block write
++ * "00 07 00 mode" (1 = absolute), A0h range, A1h firmware version, A2h
++ * traces, A3h product / SM version (bit 4: click pad), A4h resolution, A8h
++ * the report: 5Dh, touch info (bits 3-7 contact valid, bits 0-2 buttons),
++ * 5 bytes per valid contact (X 11:8 / Y 11:8, X 7:0, Y 7:0, area, pressure).
++ * Elan counts Y upwards.  The report is the current state on every read.
++ *
++ * Input as i2c-hid kind=ptp: position = finger 1 (left button), right button
++ * = finger 2 300 units to the right, middle = the click (left button bit of
++ * a click pad, the middle button otherwise).
++ *
++ * QOM read-outs: enabled, mode, reports (A8h reads), bad (A8h before the
++ * pad is enabled and in absolute mode, unknown commands).
++ */
++#include "qemu/osdep.h"
++#include "hw/i2c/i2c.h"
++#include "hw/i2c/smbus_slave.h"
++#include "hw/qdev-properties.h"
++#include "qemu/module.h"
++#include "qom/object.h"
++#include "ui/input.h"
++
++#define TYPE_SMBUS_ELANTP "smbus-elantp"
++OBJECT_DECLARE_SIMPLE_TYPE(ElanTp, SMBUS_ELANTP)
++
++#define MAXX        3200
++#define MAXY        2100
++
++struct ElanTp {
++    SMBusDevice parent;
++    bool clickpad;
++    uint8_t out[34];
++    int out_len, out_pos;
++    int absx, absy, buttons;
++    uint32_t enabled, mode, reports, bad;
++    QemuInputHandlerState *hs;
++};
++
++static void put(ElanTp *s, const uint8_t *b, int n)
++{
++    s->out[0] = n;
++    memcpy(s->out + 1, b, n);
++    s->out_len = n + 1;
++}
++
++static void report(ElanTp *s)
++{
++    uint8_t r[32];
++    int x0 = s->absx * MAXX / 0x7fff, y0 = s->absy * MAXY / 0x7fff, i, o = 2;
++    int on[2] = { s->buttons & 1, (s->buttons & 2) != 0 };
++    int x[2] = { x0, MIN(x0 + 300, MAXX) };
++
++    memset(r, 0, sizeof(r));
++    r[0] = 0x5D;
++    for (i = 0; i < 2; i++) {
++        int ey = MAXY - y0;
++        if (!on[i]) continue;
++        r[1] |= 1 << (3 + i);
++        r[o] = ((x[i] >> 4) & 0xF0) | ((ey >> 8) & 0x0F);
++        r[o + 1] = x[i] & 0xFF;
++        r[o + 2] = ey & 0xFF;
++        r[o + 3] = 0x33;
++        r[o + 4] = 40;
++        o += 5;
++    }
++    if (s->buttons & 4) {
++        r[1] |= s->clickpad ? 1 : 4;
++    }
++    put(s, r, sizeof(r));
++    s->reports++;
++}
++
++static int elan_write_data(SMBusDevice *dev, uint8_t *buf, uint8_t len)
++{
++    ElanTp *s = SMBUS_ELANTP(dev);
++    uint8_t cmd = buf[0], b[3];
++
++    s->out_len = s->out_pos = 0;
++    if (len >= 2) {
++        if (cmd == 0x00 && buf[1] == 4 && len >= 6 && buf[2] == 0x00 && buf[3] == 0x07 && buf[4] == 0x00) {
++            s->mode = buf[5];
++        } else {
++            s->bad++;
++        }
++        return 0;
++    }
++    switch (cmd) {
++    case 0x20:
++        s->enabled = 1;
++        break;
++    case 0x21:
++        s->enabled = 0;
++        break;
++    case 0xA7: {
++        static const uint8_t hello[5] = { 0x55, 0x55, 0x55, 0x55, 0x55 };
++        put(s, hello, 5);
++        break;
++    }
++    case 0xA0:
++        b[0] = ((MAXX >> 8) & 0x0F) | ((MAXY >> 4) & 0xF0);
++        b[1] = MAXX & 0xFF;
++        b[2] = MAXY & 0xFF;
++        put(s, b, 3);
++        break;
++    case 0xA1:
++        b[0] = 0; b[1] = 0; b[2] = 0x22;
++        put(s, b, 3);
++        break;
++    case 0xA2:
++        b[0] = 0; b[1] = 26; b[2] = 16;
++        put(s, b, 3);
++        break;
++    case 0xA3:
++        b[0] = s->clickpad ? 0x10 : 0x00; b[1] = 0x0E; b[2] = 0;
++        put(s, b, 3);
++        break;
++    case 0xA4:
++        b[0] = 0; b[1] = 0x33; b[2] = 0;
++        put(s, b, 3);
++        break;
++    case 0xA8:
++        if (!s->enabled || !(s->mode & 1)) {
++            s->bad++;
++        }
++        report(s);
++        break;
++    default:
++        s->bad++;
++        break;
++    }
++    return 0;
++}
++
++static uint8_t elan_receive_byte(SMBusDevice *dev)
++{
++    ElanTp *s = SMBUS_ELANTP(dev);
++
++    return s->out_pos < s->out_len ? s->out[s->out_pos++] : 0xff;
++}
++
++static void elan_event(DeviceState *dev, QemuConsole *src, InputEvent *evt)
++{
++    ElanTp *s = SMBUS_ELANTP(dev);
++    InputMoveEvent *move;
++    InputBtnEvent *btn;
++    int bit;
++
++    switch (evt->type) {
++    case INPUT_EVENT_KIND_ABS:
++        move = evt->u.abs.data;
++        if (move->axis == INPUT_AXIS_X) {
++            s->absx = move->value;
++        } else if (move->axis == INPUT_AXIS_Y) {
++            s->absy = move->value;
++        }
++        break;
++    case INPUT_EVENT_KIND_BTN:
++        btn = evt->u.btn.data;
++        bit = btn->button == INPUT_BUTTON_LEFT ? 1 : btn->button == INPUT_BUTTON_RIGHT ? 2 :
++              btn->button == INPUT_BUTTON_MIDDLE ? 4 : 0;
++        if (bit) {
++            s->buttons = btn->down ? (s->buttons | bit) : (s->buttons & ~bit);
++        }
++        break;
++    default:
++        break;
++    }
++}
++
++static const QemuInputHandler elan_handler = {
++    .name = "Elan SMBus touch pad",
++    .mask = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_ABS,
++    .event = elan_event,
++};
++
++static void elan_realize(DeviceState *dev, Error **errp)
++{
++    ElanTp *s = SMBUS_ELANTP(dev);
++
++    s->hs = qemu_input_handler_register(dev, &elan_handler);
++    qemu_input_handler_activate(s->hs);
++}
++
++static Property elan_props[] = {
++    DEFINE_PROP_BOOL("clickpad", ElanTp, clickpad, true),
++    DEFINE_PROP_UINT32("enabled", ElanTp, enabled, 0),
++    DEFINE_PROP_UINT32("mode", ElanTp, mode, 0),
++    DEFINE_PROP_UINT32("reports", ElanTp, reports, 0),
++    DEFINE_PROP_UINT32("bad", ElanTp, bad, 0),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void elan_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    SMBusDeviceClass *sc = SMBUS_DEVICE_CLASS(klass);
++
++    dc->realize = elan_realize;
++    sc->write_data = elan_write_data;
++    sc->receive_byte = elan_receive_byte;
++    device_class_set_props(dc, elan_props);
++    dc->desc = "Elan touch pad on SMBus (test device)";
++}
++
++static const TypeInfo elan_info = {
++    .name = TYPE_SMBUS_ELANTP,
++    .parent = TYPE_SMBUS_DEVICE,
++    .instance_size = sizeof(ElanTp),
++    .class_init = elan_class_init,
++};
++
++static void elan_register_types(void)
++{
++    type_register_static(&elan_info);
++}
++
++type_init(elan_register_types)
+diff --git a/hw/i2c/smbus_fch.c b/hw/i2c/smbus_fch.c
+new file mode 100644
+index 0000000..b5b3465
+--- /dev/null
++++ b/hw/i2c/smbus_fch.c
+@@ -0,0 +1,256 @@
++/*
++ * smbus_fch.c - the SMBus host of an AMD FCH ("KERNCZ", PCI 1022:790B) for
++ * the USBNT tests, as Linux drivers/i2c/busses/i2c-piix4.c drives it.
++ *
++ *   -device amd-fch-smbus,addr=14.0[,rev=0x59]
++ *
++ * Power management registers: indexed I/O at 0CD6h / 0CD7h and, from
++ * revision 51h on, memory at FED80300h.  PM 00h bit 4 = SMBus on, PM 01h =
++ * I/O base 15:8 (revisions 49h and later); PM 2Ch / 2Dh = base and enable bit
++ * (older); PM 02h bits 4:3 = the port of the multiplexed main SMBus.  Two
++ * ports with an I2C bus each: "fchsmb0", "fchsmb1".
++ *
++ * SMBus registers at 0B00h with PIIX4 semantics: a transfer runs at the start
++ * bit, status 01h busy, 02h done, 04h no answer; block data through DAT0 (the
++ * count) and BLKDAT (reading HSTCNT puts its index to 0).  SMBSLVCNT (08h)
++ * bit 4 = the host semaphore (written 1: taken when free), bit 5 written 1 =
++ * given back.
++ *
++ * QOM read-outs: transactions, bad (a transfer without the semaphore, the
++ * semaphore given back with another port selected than before it was taken),
++ * port (the current selection).
++ */
++#include "qemu/osdep.h"
++#include "hw/pci/pci_device.h"
++#include "hw/i2c/i2c.h"
++#include "hw/i2c/smbus_master.h"
++#include "hw/qdev-properties.h"
++#include "exec/address-spaces.h"
++#include "qemu/module.h"
++#include "qom/object.h"
++
++#define TYPE_AMD_FCH_SMBUS "amd-fch-smbus"
++OBJECT_DECLARE_SIMPLE_TYPE(FchSmbus, AMD_FCH_SMBUS)
++
++#define SMB_BASE    0x0B00
++
++struct FchSmbus {
++    PCIDevice parent;
++    uint8_t rev;
++    uint8_t pm[256];
++    uint8_t pm_idx;
++    MemoryRegion pm_io, pm_mem, smb_io;
++    I2CBus *bus[2];
++    uint8_t sts, cnt, cmd, add, dat0, dat1, blk[32], idx;
++    uint8_t own, own_port;
++    uint32_t transactions, bad, port;
++};
++
++static uint64_t pm_io_read(void *opaque, hwaddr a, unsigned size)
++{
++    FchSmbus *s = opaque;
++    return a == 0 ? s->pm_idx : s->pm[s->pm_idx];
++}
++
++static void pm_io_write(void *opaque, hwaddr a, uint64_t v, unsigned size)
++{
++    FchSmbus *s = opaque;
++    if (a == 0) {
++        s->pm_idx = v;
++    } else {
++        s->pm[s->pm_idx] = v;
++    }
++    s->port = (s->pm[0x02] >> 3) & 3;
++}
++
++static const MemoryRegionOps pm_io_ops = {
++    .read = pm_io_read,
++    .write = pm_io_write,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 1,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
++static uint64_t pm_mem_read(void *opaque, hwaddr a, unsigned size)
++{
++    FchSmbus *s = opaque;
++    return s->pm[a & 0xFF];
++}
++
++static void pm_mem_write(void *opaque, hwaddr a, uint64_t v, unsigned size)
++{
++    FchSmbus *s = opaque;
++    s->pm[a & 0xFF] = v;
++    s->port = (s->pm[0x02] >> 3) & 3;
++}
++
++static const MemoryRegionOps pm_mem_ops = {
++    .read = pm_mem_read,
++    .write = pm_mem_write,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 1,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
++static void transfer(FchSmbus *s)
++{
++    I2CBus *bus = s->bus[s->port & 1];
++    uint8_t addr = s->add >> 1, rd = s->add & 1, prot = (s->cnt >> 2) & 7;
++    int r = -1;
++
++    s->transactions++;
++    if (!s->own) {
++        s->bad++;
++    }
++    switch (prot) {
++    case 0:
++        r = smbus_quick_command(bus, addr, rd);
++        break;
++    case 1:
++        if (rd) {
++            r = smbus_receive_byte(bus, addr);
++            if (r >= 0) s->dat0 = r;
++        } else {
++            r = smbus_send_byte(bus, addr, s->cmd);
++        }
++        break;
++    case 2:
++        if (rd) {
++            r = smbus_read_byte(bus, addr, s->cmd);
++            if (r >= 0) s->dat0 = r;
++        } else {
++            r = smbus_write_byte(bus, addr, s->cmd, s->dat0);
++        }
++        break;
++    case 5:
++        if (rd) {
++            r = smbus_read_block(bus, addr, s->cmd, s->blk, sizeof(s->blk), true, true);
++            if (r > 0) s->dat0 = r; else r = -1;
++        } else {
++            r = smbus_write_block(bus, addr, s->cmd, s->blk, MIN(s->dat0, 32), true);
++        }
++        break;
++    default:
++        break;
++    }
++    s->idx = 0;
++    s->sts = r < 0 ? 0x04 : 0x02;
++}
++
++static uint64_t smb_read(void *opaque, hwaddr a, unsigned size)
++{
++    FchSmbus *s = opaque;
++
++    switch (a) {
++    case 0: return s->sts;
++    case 2: s->idx = 0; return s->cnt & 0x1F;
++    case 3: return s->cmd;
++    case 4: return s->add;
++    case 5: return s->dat0;
++    case 6: return s->dat1;
++    case 7: return s->blk[s->idx++ & 31];
++    case 8: return s->own ? 0x10 : 0x00;
++    default: return 0;
++    }
++}
++
++static void smb_write(void *opaque, hwaddr a, uint64_t v, unsigned size)
++{
++    FchSmbus *s = opaque;
++
++    switch (a) {
++    case 0: s->sts &= ~v; break;
++    case 2:
++        s->cnt = v & ~0x40;
++        if (v & 0x40) transfer(s);
++        break;
++    case 3: s->cmd = v; break;
++    case 4: s->add = v; break;
++    case 5: s->dat0 = v; break;
++    case 6: s->dat1 = v; break;
++    case 7: s->blk[s->idx++ & 31] = v; break;
++    case 8:
++        if ((v & 0x10) && !s->own) {
++            s->own = 1;
++            s->own_port = s->port;
++        }
++        if ((v & 0x20) && s->own) {
++            if (s->port != s->own_port) {
++                s->bad++;                       /* the port must be put back */
++            }
++            s->own = 0;
++        }
++        break;
++    default:
++        break;
++    }
++}
++
++static const MemoryRegionOps smb_ops = {
++    .read = smb_read,
++    .write = smb_write,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 1,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
++static void fch_realize(PCIDevice *pd, Error **errp)
++{
++    FchSmbus *s = AMD_FCH_SMBUS(pd);
++
++    pci_config_set_revision(pd->config, s->rev);
++    memset(s->pm, 0, sizeof(s->pm));
++    s->pm[0x00] = 0x10;                         /* SMBus on (49h and later) */
++    s->pm[0x01] = SMB_BASE >> 8;
++    s->pm[0x2C] = (SMB_BASE & 0xE0) | 0x01;     /* older revisions */
++    s->pm[0x2D] = SMB_BASE >> 8;
++    s->bus[0] = i2c_init_bus(DEVICE(pd), "fchsmb0");
++    s->bus[1] = i2c_init_bus(DEVICE(pd), "fchsmb1");
++    memory_region_init_io(&s->pm_io, OBJECT(pd), &pm_io_ops, s, "fch-pm-idx", 2);
++    memory_region_add_subregion(pci_address_space_io(pd), 0xCD6, &s->pm_io);
++    memory_region_init_io(&s->smb_io, OBJECT(pd), &smb_ops, s, "fch-smbus", 16);
++    memory_region_add_subregion(pci_address_space_io(pd), SMB_BASE, &s->smb_io);
++    if (s->rev >= 0x51) {
++        memory_region_init_io(&s->pm_mem, OBJECT(pd), &pm_mem_ops, s, "fch-pm", 0x100);
++        memory_region_add_subregion(get_system_memory(), 0xFED80300, &s->pm_mem);
++    }
++}
++
++static Property fch_props[] = {
++    DEFINE_PROP_UINT8("rev", FchSmbus, rev, 0x59),
++    DEFINE_PROP_UINT32("transactions", FchSmbus, transactions, 0),
++    DEFINE_PROP_UINT32("bad", FchSmbus, bad, 0),
++    DEFINE_PROP_UINT32("port", FchSmbus, port, 0),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void fch_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
++
++    k->realize = fch_realize;
++    k->vendor_id = 0x1022;
++    k->device_id = 0x790B;
++    k->class_id = 0x0C05;
++    device_class_set_props(dc, fch_props);
++    dc->desc = "AMD FCH SMBus host (test device)";
++}
++
++static const TypeInfo fch_info = {
++    .name = TYPE_AMD_FCH_SMBUS,
++    .parent = TYPE_PCI_DEVICE,
++    .instance_size = sizeof(FchSmbus),
++    .class_init = fch_class_init,
++    .interfaces = (InterfaceInfo[]) {
++        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
++        { },
++    },
++};
++
++static void fch_register_types(void)
++{
++    type_register_static(&fch_info);
++}
++
++type_init(fch_register_types)
+diff --git a/hw/i2c/meson.build b/hw/i2c/meson.build
+--- a/hw/i2c/meson.build
++++ b/hw/i2c/meson.build
+@@ -22,1 +22,3 @@
++i2c_ss.add(when: 'CONFIG_SMBUS', if_true: files('smbus_rmi4tp.c', 'smbus_elantp.c'))
++i2c_ss.add(when: ['CONFIG_SMBUS', 'CONFIG_PCI'], if_true: files('smbus_fch.c'))
+ system_ss.add_all(when: 'CONFIG_I2C', if_true: i2c_ss)

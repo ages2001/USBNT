@@ -6,11 +6,15 @@
  */
 
 #include "devmap.h"
+#include <commdlg.h>
+#include "fsdetect.h"
+#include "pnpeject.h"
 
 #define ID_LIST         100
 #define ID_INFO         101
 #define ID_REFRESH      102
 #define ID_EJECT        103
+#define ID_REPORT       104
 #define WM_TREE_CHANGED (WM_USER + 1)
 
 #define ITEM_NONE       0
@@ -18,6 +22,7 @@
 #define ITEM_DEV        2
 #define ITEM_SLOT       3
 #define ITEM_PORT       4
+#define ITEM_EXTRA      5
 #define ITEM(kind, n)   (((DWORD)(kind) << 16) | (DWORD)(n))
 #define ITEM_KIND(v)    ((int)((v) >> 16))
 #define ITEM_NUM(v)     ((int)((v) & 0xFFFF))
@@ -32,10 +37,12 @@ static HWND MainWnd;
 static HWND ListWnd;
 static HWND InfoWnd;
 static HWND RefreshBtn;
-static HWND EjectBtn;
+static HWND EjectBtn, ReportBtn;
 static HFONT Font;
+static HBITMAP IconBmp, MaskBmp;
 static HANDLE Dev;
-static USBNT_TREE Tree;
+static USBNT_TREE2 Tree2;
+#define Tree (Tree2.Base)
 static BOOL TreeValid;
 static DEV_SLOT_MAP Map[USBNT_MAX_SLOTS];
 static BOOL MapDone;
@@ -236,6 +243,7 @@ static const char *ProtoName(int Proto)
     case 0x62: return "UAS";
     case 0x00:
     case 0x01: return "CBI";
+    case 0xFE: return "SD card reader (PCI / vendor USB)";
     default:   return "?";
     }
 }
@@ -248,6 +256,9 @@ static void Functions(char *Out, const USBNT_DEV_INFO *d)
     if (d->Functions & USBNT_FUNC_MOUSE) lstrcatA(Out, "Mouse, ");
     if (d->Functions & USBNT_FUNC_TABLET) lstrcatA(Out, "Tablet, ");
     if (d->Functions & USBNT_FUNC_STORAGE) lstrcatA(Out, "Storage, ");
+    if (d->Functions & USBNT_FUNC_AUDIO) lstrcatA(Out, "Audio, ");
+    if (d->Functions & USBNT_FUNC_MIDI) lstrcatA(Out, "MIDI, ");
+    if (d->Functions & USBNT_FUNC_VIDEO) lstrcatA(Out, "Camera, ");
     if (Out[0] == 0) {
         lstrcpyA(Out, "No driver");
     } else {
@@ -272,17 +283,71 @@ static void DevName(char *Out, const USBNT_DEV_INFO *d)
 /* Volumes                                                              */
 /* ------------------------------------------------------------------ */
 
+/* file systems found on the media themselves, cached per slot until the tree changes */
+#define MAX_PARTS 8
+static FS_PART Parts[USBNT_MAX_SLOTS][MAX_PARTS];
+static int PartCount[USBNT_MAX_SLOTS];
+static ULONG PartKey[USBNT_MAX_SLOTS];          /* ChangeCount + 1 of the detection, 0 = none */
+
+static int SlotParts(int Slot)
+{
+    USBNT_SLOT_INFO *si = &Tree.Slot[Slot];
+    ULONG key = Tree.ChangeCount + 1;
+    if (!si->Present || !si->MediaReady) {
+        PartKey[Slot] = 0;
+        return -1;
+    }
+    if (PartKey[Slot] != key) {
+        PartCount[Slot] = FsDetectSlot(Tree.ScsiPort, (ULONG)Slot, si->BlockSize, si->LastLba, Parts[Slot], MAX_PARTS);
+        PartKey[Slot] = key;
+    }
+    return PartCount[Slot];
+}
+
+/* file system of the first partition with a recognised one, "" if none */
+static const char *SlotFs(int Slot)
+{
+    int i, n = SlotParts(Slot);
+    for (i = 0; i < n; i++)
+        if (lstrcmpA(Parts[Slot][i].Fs, "unknown") && lstrcmpA(Parts[Slot][i].Fs, "unreadable")) return Parts[Slot][i].Fs;
+    return n > 0 ? Parts[Slot][0].Fs : "";
+}
+
 static char SlotLetter(int Slot)
 {
+    char l[27];
+
     if (!MapDone) {
         DevMapSlots(Tree.ScsiPort, Map, USBNT_MAX_SLOTS);
         MapDone = TRUE;
     }
+    if (DevMapSlotLetters(&Map[Slot], l, NULL, 26) > 0) {
+        return l[0];                            /* the lowest partition with a letter */
+    }
     return DevMapLetter(Map[Slot].Path);
 }
 
+/* "D: E: F:" - every drive letter on the slot's disk, "" if fewer than two */
+static const char *SlotMoreLetters(int Slot, int *Count)
+{
+    static char text[80];
+    char l[27];
+    int n, i;
+
+    SlotLetter(Slot);
+    n = DevMapSlotLetters(&Map[Slot], l, NULL, 26);
+    text[0] = 0;
+    for (i = 0; i < n && n > 1; i++) {
+        wsprintfA(text + lstrlenA(text), "%s%c:", i ? " " : "", l[i]);
+    }
+    if (Count != NULL) {
+        *Count = n;
+    }
+    return text;
+}
+
 /* One line about the volume on a drive letter, Detail adds more lines */
-static void VolumeText(char Letter, char *Short, BOOL Detail)
+static void VolumeText(char Letter, char *Short, BOOL Detail, const char *RawFs)
 {
     char root[4];
     char label[64];
@@ -300,12 +365,22 @@ static void VolumeText(char Letter, char *Short, BOOL Detail)
     label[0] = 0;
     fs[0] = 0;
     if (!GetVolumeInformationA(root, label, sizeof(label), &serial, &maxlen, &flags, fs, sizeof(fs))) {
-        wsprintfA(Short, "%c: no medium or unknown file system", Letter);
+        if (RawFs && RawFs[0])
+            wsprintfA(Short, "%c: %s (no Windows driver mounted it)", Letter, RawFs);
+        else
+            wsprintfA(Short, "%c: no medium or unknown file system", Letter);
         if (Detail) {
             Line("Drive letter:   %c:", Letter);
-            Line("Volume:         not mounted (no medium or unknown file system)");
+            Line("Volume:         not mounted (no medium or no driver for the file system)");
         }
         return;
+    }
+    /* the file system as found on the medium (with its version) beats the name the
+       driver reports ("Unknown", "FAT" for FAT32, no NTFS version, ...) */
+    if (RawFs && RawFs[0] && lstrcmpA(RawFs, "unknown") && lstrcmpA(RawFs, "unreadable")) {
+        int k;
+        for (k = 0; k < (int)sizeof(fs) - 1 && RawFs[k]; k++) fs[k] = RawFs[k];
+        fs[k] = 0;
     }
     GetDiskFreeSpaceA(root, &spc, &bps, &freec, &total);
     clus = spc * bps;
@@ -379,7 +454,14 @@ static void AddSlots(int DevIndex, int Depth)
         }
         letter = SlotLetter((int)s);
         if (letter != 0) {
-            VolumeText(letter, vol, FALSE);
+            int nl = 0;
+            const char *more = SlotMoreLetters((int)s, &nl);
+            VolumeText(letter, vol, FALSE, SlotFs((int)s));
+            if (nl > 1) {
+                wsprintfA(vol + lstrlenA(vol), " (partitions: %s)", more);
+            }
+        } else if (SlotFs((int)s)[0]) {
+            wsprintfA(vol, "%s, no drive letter", SlotFs((int)s));
         } else {
             lstrcpyA(vol, "no drive letter");
         }
@@ -409,6 +491,107 @@ static void AddDevice(int Index, int Depth)
     }
 }
 
+/* card readers that are not USB devices, HID over I2C */
+static int Has(const char *S, const char *W);
+
+/* disk slots that are not on a USB port: card readers (Kind READER), NVMe drives (Kind NVME) */
+static void AddExtraSlots(UCHAR Kind, const char *Head)
+{
+    ULONG e;
+    BOOL head = FALSE;
+
+    for (e = 0; e < Tree2.ExtraCount && e < USBNT_MAX_EXTRA; e++) {
+        USBNT_EXTRA_INFO *x = &Tree2.Extra[e];
+        USBNT_SLOT_INFO *si;
+        char vol[160], v[12], p[20];
+        char letter;
+        if (x->Kind != Kind || x->Slot >= USBNT_MAX_SLOTS) {
+            continue;
+        }
+        if (!head) {
+            Add(ITEM(ITEM_NONE, 0), "%s", Head);
+            head = TRUE;
+        }
+        si = &Tree.Slot[x->Slot];
+        Trim(v, si->Vendor, 8);
+        Trim(p, si->Product, 16);
+        letter = SlotLetter(x->Slot);
+        if (!si->MediaReady || si->BlockSize == 0) {
+            lstrcpyA(vol, Kind == USBNT_EXTRA_NVME ? "shut down" : "no card");
+        } else if (letter != 0) {
+            int nl = 0;
+            const char *more = SlotMoreLetters(x->Slot, &nl);
+            VolumeText(letter, vol, FALSE, SlotFs(x->Slot));
+            if (nl > 1) {
+                wsprintfA(vol + lstrlenA(vol), " (partitions: %s)", more);
+            }
+        } else if (SlotFs(x->Slot)[0]) {
+            wsprintfA(vol, "%s, no drive letter", SlotFs(x->Slot));
+        } else {
+            lstrcpyA(vol, "no drive letter");
+        }
+        if (Kind == USBNT_EXTRA_NVME) {
+            Add(ITEM(ITEM_SLOT, x->Slot), "    %s: %s", x->Name, vol);
+        } else {
+            Add(ITEM(ITEM_SLOT, x->Slot), "    %s: %s - %s", x->Name, vol, p);
+        }
+    }
+}
+
+/* card readers and NVMe drives that are not USB devices, Thunderbolt, HID over I2C */
+static void AddExtra(void)
+{
+    ULONG e;
+    BOOL head = FALSE;
+
+    AddExtraSlots(USBNT_EXTRA_READER, "SD card readers");
+    AddExtraSlots(USBNT_EXTRA_NVME, "NVMe drives (Thunderbolt / USB4, PCIe hot plug)");
+    head = FALSE;
+    for (e = 0; e < Tree2.ExtraCount && e < USBNT_MAX_EXTRA; e++) {
+        USBNT_EXTRA_INFO *x = &Tree2.Extra[e];
+        if (x->Kind != USBNT_EXTRA_TBT) {
+            continue;
+        }
+        if (!head) {
+            Add(ITEM(ITEM_NONE, 0), "Thunderbolt / USB4");
+            head = TRUE;
+        }
+        Add(ITEM(ITEM_EXTRA, e), "%s%s", Has(x->Name, "host") ? "    " : "        ", x->Name);
+    }
+    head = FALSE;
+    for (e = 0; e < Tree2.ExtraCount && e < USBNT_MAX_EXTRA; e++) {
+        USBNT_EXTRA_INFO *x = &Tree2.Extra[e];
+        if (x->Kind != USBNT_EXTRA_I2C_CTRL && x->Kind != USBNT_EXTRA_I2C_HID) {
+            continue;
+        }
+        if (!head) {
+            Add(ITEM(ITEM_NONE, 0), "HID over I2C and SMBus (touch pads, touch screens)");
+            head = TRUE;
+        }
+        Add(ITEM(ITEM_EXTRA, e), "%s%s", x->Kind == USBNT_EXTRA_I2C_CTRL ? "    " : "        ", x->Name);
+    }
+}
+
+static void ExtraDetails(int e)
+{
+    USBNT_EXTRA_INFO *x = &Tree2.Extra[e];
+    char line[200];
+    int i = 0, k = 0;
+
+    Line("%s", x->Name);
+    for (;;) {
+        char ch = x->Detail[i++];
+        if (ch == '\n' || ch == 0) {
+            line[k] = 0;
+            if (k) Line("%s", line);
+            k = 0;
+            if (ch == 0) break;
+        } else if (k < (int)sizeof(line) - 1) {
+            line[k++] = ch;
+        }
+    }
+}
+
 static void FillList(void)
 {
     LRESULT sel = SendMessageA(ListWnd, LB_GETCURSEL, 0, 0);
@@ -420,7 +603,7 @@ static void FillList(void)
 
     SendMessageA(ListWnd, WM_SETREDRAW, FALSE, 0);
     SendMessageA(ListWnd, LB_RESETCONTENT, 0, 0);
-    TreeValid = DevMapQueryTree(Dev, &Tree);
+    TreeValid = DevMapQueryTree2(Dev, &Tree2);
     if (!TreeValid) {
         Add(ITEM(ITEM_NONE, 0), "The USB driver (usbnt.sys) does not answer.");
     } else {
@@ -428,7 +611,8 @@ static void FillList(void)
             USBNT_HC_INFO *hc = &Tree.Hc[h];
             Add(ITEM(ITEM_HC, h), "%s - %s %04X:%04X at %02X:%02X.%u, %u ports%s", HcName(hc->Type),
                 PciVendor(hc->VendorId), hc->VendorId, hc->DeviceId, hc->Bus, hc->Device, hc->Function,
-                hc->NumPorts, hc->Running ? "" : " (not running)");
+                hc->NumPorts, hc->Running == 2 ? " (unplugged)" : hc->Running == 3 ? " (hot plugged, polled)" :
+                hc->Running ? "" : " (not running)");
             for (p = 1; p <= hc->NumPorts; p++) {
                 BOOL used = FALSE;
                 for (i = 0; i < USBNT_MAX_DEVS; i++) {
@@ -447,6 +631,7 @@ static void FillList(void)
                 }
             }
         }
+        AddExtra();
     }
     count = (int)SendMessageA(ListWnd, LB_GETCOUNT, 0, 0);
     for (i = 0; i < count; i++) {
@@ -473,7 +658,8 @@ static void HcDetails(int h)
     Line("PCI location:   bus %u, device %u, function %u", hc->Bus, hc->Device, hc->Function);
     Line("Interrupt line: %u", hc->Irq);
     Line("Root ports:     %u", hc->NumPorts);
-    Line("State:          %s", hc->Running ? "running" : "not running");
+    Line("State:          %s", hc->Running == 2 ? "unplugged" : hc->Running == 3 ? "running, hot plugged (polled)" :
+         hc->Running ? "running" : "not running");
     if (hc->Companion != 0xFF) {
         Line("Companion of:   controller %u (EHCI); low and full speed devices on its ports", hc->Companion);
     }
@@ -555,9 +741,32 @@ static void SlotDetails(int s)
     letter = SlotLetter(s);
     if (letter != 0) {
         char dummy[160];
-        VolumeText(letter, dummy, TRUE);
+        int nl = 0;
+        const char *more = SlotMoreLetters(s, &nl);
+        VolumeText(letter, dummy, TRUE, SlotFs(s));
+        if (nl > 1) {
+            Line("Drive letters:  %s (one per partition)", more);
+        }
     } else {
         Line("Drive letter:   none");
+    }
+    {
+        int i, n = SlotParts(s);
+        if (n == 0) {
+            Line("Partitions:     none found");
+        } else if (n > 0) {
+            Line("Partitions:     %d (%s)", n, Parts[s][0].Scheme);
+            for (i = 0; i < n; i++) {
+                FS_PART *p = &Parts[s][i];
+                char sz[32];
+                SizeText(sz, Mul((ULONG)p->Length, si->BlockSize ? si->BlockSize : 512));
+                if (p->Length > 0xFFFFFFFFUL) lstrcpyA(sz, "> 2 TB");
+                Line("  %d: %-30s %s%s%s%s%s", i + 1, p->Fs, sz, p->Label[0] ? ", label " : "", p->Label,
+                     p->PartName[0] ? ", " : "", p->PartName);
+                if (p->MbrType && p->MbrType != 0xEE)
+                    Line("     MBR type %02X, starts at block %lu", p->MbrType, (ULONG)p->Start);
+            }
+        }
     }
 }
 
@@ -585,6 +794,11 @@ static void ShowDetails(void)
         case ITEM_PORT:
             Line("Port %u of controller %u: nothing connected", ITEM_NUM(item) & 0xFF, ITEM_NUM(item) >> 8);
             break;
+        case ITEM_EXTRA:
+            if (ITEM_NUM(item) < USBNT_MAX_EXTRA) {
+                ExtraDetails(ITEM_NUM(item));
+            }
+            break;
         default:
             break;
         }
@@ -596,11 +810,40 @@ static void ShowDetails(void)
 static BOOL EjectSlot(DWORD slot)
 {
     char letter;
-    char msg[160];
+    char msg[400];
     DWORD got = 0;
 
     letter = SlotLetter((int)slot);
-    if (letter != 0) {
+    if ((GetVersion() & 0x80000000) == 0 && (GetVersion() & 0xFF) >= 5) {
+        /* Windows 2000 / XP: the way of Safely Remove Hardware */
+        char veto[300];
+        int r = PnpEjectSlot(slot, veto, sizeof(veto));
+        if (r == 0) {
+            if (letter != 0) {
+                wsprintfA(msg, "Windows cannot stop drive %c: now: %s.\nClose the files and windows on it and try again.",
+                          letter, veto);
+            } else {
+                wsprintfA(msg, "Windows cannot stop the disk now: %s.", veto);
+            }
+            MessageBoxA(MainWnd, msg, "USB Devices", MB_OK | MB_ICONEXCLAMATION);
+            return FALSE;
+        }
+        if (r == 1) {
+            return TRUE;
+        }
+    }
+    if (letter != 0 && slot < USBNT_MAX_SLOTS && Map[slot].Disk >= 0) {
+        /* every partition of the disk */
+        DEV_LOCKED locked;
+        char busy = DevMapLockSlot(&Map[slot], FALSE, 10, &locked);
+        if (busy != 0) {
+            wsprintfA(msg, "Drive %c: is in use. Close the files and windows on it and try again.", busy);
+            MessageBoxA(MainWnd, msg, "USB Devices", MB_OK | MB_ICONEXCLAMATION);
+            return FALSE;
+        }
+        DeviceIoControl(Dev, IOCTL_USBNT_EJECT, &slot, sizeof(slot), NULL, 0, &got, NULL);
+        DevMapUnlock(&locked);
+    } else if (letter != 0) {
         char path[8];
         HANDLE vol;
         int i;
@@ -707,20 +950,181 @@ static void Layout(int W, int H)
     }
     MoveWindow(RefreshBtn, 4, H - btnH - 4, 90, btnH, TRUE);
     MoveWindow(EjectBtn, 100, H - btnH - 4, 130, btnH, TRUE);
+    MoveWindow(ReportBtn, 236, H - btnH - 4, 130, btnH, TRUE);
+}
+
+/* ------------------------------------------------------------------ */
+/* Pictures in the list                                                 */
+/* ------------------------------------------------------------------ */
+
+/* the 16x16 pictures of treeicons.bmp, in this order */
+enum { G_HC, G_HUB, G_STICK, G_DISK, G_KBD, G_MOUSE, G_TABLET, G_CAM, G_AUDIO, G_MIDI, G_SD, G_READER, G_PORT,
+       G_TOUCHPAD, G_I2C, G_PLUG, G_NVME, G_TBT };
+
+static int Has(const char *S, const char *W)
+{
+    int i, k;
+    for (i = 0; S[i]; i++) {
+        for (k = 0; W[k] && S[i + k]; k++) {
+            char a = S[i + k], b = W[k];
+            if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+            if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+            if (a != b) break;
+        }
+        if (!W[k]) return 1;
+    }
+    return 0;
+}
+
+static int ItemPicture(DWORD Item, const char *Text)
+{
+    int n = ITEM_NUM(Item);
+    ULONG e;
+    switch (ITEM_KIND(Item)) {
+    case ITEM_HC:
+        return G_HC;
+    case ITEM_PORT:
+        return G_PORT;
+    case ITEM_SLOT:
+        for (e = 0; e < Tree2.ExtraCount && e < USBNT_MAX_EXTRA; e++)
+            if (Tree2.Extra[e].Slot == n && Tree2.Extra[e].Kind == USBNT_EXTRA_READER) return G_SD;
+            else if (Tree2.Extra[e].Slot == n && Tree2.Extra[e].Kind == USBNT_EXTRA_NVME) return G_NVME;
+        return Has(Text, "SD") || Has(Text, "card") ? G_SD : G_DISK;
+    case ITEM_EXTRA:
+        if (Tree2.Extra[n].Kind == USBNT_EXTRA_I2C_CTRL) return G_I2C;
+        if (Tree2.Extra[n].Kind == USBNT_EXTRA_TBT) return Has(Tree2.Extra[n].Name, "host") ? G_TBT : G_PLUG;
+        if (Has(Tree2.Extra[n].Name, "keyboard")) return G_KBD;
+        if (Has(Tree2.Extra[n].Name, "screen") || Has(Tree2.Extra[n].Name, "pen")) return G_TABLET;
+        return G_TOUCHPAD;
+    case ITEM_DEV: {
+        UCHAR f = Tree.Dev[n].Functions;
+        if (f & USBNT_FUNC_HUB) return G_HUB;
+        if (f & USBNT_FUNC_VIDEO) return G_CAM;
+        if (f & USBNT_FUNC_STORAGE) return Has(Text, "card") || Has(Text, "CRW") ? G_READER : G_STICK;
+        if (f & USBNT_FUNC_KEYBOARD) return G_KBD;
+        if (f & USBNT_FUNC_TABLET) return G_TABLET;
+        if (f & USBNT_FUNC_MOUSE) return G_MOUSE;
+        if (f & USBNT_FUNC_AUDIO) return G_AUDIO;
+        if (f & USBNT_FUNC_MIDI) return G_MIDI;
+        return G_PLUG;
+    }
+    default:
+        if (Has(Text, "SD card readers")) return G_READER;
+        if (Has(Text, "HID over I2C")) return G_TOUCHPAD;
+        return -1;
+    }
+}
+
+static int ListLineHeight(void)
+{
+    HDC dc = GetDC(NULL);
+    TEXTMETRICA tm;
+    HGDIOBJ old = SelectObject(dc, GetStockObject(ANSI_FIXED_FONT));
+    int h;
+    GetTextMetricsA(dc, &tm);
+    SelectObject(dc, old);
+    ReleaseDC(NULL, dc);
+    h = tm.tmHeight + 2;
+    return h < 18 ? 18 : h;
+}
+
+static void DrawListItem(DRAWITEMSTRUCT *Di)
+{
+    char text[512];
+    int len, sp = 0, x, pic;
+    HDC dc = Di->hDC;
+    RECT rc = Di->rcItem;
+    BOOL sel = (Di->itemState & ODS_SELECTED) != 0;
+    TEXTMETRICA tm;
+    HGDIOBJ oldFont;
+
+    if (Di->itemID == (UINT)-1) {
+        if (Di->itemState & ODS_FOCUS) DrawFocusRect(dc, &rc);
+        return;
+    }
+    len = (int)SendMessageA(ListWnd, LB_GETTEXT, Di->itemID, (LPARAM)text);
+    if (len < 0) len = 0;
+    text[len] = 0;
+    oldFont = SelectObject(dc, Font ? (HGDIOBJ)Font : GetStockObject(ANSI_FIXED_FONT));
+    GetTextMetricsA(dc, &tm);
+    {
+        HBRUSH br = CreateSolidBrush(GetSysColor(sel ? COLOR_HIGHLIGHT : COLOR_WINDOW));
+        FillRect(dc, &rc, br);
+        DeleteObject(br);
+    }
+    while (text[sp] == ' ') sp++;
+    x = rc.left + 2 + sp * tm.tmAveCharWidth;
+    pic = ItemPicture((DWORD)Di->itemData, text);
+    if (pic >= 0 && IconBmp && MaskBmp) {
+        HDC mem = CreateCompatibleDC(dc);
+        int y = rc.top + (rc.bottom - rc.top - 16) / 2;
+        HGDIOBJ old = SelectObject(mem, MaskBmp);
+        COLORREF ob = SetBkColor(dc, RGB(255, 255, 255)), ot = SetTextColor(dc, RGB(0, 0, 0));
+        BitBlt(dc, x, y, 16, 16, mem, pic * 16, 0, SRCAND);
+        SetBkColor(dc, ob);
+        SetTextColor(dc, ot);
+        SelectObject(mem, IconBmp);
+        BitBlt(dc, x, y, 16, 16, mem, pic * 16, 0, SRCPAINT);
+        SelectObject(mem, old);
+        DeleteDC(mem);
+        x += 20;
+    } else if (sp == 0) {
+        x += 0;
+    }
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, GetSysColor(sel ? COLOR_HIGHLIGHTTEXT : COLOR_WINDOWTEXT));
+    TextOutA(dc, x, rc.top + (rc.bottom - rc.top - tm.tmHeight) / 2, text + sp, len - sp);
+    SelectObject(dc, oldFont);
+    if (Di->itemState & ODS_FOCUS) DrawFocusRect(dc, &rc);
+}
+
+static BOOL WriteReport(const char *path);
+
+/* "Save report...": the same file as usbtree /dump, for a bug report */
+static void SaveReport(void)
+{
+    OPENFILENAMEA ofn;
+    char name[MAX_PATH], msg[MAX_PATH + 80];
+    lstrcpyA(name, "USBNT.TXT");
+    {
+        char *z = (char *)&ofn;
+        unsigned k;
+        for (k = 0; k < sizeof(ofn); k++) z[k] = 0;
+    }
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = MainWnd;
+    ofn.lpstrFilter = "Text files (*.TXT)\0*.TXT\0All files\0*.*\0";
+    ofn.lpstrFile = name;
+    ofn.nMaxFile = sizeof(name);
+    ofn.lpstrTitle = "Save the USB report (devices, details and the driver log)";
+    ofn.lpstrDefExt = "TXT";
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_OVERWRITEPROMPT;
+    if (!GetSaveFileNameA(&ofn)) return;
+    if (WriteReport(name)) {
+        wsprintfA(msg, "Saved to %s.", name);
+        MessageBoxA(MainWnd, msg, "USB Devices", MB_OK | MB_ICONINFORMATION);
+    } else {
+        wsprintfA(msg, "Cannot write %s.", name);
+        MessageBoxA(MainWnd, msg, "USB Devices", MB_OK | MB_ICONSTOP);
+    }
 }
 
 static LRESULT CALLBACK WndProc(HWND Wnd, UINT Msg, WPARAM W, LPARAM L)
 {
     switch (Msg) {
     case WM_CREATE:
+        IconBmp = LoadBitmapA(Inst, MAKEINTRESOURCEA(100));
+        MaskBmp = LoadBitmapA(Inst, MAKEINTRESOURCEA(101));
         ListWnd = CreateWindowA("LISTBOX", "", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | WS_HSCROLL |
-                                LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, 0, 0, 10, 10, Wnd, (HMENU)ID_LIST, Inst, NULL);
+                                LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS, 0, 0, 10, 10, Wnd, (HMENU)ID_LIST, Inst, NULL);
         InfoWnd = CreateWindowA("EDIT", "", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | ES_MULTILINE |
                                 ES_READONLY | ES_AUTOVSCROLL, 0, 0, 10, 10, Wnd, (HMENU)ID_INFO, Inst, NULL);
         RefreshBtn = CreateWindowA("BUTTON", "&Refresh", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 10, 10, Wnd,
                                    (HMENU)ID_REFRESH, Inst, NULL);
         EjectBtn = CreateWindowA("BUTTON", "&Safe removal", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 10, 10, Wnd,
                                  (HMENU)ID_EJECT, Inst, NULL);
+        ReportBtn = CreateWindowA("BUTTON", "Save re&port...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 10, 10,
+                                  Wnd, (HMENU)ID_REPORT, Inst, NULL);
         {
             /* loaded at run time so the tools build needs no gdi32.lib */
             typedef HGDIOBJ (WINAPI *GET_STOCK)(int);
@@ -731,6 +1135,17 @@ static LRESULT CALLBACK WndProc(HWND Wnd, UINT Msg, WPARAM W, LPARAM L)
         SendMessageA(InfoWnd, WM_SETFONT, (WPARAM)Font, 0);
         SendMessageA(ListWnd, LB_SETHORIZONTALEXTENT, 1600, 0);
         return 0;
+    case WM_MEASUREITEM: {
+        MEASUREITEMSTRUCT *mi = (MEASUREITEMSTRUCT *)L;
+        mi->itemHeight = (UINT)ListLineHeight();
+        return TRUE;
+    }
+    case WM_DRAWITEM:
+        if (((DRAWITEMSTRUCT *)L)->CtlID == ID_LIST) {
+            DrawListItem((DRAWITEMSTRUCT *)L);
+            return TRUE;
+        }
+        return DefWindowProcA(Wnd, Msg, W, L);
     case WM_SIZE:
         Layout(LOWORD(L), HIWORD(L));
         return 0;
@@ -749,6 +1164,9 @@ static LRESULT CALLBACK WndProc(HWND Wnd, UINT Msg, WPARAM W, LPARAM L)
         case ID_EJECT:
             Eject();
             break;
+        case ID_REPORT:
+            SaveReport();
+            break;
         default:
             break;
         }
@@ -763,6 +1181,85 @@ static LRESULT CALLBACK WndProc(HWND Wnd, UINT Msg, WPARAM W, LPARAM L)
     default:
         return DefWindowProcA(Wnd, Msg, W, L);
     }
+}
+
+/* usbtree /dump FILE: writes the list and the details of every line to FILE
+   and exits (tests, bug reports) */
+static BOOL WriteReport(const char *path);
+
+static void DumpIfAsked(void)
+{
+    const char *cl = GetCommandLineA();
+    const char *p = cl;
+    char path[MAX_PATH];
+    int n;
+
+    while (*p && !(p[0] == '/' && (p[1] == 'd' || p[1] == 'D') && (p[2] == 'u' || p[2] == 'U'))) {
+        p++;
+    }
+    if (*p == 0) {
+        return;
+    }
+    while (*p && *p != ' ') p++;
+    while (*p == ' ') p++;
+    for (n = 0; *p && *p != ' ' && n < MAX_PATH - 1; n++) {
+        path[n] = *p++;
+    }
+    path[n] = 0;
+    ExitProcess(WriteReport(path) ? 0 : 2);
+}
+
+/* everything usbtree shows, every detail and the driver's log, into a text file */
+static BOOL WriteReport(const char *path)
+{
+    HANDLE f;
+    int i, count;
+    DWORD w;
+    char line[300];
+    LRESULT sel = SendMessageA(ListWnd, LB_GETCURSEL, 0, 0);
+
+    f = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) {
+        return FALSE;
+    }
+    count = (int)SendMessageA(ListWnd, LB_GETCOUNT, 0, 0);
+    for (i = 0; i < count; i++) {
+        line[0] = 0;
+        SendMessageA(ListWnd, LB_GETTEXT, (WPARAM)i, (LPARAM)line);
+        lstrcatA(line, "\r\n");
+        WriteFile(f, line, (DWORD)lstrlenA(line), &w, NULL);
+    }
+    for (i = 0; i < count; i++) {
+        SendMessageA(ListWnd, LB_SETCURSEL, (WPARAM)i, 0);
+        ShowDetails();
+        if (Text[0]) {
+            wsprintfA(line, "--- line %d\r\n", i);
+            WriteFile(f, line, (DWORD)lstrlenA(line), &w, NULL);
+            WriteFile(f, Text, (DWORD)lstrlenA(Text), &w, NULL);
+        }
+    }
+    {
+        /* the driver's log (the latest 32 KB) */
+        static char log[32768 + 1];
+        DWORD n = 0;
+        if (DeviceIoControl(Dev, IOCTL_USBNT_GET_LOG, NULL, 0, log, sizeof(log) - 1, &n, NULL) && n != 0) {
+            static const char head[] = "\r\n==== usbnt.sys log ====\r\n";
+            DWORD k, a = 0;
+            WriteFile(f, head, sizeof(head) - 1, &w, NULL);
+            for (k = 0; k < n; k++) {
+                if (log[k] == '\n') {                       /* CR LF for Notepad */
+                    WriteFile(f, log + a, k - a, &w, NULL);
+                    WriteFile(f, "\r\n", 2, &w, NULL);
+                    a = k + 1;
+                }
+            }
+            if (a < n) WriteFile(f, log + a, n - a, &w, NULL);
+        }
+    }
+    CloseHandle(f);
+    SendMessageA(ListWnd, LB_SETCURSEL, (WPARAM)sel, 0);
+    ShowDetails();
+    return TRUE;
 }
 
 void __stdcall Entry(void)
@@ -784,7 +1281,7 @@ void __stdcall Entry(void)
     wc.cbClsExtra = 0;
     wc.cbWndExtra = 0;
     wc.hInstance = Inst;
-    wc.hIcon = LoadIconA(NULL, IDI_APPLICATION);
+    wc.hIcon = LoadIconA(Inst, MAKEINTRESOURCEA(1));
     wc.hCursor = LoadCursorA(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.lpszMenuName = NULL;
@@ -800,6 +1297,7 @@ void __stdcall Entry(void)
     }
     FillList();
     ShowDetails();
+    DumpIfAsked();
     ShowWindow(MainWnd, SW_SHOWNORMAL);
     UpdateWindow(MainWnd);
     CreateThread(NULL, 0, ChangeThread, NULL, 0, &tid);
@@ -813,6 +1311,10 @@ void __stdcall Entry(void)
             if (IsWindowEnabled(EjectBtn)) {
                 SendMessageA(MainWnd, WM_COMMAND, ID_EJECT, 0);
             }
+            continue;
+        }
+        if (msg.message == WM_SYSCHAR && (msg.wParam == 'p' || msg.wParam == 'P')) {
+            SendMessageA(MainWnd, WM_COMMAND, ID_REPORT, 0);
             continue;
         }
         if (msg.message == WM_KEYDOWN && msg.wParam == VK_F5) {

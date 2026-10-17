@@ -14,6 +14,7 @@
 #include <kbdmou.h>
 #include "usbntioc.h"
 
+#ifndef USB_WDM
 /*
  * One binary for NT 3.1 to 4.0: only kernel and HAL entry points that every
  * one of these versions exports. The DDK headers route several calls to the
@@ -33,6 +34,7 @@
 #undef InterlockedIncrement
 #undef InterlockedDecrement
 #undef InterlockedExchange
+#undef ObDereferenceObject
 
 __declspec(dllimport) VOID NTAPI KeAcquireSpinLock(PKSPIN_LOCK SpinLock, PKIRQL OldIrql);
 __declspec(dllimport) VOID NTAPI KeReleaseSpinLock(PKSPIN_LOCK SpinLock, KIRQL NewIrql);
@@ -40,6 +42,7 @@ __declspec(dllimport) VOID NTAPI KeRaiseIrql(KIRQL NewIrql, PKIRQL OldIrql);
 __declspec(dllimport) VOID NTAPI KeLowerIrql(KIRQL NewIrql);
 __declspec(dllimport) VOID NTAPI IoCompleteRequest(PIRP Irp, CCHAR PriorityBoost);
 __declspec(dllimport) VOID NTAPI KeQueryTickCount(PLARGE_INTEGER TickCount);
+__declspec(dllimport) LONG NTAPI ObDereferenceObject(PVOID Object);     /* NT 3.1 has no ObfDereferenceObject */
 
 LONG    NtAtomicAdd(LONG volatile *Value, LONG Delta);
 LONG    NtAtomicSwap(LONG volatile *Value, LONG New);
@@ -53,6 +56,11 @@ PDRIVER_CANCEL NtSetCancelRoutine(PIRP Irp, PDRIVER_CANCEL Routine);
 #define InterlockedDecrement(p)     NtAtomicAdd((LONG volatile *)(p), -1)
 #define InterlockedExchange(p, v)   NtAtomicSwap((LONG volatile *)(p), (LONG)(v))
 #define IoSetCancelRoutine(Irp, R)  NtSetCancelRoutine((Irp), (R))
+#else
+LONG    NtAtomicAdd(LONG volatile *Value, LONG Delta);
+LONG    NtAtomicSwap(LONG volatile *Value, LONG New);
+PDRIVER_CANCEL NtSetCancelRoutine(PIRP Irp, PDRIVER_CANCEL Routine);
+#endif
 
 /* values missing from older DDK headers */
 #ifndef SRB_FUNCTION_REMOVE_DEVICE
@@ -81,6 +89,7 @@ PDRIVER_CANCEL NtSetCancelRoutine(PIRP Irp, PDRIVER_CANCEL Routine);
 #define EXT_KBD         2
 #define EXT_MOUSE       3
 #define EXT_CTL         4
+#define EXT_AUDIO       5
 
 typedef struct _NT_EXT {
     ULONG           Kind;
@@ -90,11 +99,13 @@ typedef struct _NT_EXT {
 
 /* ntos.c */
 void    NtOsInit(PUNICODE_STRING RegistryPath);
+void    NtReloadConfig(void);
 void    NtKernelInit(PDRIVER_OBJECT Drv);
 PVOID   NtKernelExport(const char *Name);
 PVOID   NtHalExport(const char *Name);
 extern  UNICODE_STRING NtRegistryPath;
 extern  KEVENT NtWorkerEvent;
+extern  PKTHREAD NtWorkerThread;
 
 /* ntscsi.c */
 NTSTATUS NtScsiCreate(PDRIVER_OBJECT Drv);
@@ -103,11 +114,32 @@ NTSTATUS NtScsiSrb(PDEVICE_OBJECT Dev, PIRP Irp);
 NTSTATUS NtCtlEject(ULONG Slot);
 extern ULONG NtScsiPortNumber;
 
+/* ntaudio.c */
+NTSTATUS NtAudioCreate(PDRIVER_OBJECT Drv);
+NTSTATUS NtAudioInternal(PDEVICE_OBJECT Dev, PIRP Irp);
+
 /* ntinput.c */
 NTSTATUS NtInputCreate(PDRIVER_OBJECT Drv);
+void    NtInputDestroy(void);
+void    NtInputService(void);           /* worker: USB keys for another keyboard's class driver */
+BOOLEAN NtQueryDword(const WCHAR *Path, const WCHAR *Name, ULONG *Out);
+
+/* ntps2.c - PS/2 keyboard and mouse */
+void    NtPs2Init(void);
+BOOLEAN NtPs2Wanted(void);
+void    NtPs2Poll(void);
+void    NtPs2Service(void);
+void    NtPs2SetLeds(ULONG NtIndicators);
+void    NtPs2SetTypematic(ULONG DelayMs, ULONG RateCps);
+BOOLEAN NtPs2MouseWheel(void);
+ULONG   NtPs2MouseButtons(void);
+BOOLEAN NtPs2Keyboard(void);
+BOOLEAN NtPs2Mouse(void);
 NTSTATUS NtInputIoctl(PDEVICE_OBJECT Dev, PIRP Irp);
 NTSTATUS NtCtlIoctl(PDEVICE_OBJECT Dev, PIRP Irp);
 void     NtCtlCreateClose(PDEVICE_OBJECT Dev, PIRP Irp, BOOLEAN Create);
 void     NtCtlCleanup(PDEVICE_OBJECT Dev, PIRP Irp);
+
+PDRIVER_OBJECT NtRefDriver(const WCHAR *Name);   /* \\Driver\\name, referenced (NT 4.0 and later) */
 
 #endif

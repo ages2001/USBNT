@@ -126,7 +126,8 @@ void *OsAlloc(ULONG Size)
 {
     ULONG p = (HeapPtr + 15) & ~15UL;
 
-    if (p + Size > HeapEnd) {
+    if (p + Size > HeapEnd || p + Size < p) {
+        HarnessPrintf("harness: OsAlloc(%u) failed, heap at %08x\n", Size, HeapPtr);
         return NULL;
     }
     HeapPtr = p + Size;
@@ -143,7 +144,8 @@ void *OsDmaAlloc(ULONG Size, ULONG *Phys)
 {
     ULONG p = (HeapPtr + 4095) & ~4095UL;
 
-    if (p + Size > HeapEnd) {
+    if (p + Size > HeapEnd || p + Size < p) {
+        HarnessPrintf("harness: OsDmaAlloc(%u) failed, heap at %08x\n", Size, HeapPtr);
         return NULL;
     }
     HeapPtr = p + Size;
@@ -234,6 +236,8 @@ void *OsMapMmio(UCHAR Bus, ULONG Phys, ULONG Len)
     return (void *)Phys;
 }
 
+void OsUnmapMmio(void *Va, ULONG Len) { (void)Va; (void)Len; }
+
 UCHAR OsIn8(ULONG Port) { return inb((unsigned short)Port); }
 USHORT OsIn16(ULONG Port) { return inw((unsigned short)Port); }
 ULONG OsIn32(ULONG Port) { return inl((unsigned short)Port); }
@@ -247,6 +251,16 @@ OS_IRQL OsLock(void)
 }
 
 void OsUnlock(OS_IRQL Irql)
+{
+    (void)Irql;
+}
+
+OS_IRQL OsRaise(void)
+{
+    return 0;
+}
+
+void OsLower(OS_IRQL Irql)
 {
     (void)Irql;
 }
@@ -285,6 +299,11 @@ BOOLEAN OsEventWait(OS_EVENT *Ev, ULONG TimeoutMs)
     }
 }
 
+BOOLEAN OsInWorker(void)
+{
+    return TRUE;
+}
+
 void OsWakeWorker(void)
 {
     HarnessWorkerWake = 1;
@@ -295,6 +314,7 @@ static struct {
     ULONG Value;
     int Set;
 } Config[16];
+static char ConfigNames[16][32];
 
 void HarnessSetConfig(const char *Name, ULONG Value)
 {
@@ -316,7 +336,12 @@ void HarnessSetConfig(const char *Name, ULONG Value)
     }
     for (i = 0; i < 16; i++) {
         if (!Config[i].Set) {
-            Config[i].Name = Name;
+            int n;
+            for (n = 0; n < 31 && Name[n]; n++) {
+                ConfigNames[i][n] = Name[n];
+            }
+            ConfigNames[i][n] = 0;
+            Config[i].Name = ConfigNames[i];
             Config[i].Value = Value;
             Config[i].Set = 1;
             return;
@@ -344,3 +369,62 @@ ULONG OsGetConfig(const char *Name, ULONG Default)
     return Default;
 }
 void OsNotifyChange(void) { }
+
+/* kept in memory for the run (QEMU tests replug a device in one boot) */
+static struct {
+    char Name[40];
+    UCHAR Data[32];
+    ULONG Len;
+} Store[8];
+
+static ULONG StoreLen(const char *S)
+{
+    ULONG n = 0;
+
+    while (S[n]) {
+        n++;
+    }
+    return n;
+}
+
+BOOLEAN OsStoreGet(const char *Name, void *Data, ULONG Len)
+{
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        if (Store[i].Len == Len && UsbMemCmp(Store[i].Name, Name, StoreLen(Name) + 1) == 0) {
+            UsbMemCpy(Data, Store[i].Data, Len);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+BOOLEAN OsStoreSet(const char *Name, const void *Data, ULONG Len)
+{
+    int i;
+    ULONG n = StoreLen(Name);
+
+    if (Len > 32 || n >= 40) {
+        return FALSE;
+    }
+    for (i = 0; i < 8; i++) {
+        if (Store[i].Len == 0 || UsbMemCmp(Store[i].Name, Name, n + 1) == 0) {
+            UsbMemCpy(Store[i].Name, Name, n + 1);
+            UsbMemCpy(Store[i].Data, Data, Len);
+            Store[i].Len = Len;
+            HarnessPrintf("harness: stored %s\n", Name);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+ULONGLONG OsEntropy(void)
+{
+    ULONG lo, hi;
+
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((ULONGLONG)hi << 32) | lo;
+}
+void OsScsiMediaChange(int Slot) { (void)Slot; }

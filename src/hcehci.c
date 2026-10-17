@@ -62,6 +62,7 @@
 #define TOK_PID_OUT         (0UL << 8)
 #define TOK_PID_IN          (1UL << 8)
 #define TOK_PID_SETUP       (2UL << 8)
+#define TOK_PID_MASK        (3UL << 8)
 #define TOK_CERR3           (3UL << 10)
 #define TOK_IOC             0x00008000
 #define TOK_TOGGLE          0x80000000
@@ -97,7 +98,38 @@ typedef struct _EHC {
     EQH         IntHead;
     BOOLEAN     UseIrq;
     BOOLEAN     HasCompanions;
+    ULONG     **IsoFirst;       /* first isochronous descriptor of every frame list slot */
+    ULONG       UfExt;          /* 32 bit microframe counter */
+    ULONG       UfRaw;
+    struct _EISO *IsoList;
 } EHC;
+
+/*
+ * Isochronous pipe: a ring of iTDs (high speed) or siTDs (full speed
+ * behind a transaction translator) linked straight into the frame list in
+ * front of the interrupt QH. Dwords 24.. of each descriptor hold software
+ * state.
+ */
+#define EISO_DESC       128
+#define ISO_DESC_SIZE   128
+#define SW_NEXT(t)      (*(ULONG **)&(t)[30])  /* pointer: words 30-31 (8 byte aligned) */
+#define SW_FRAME(t)     ((t)[25])
+#define SW_FIRST(t)     ((t)[26])       /* first packet */
+#define SW_COUNT(t)     ((t)[27])       /* packets */
+#define SW_SLOT(t)      ((t)[28])       /* microframe of the first packet (iTD) */
+#define SW_LINKED(t)    ((t)[29])
+
+typedef struct _EISO {
+    USB_PIPE   *Pipe;
+    BOOLEAN     Split;
+    BOOLEAN     Started;
+    UCHAR       Pad[2];
+    ULONG      *Td[EISO_DESC];
+    ULONG       TdPhys[EISO_DESC];
+    ULONG       Head;
+    ULONG       Used;
+    struct _EISO *Next;
+} EISO;
 
 #define EHCP(hc)    ((EHC *)(hc)->Priv)
 
@@ -187,6 +219,12 @@ static void QhUnlink(EHC *e, EQH *q)
         AsyncWaitAdvance(e);
     }
 }
+
+/* an inactive qTD: the alternate next pointer of IN qTDs points here, so a short
+   packet ends the transfer instead of letting the controller go on with the
+   following qTDs (it would read the next transfer's data into this buffer) */
+static ULONG *StopTd;
+static ULONG StopTdPhys;
 
 static void QhIdle(EQH *q, BOOLEAN ResetToggle)
 {
@@ -340,8 +378,17 @@ static int EhciStart(USB_HC *Hc)
         return USB_ERR_IO;
     }
 
+    if (StopTd == NULL) {
+        StopTd = (ULONG *)UsbDmaAlloc(64, &StopTdPhys);
+        if (StopTd != NULL) {
+            StopTd[0] = LINK_T;
+            StopTd[1] = LINK_T;
+            StopTd[2] = 0;                      /* not active */
+        }
+    }
     e->Frames = (ULONG *)UsbDmaAlloc(4096, &e->FramesPhys);
-    if (e->Frames == NULL || QhAlloc(&e->AsyncHead, 0) != USB_OK || QhAlloc(&e->IntHead, 0) != USB_OK) {
+    e->IsoFirst = (ULONG **)OsAlloc(1024 * sizeof(ULONG *));
+    if (e->Frames == NULL || e->IsoFirst == NULL || QhAlloc(&e->AsyncHead, 0) != USB_OK || QhAlloc(&e->IntHead, 0) != USB_OK) {
         return USB_ERR_NOMEM;
     }
     e->AsyncHead.Qh[0] = e->AsyncHead.QhPhys | LINK_QH;
@@ -379,6 +426,7 @@ static int EhciStart(USB_HC *Hc)
     Hc->NumPorts = (UCHAR)ports;
     Hc->MaxXfer = 0x10000;
     Hc->SgMax = 0x100000;
+    Hc->IsoOk = 1;
     if (e->HcsParams & 0x10) {
         for (i = 1; i <= ports; i++) {
             ULONG sc = OpRd(e, EOP_PORTSC(i));
@@ -502,6 +550,365 @@ static void EhciPortDisable(USB_HC *Hc, int Port)
 /* Devices and pipes                                                    */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* Isochronous                                                          */
+/* ------------------------------------------------------------------ */
+
+#define ITD_ACTIVE      0x80000000
+#define ITD_DBE         0x40000000
+#define ITD_BABBLE      0x20000000
+#define ITD_XACT        0x10000000
+#define ITD_IOC         0x00008000
+#define SITD_ACTIVE     0x80
+#define SITD_ERRMASK    0x7C
+#define SITD_IOC        0x80000000
+#define LINK_SITD       0x00000004
+
+/* lock held */
+static void UframeUpdate(EHC *e)
+{
+    ULONG raw = OpRd(e, EOP_FRINDEX) & 0x3FFF;
+
+    e->UfExt += (raw - e->UfRaw) & 0x3FFF;
+    e->UfRaw = raw;
+}
+
+static void IsoLink(EHC *e, EISO *iso, ULONG k, ULONG Frame)
+{
+    ULONG *t = iso->Td[k];
+    ULONG fi = Frame & 1023;
+
+    SW_FRAME(t) = Frame;
+    SW_NEXT(t) = e->IsoFirst[fi];
+    SW_LINKED(t) = 1;
+    t[0] = e->Frames[fi];
+    e->IsoFirst[fi] = t;
+    e->Frames[fi] = iso->TdPhys[k] | (iso->Split ? LINK_SITD : 0);
+}
+
+static void IsoUnlink(EHC *e, ULONG *t)
+{
+    ULONG fi = SW_FRAME(t) & 1023;
+    ULONG *prev = e->IsoFirst[fi];
+
+    if (!SW_LINKED(t)) {
+        return;
+    }
+    SW_LINKED(t) = 0;
+    if (prev == t) {
+        e->Frames[fi] = t[0];
+        e->IsoFirst[fi] = SW_NEXT(t);
+        return;
+    }
+    while (prev != NULL && SW_NEXT(prev) != t) {
+        prev = SW_NEXT(prev);
+    }
+    if (prev != NULL) {
+        prev[0] = t[0];
+        SW_NEXT(prev) = SW_NEXT(t);
+    }
+}
+
+static void IsoFree(EISO *iso)
+{
+    ULONG i;
+
+    for (i = 0; i < EISO_DESC; i++) {
+        if (iso->Td[i] != NULL) {
+            UsbDmaFree(iso->Td[i], ISO_DESC_SIZE);
+        }
+    }
+    OsFree(iso);
+}
+
+static int IsoOpen(EHC *e, USB_PIPE *Pipe)
+{
+    EISO *iso;
+    ULONG i;
+    OS_IRQL irql;
+
+    if (Pipe->Dev->Speed != USB_SPEED_HIGH && Pipe->Dev->TtHub == NULL) {
+        return USB_ERR_PARAM;
+    }
+    iso = (EISO *)OsAlloc(sizeof(EISO));
+    if (iso == NULL) {
+        return USB_ERR_NOMEM;
+    }
+    for (i = 0; i < EISO_DESC; i++) {
+        iso->Td[i] = (ULONG *)UsbDmaAlloc(ISO_DESC_SIZE, &iso->TdPhys[i]);
+        if (iso->Td[i] == NULL) {
+            IsoFree(iso);
+            return USB_ERR_NOMEM;
+        }
+        SW_LINKED(iso->Td[i]) = 0;
+    }
+    iso->Pipe = Pipe;
+    iso->Split = (BOOLEAN)(Pipe->Dev->Speed != USB_SPEED_HIGH);
+    Pipe->HcPriv = iso;
+    irql = OsLock();
+    iso->Next = e->IsoList;
+    e->IsoList = iso;
+    OsUnlock(irql);
+    return USB_OK;
+}
+
+static void IsoCancel(EHC *e, EISO *iso)
+{
+    OS_IRQL irql;
+    ULONG i;
+
+    if (iso == NULL) {
+        return;
+    }
+    irql = OsLock();
+    for (i = 0; i < EISO_DESC; i++) {
+        ULONG *t = iso->Td[i];
+        if (SW_LINKED(t)) {
+            if (iso->Split) {
+                t[3] &= ~SITD_ACTIVE;
+            } else {
+                ULONG k;
+                for (k = 1; k <= 8; k++) {
+                    t[k] &= ~ITD_ACTIVE;
+                }
+            }
+            IsoUnlink(e, t);
+        }
+    }
+    iso->Used = 0;
+    iso->Started = FALSE;
+    OsUnlock(irql);
+    OsSleepMs(2);
+}
+
+static void IsoClose(EHC *e, USB_PIPE *Pipe)
+{
+    EISO *iso = (EISO *)Pipe->HcPriv;
+    EISO **pp;
+    OS_IRQL irql;
+
+    IsoCancel(e, iso);
+    irql = OsLock();
+    for (pp = &e->IsoList; *pp != NULL; pp = &(*pp)->Next) {
+        if (*pp == iso) {
+            *pp = iso->Next;
+            break;
+        }
+    }
+    OsUnlock(irql);
+    Pipe->HcPriv = NULL;
+    IsoFree(iso);
+}
+
+/* number of 188 byte full speed microframe budgets a packet needs */
+static ULONG SplitCount(ULONG Len)
+{
+    ULONG n = (Len + 187) / 188;
+
+    return n ? (n > 6 ? 6 : n) : 1;
+}
+
+/* lock held; schedule positions are microframes */
+static int IsoSubmit(EHC *e, USB_XFER *X)
+{
+    USB_PIPE *p = X->Pipe;
+    EISO *iso = (EISO *)p->HcPriv;
+    ULONG per = p->IsoSlots ? p->IsoSlots : 8;
+    ULONG n = X->IsoCount;
+    ULONG start, i, ndesc = 0;
+    ULONG align;
+
+    if (iso->Split && per < 8) {
+        per = 8;
+    }
+    align = per < 8 ? per : 8;
+    UframeUpdate(e);
+    start = p->IsoNext;
+    if (!iso->Started || (LONG)(start - (e->UfExt + 16)) < 0) {
+        if (iso->Started) {
+            p->IsoLate = 1;
+        }
+        start = ((e->UfExt + 8 * USB_ISO_RESTART_FRAMES) + align - 1) & ~(align - 1);
+    }
+    if ((LONG)(start + n * per - e->UfExt) > 900 * 8) {
+        return USB_ERR_BUSY;
+    }
+    for (i = 0; i < n; i++) {
+        if (X->Iso[i].Length > (ULONG)p->MaxPacket * p->Mult) {
+            return USB_ERR_PARAM;
+        }
+    }
+
+    if (iso->Split) {
+        USB_DEV *d = p->Dev;
+        ULONG ep = d->Address | ((ULONG)p->Endpoint << 8) | ((ULONG)d->TtHub->Address << 16) |
+                   ((ULONG)d->TtPort << 24) | (p->DirIn ? 0x80000000UL : 0);
+        if (iso->Used + n > EISO_DESC) {
+            return USB_ERR_BUSY;
+        }
+        for (i = 0; i < n; i++) {
+            ULONG k = (iso->Head + i) % EISO_DESC;
+            ULONG *t = iso->Td[k];
+            USB_ISO_PACKET *pk = &X->Iso[i];
+            ULONG addr = X->Phys + pk->Offset;
+            ULONG len = pk->Length;
+            ULONG sc = SplitCount(p->DirIn ? p->MaxPacket : len);
+            ULONG mask;
+            if (p->DirIn) {
+                mask = 0x01 | ((((1UL << (sc + 2)) - 1) << 2) & 0xFC) << 8;
+            } else {
+                static const UCHAR sm[6] = { 0x01, 0x03, 0x07, 0x0F, 0x1F, 0x3F };
+                mask = sm[sc - 1];
+            }
+            t[1] = ep;
+            t[2] = mask;
+            t[3] = SITD_ACTIVE | (len << 16) | ((e->UseIrq && i + 1 == n) ? SITD_IOC : 0);
+            t[4] = addr;
+            t[5] = ((addr + 0x1000) & ~0xFFFUL) | (p->DirIn ? 0 : (((sc == 1) ? 0UL : 1UL) << 3) | sc);
+            t[6] = LINK_T;
+            t[7] = 0;
+            t[8] = 0;
+            SW_FIRST(t) = i;
+            SW_COUNT(t) = 1;
+            pk->Actual = 0;
+            pk->Status = USB_ERR_BUSY;
+            IsoLink(e, iso, k, (start + i * per) >> 3);
+        }
+        ndesc = n;
+    } else {
+        ULONG maxp = p->MaxPacket & 0x7FF;
+        i = 0;
+        while (i < n) {
+            ULONG uf = start + i * per;
+            ULONG frame = uf >> 3;
+            ULONG k = (iso->Head + ndesc) % EISO_DESC;
+            ULONG *t = iso->Td[k];
+            ULONG base = (X->Phys + X->Iso[i].Offset) & ~0xFFFUL;
+            ULONG j, pg;
+            if (iso->Used + ndesc + 1 > EISO_DESC) {
+                goto busy;
+            }
+            for (j = 1; j <= 8; j++) {
+                t[j] = 0;
+            }
+            for (pg = 0; pg < 7; pg++) {
+                t[9 + pg] = base + pg * 0x1000;
+            }
+            for (j = 16; j < 23; j++) {
+                t[j] = 0;
+            }
+            t[9] |= p->Dev->Address | ((ULONG)p->Endpoint << 8);
+            t[10] |= (p->DirIn ? 0x800 : 0) | maxp;
+            t[11] |= p->Mult;
+            SW_FIRST(t) = i;
+            SW_SLOT(t) = uf & 7;
+            j = 0;
+            while (i < n && ((start + i * per) >> 3) == frame) {
+                USB_ISO_PACKET *pk = &X->Iso[i];
+                ULONG addr = X->Phys + pk->Offset;
+                ULONG slot = (start + i * per) & 7;
+                pg = (addr >> 12) - (base >> 12);
+                if (pg > 6 || (pk->Length && ((addr + pk->Length - 1) >> 12) - (base >> 12) > 6)) {
+                    goto bad;
+                }
+                t[1 + slot] = ITD_ACTIVE | ((ULONG)pk->Length << 16) | (pg << 12) | (addr & 0xFFF) |
+                              ((e->UseIrq && i + 1 == n) ? ITD_IOC : 0);
+                pk->Actual = 0;
+                pk->Status = USB_ERR_BUSY;
+                i++;
+                j++;
+            }
+            SW_COUNT(t) = j;
+            IsoLink(e, iso, k, frame);
+            ndesc++;
+        }
+    }
+    X->Hc[0] = start;
+    X->Hc[1] = iso->Head;
+    X->Hc[2] = per;
+    X->Hc[3] = ndesc;
+    X->IsoFrame = start >> 3;
+    iso->Head = (iso->Head + ndesc) % EISO_DESC;
+    iso->Used += ndesc;
+    iso->Started = TRUE;
+    p->IsoNext = start + n * per;
+    return USB_OK;
+
+bad:
+busy:
+    /* take back the iTDs linked so far */
+    for (i = 0; i <= ndesc && i < EISO_DESC; i++) {
+        IsoUnlink(e, iso->Td[(iso->Head + i) % EISO_DESC]);
+    }
+    return USB_ERR_BUSY;
+}
+
+/* lock held: completes transfers whose last frame has passed */
+static void IsoPoll(EHC *e)
+{
+    EISO *iso;
+
+    if (e->IsoList == NULL) {
+        return;
+    }
+    UframeUpdate(e);
+    for (iso = e->IsoList; iso != NULL; iso = iso->Next) {
+        USB_PIPE *p = iso->Pipe;
+        USB_XFER *X;
+        while ((X = p->Cur) != NULL && X->Busy) {
+            ULONG n = X->IsoCount;
+            ULONG lastFrame = (X->Hc[0] + (n - 1) * X->Hc[2]) >> 3;
+            ULONG ndesc = X->Hc[3];
+            ULONG total = 0;
+            ULONG d, i;
+            if ((LONG)((e->UfExt >> 3) - (lastFrame + 2)) < 0) {
+                break;
+            }
+            for (d = 0; d < ndesc; d++) {
+                ULONG *t = iso->Td[(X->Hc[1] + d) % EISO_DESC];
+                ULONG first = SW_FIRST(t);
+                if (iso->Split) {
+                    USB_ISO_PACKET *pk = &X->Iso[first];
+                    ULONG st = t[3];
+                    if (st & SITD_ACTIVE) {
+                        t[3] = st & ~SITD_ACTIVE;
+                        pk->Status = USB_ERR_IO;
+                    } else {
+                        ULONG left = (st >> 16) & 0x3FF;
+                        pk->Actual = (USHORT)(pk->Length > left ? pk->Length - left : 0);
+                        pk->Status = (st & SITD_ERRMASK) ? ((st & 0x10) ? USB_ERR_BABBLE : USB_ERR_IO) : USB_OK;
+                    }
+                    total += pk->Actual;
+                } else {
+                    for (i = 0; i < SW_COUNT(t); i++) {
+                        USB_ISO_PACKET *pk = &X->Iso[first + i];
+                        ULONG slot = (SW_SLOT(t) + i * X->Hc[2]) & 7;
+                        ULONG st = t[1 + slot];
+                        if (st & ITD_ACTIVE) {
+                            t[1 + slot] = st & ~ITD_ACTIVE;
+                            pk->Status = USB_ERR_IO;
+                        } else if (st & (ITD_DBE | ITD_BABBLE | ITD_XACT)) {
+                            pk->Status = (st & ITD_BABBLE) ? USB_ERR_BABBLE : USB_ERR_IO;
+                            pk->Actual = (USHORT)(p->DirIn ? ((st >> 16) & 0xFFF) : 0);
+                        } else {
+                            pk->Status = USB_OK;
+                            pk->Actual = (USHORT)(p->DirIn ? ((st >> 16) & 0xFFF) : pk->Length);
+                        }
+                        total += pk->Actual;
+                    }
+                }
+                IsoUnlink(e, t);
+            }
+            iso->Used -= (iso->Used >= ndesc) ? ndesc : iso->Used;
+            UsbXferDone(X, USB_OK, total);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Pipes                                                                */
+/* ------------------------------------------------------------------ */
+
 static int EhciDevUpdate(USB_DEV *Dev)
 {
     EQH *q = (EQH *)Dev->Ep0.HcPriv;
@@ -518,7 +925,7 @@ static int EhciPipeOpen(USB_PIPE *Pipe)
     EQH *q;
 
     if (Pipe->Type == USB_EP_ISOCH) {
-        return USB_ERR_PARAM;
+        return IsoOpen(e, Pipe);
     }
     q = (EQH *)OsAlloc(sizeof(EQH));
     if (q == NULL) {
@@ -545,6 +952,10 @@ static void EhciPipeClose(USB_PIPE *Pipe)
     EQH *q = (EQH *)Pipe->HcPriv;
 
     if (q == NULL) {
+        return;
+    }
+    if (Pipe->Type == USB_EP_ISOCH) {
+        IsoClose(e, Pipe);
         return;
     }
     QhUnlink(e, q);
@@ -582,7 +993,7 @@ static void FillTdX(EQH *q, int i, USB_XFER *X, ULONG Off, ULONG Len, ULONG Toke
     int k;
 
     t[0] = LINK_T;
-    t[1] = LINK_T;
+    t[1] = (StopTd != NULL && (Token & TOK_PID_MASK) == TOK_PID_IN) ? StopTdPhys : LINK_T;
     t[3] = phys;
     for (k = 1; k < 5; k++) {
         if (next < Off + Len) {
@@ -609,6 +1020,9 @@ static int EhciSubmit(USB_XFER *X)
 
     if (q == NULL) {
         return USB_ERR_NODEV;
+    }
+    if (p->Type == USB_EP_ISOCH) {
+        return IsoSubmit(EHCP(p->Dev->Hc), X);
     }
     if (q->Qh[6] & TOK_ACTIVE) {
         return USB_ERR_BUSY;
@@ -723,6 +1137,7 @@ static void EhciPoll(USB_HC *Hc)
     for (q = e->IntHead.Next; q != NULL; q = q->Next) {
         CheckQh(q);
     }
+    IsoPoll(e);
     if (!e->UseIrq) {
         ULONG sts = OpRd(e, EOP_USBSTS);
         if (sts & (STS_USBINT | STS_ERR | STS_PCD)) {
@@ -760,6 +1175,10 @@ static void EhciCancel(USB_PIPE *Pipe)
     if (q == NULL) {
         return;
     }
+    if (Pipe->Type == USB_EP_ISOCH) {
+        IsoCancel(e, (EISO *)q);
+        return;
+    }
     QhUnlink(e, q);
     irql = OsLock();
     CheckQh(q);
@@ -775,6 +1194,10 @@ static int EhciPipeReset(USB_PIPE *Pipe)
 
     if (q == NULL) {
         return USB_ERR_NODEV;
+    }
+    if (Pipe->Type == USB_EP_ISOCH) {
+        IsoCancel(e, (EISO *)q);
+        return USB_OK;
     }
     QhUnlink(e, q);
     QhIdle(q, TRUE);

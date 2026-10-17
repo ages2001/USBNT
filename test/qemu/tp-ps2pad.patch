@@ -1,0 +1,598 @@
+diff --git a/hw/input/meson.build b/hw/input/meson.build
+index 640556b..f07b0cd 100644
+--- a/hw/input/meson.build
++++ b/hw/input/meson.build
+@@ -4,7 +4,7 @@ system_ss.add(when: 'CONFIG_ADS7846', if_true: files('ads7846.c'))
+ system_ss.add(when: 'CONFIG_LM832X', if_true: files('lm832x.c'))
+ system_ss.add(when: 'CONFIG_PCKBD', if_true: files('pckbd.c'))
+ system_ss.add(when: 'CONFIG_PL050', if_true: files('pl050.c'))
+-system_ss.add(when: 'CONFIG_PS2', if_true: files('ps2.c'))
++system_ss.add(when: 'CONFIG_PS2', if_true: files('ps2.c', 'tp_ps2pad.c'))
+ system_ss.add(when: 'CONFIG_STELLARIS_GAMEPAD', if_true: files('stellaris_gamepad.c'))
+ system_ss.add(when: 'CONFIG_TSC2005', if_true: files('tsc2005.c'))
+ 
+diff --git a/hw/input/ps2.c b/hw/input/ps2.c
+index c8fd23c..6855150 100644
+--- a/hw/input/ps2.c
++++ b/hw/input/ps2.c
+@@ -874,10 +874,16 @@ void ps2_mouse_fake_event(PS2MouseState *s)
+     ps2_mouse_sync(DEVICE(s));
+ }
+ 
++/* a test device in place of the mouse (hw/input/tp_ps2pad.c): returns 1 when it took the byte */
++int (*ps2_mouse_write_hook)(PS2MouseState *s, int val);
++
+ void ps2_write_mouse(PS2MouseState *s, int val)
+ {
+     PS2State *ps2 = PS2_DEVICE(s);
+ 
++    if (ps2_mouse_write_hook && ps2_mouse_write_hook(s, val)) {
++        return;
++    }
+     trace_ps2_write_mouse(s, val);
+     switch (ps2->write_cmd) {
+     default:
+diff --git a/include/hw/input/ps2.h b/include/hw/input/ps2.h
+index cd61a63..3e04087 100644
+--- a/include/hw/input/ps2.h
++++ b/include/hw/input/ps2.h
+@@ -99,6 +99,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(PS2MouseState, PS2_MOUSE_DEVICE)
+ 
+ /* ps2.c */
+ void ps2_write_mouse(PS2MouseState *s, int val);
++extern int (*ps2_mouse_write_hook)(PS2MouseState *s, int val);
+ void ps2_write_keyboard(PS2KbdState *s, int val);
+ uint32_t ps2_read_data(PS2State *s);
+ void ps2_queue_noirq(PS2State *s, int b);
+diff --git a/hw/input/tp_ps2pad.c b/hw/input/tp_ps2pad.c
+new file mode 100644
+index 0000000..8a3770c
+--- /dev/null
++++ b/hw/input/tp_ps2pad.c
+@@ -0,0 +1,546 @@
++/*
++ * PS/2 touch pad test device (for the USBNT PS/2 touch pad protocols).
++ *
++ *   -device tp-ps2pad,id=tp,proto=synaptics|elantech|alps[,stick=on]
++ *
++ * Takes the place of the PS/2 mouse on the i8042 aux port (every byte the
++ * guest writes to the mouse comes here; the emulated mouse stays silent) and
++ * answers like
++ *   synaptics  a Synaptics TouchPad 8.1, W mode, advanced gesture mode
++ *              (second contact), pass-through port (stick=on: trackpoint)
++ *   elantech   an Elantech v4 (firmware 46 0F 01, 3000 x 2000), trackpoint
++ *              packets with stick=on
++ *   alps       an ALPS v7 (E7 73 03 0A, EC 88 BA 00, 0xFFF x 0x7FF),
++ *              command mode registers, trackstick (stick=on)
++ * after the identification commands of each (Linux synaptics.c, elantech.c,
++ * alps.c).  Until the guest switches the pad to its absolute mode it is a
++ * plain PS/2 mouse that never moves.
++ *
++ * Touches, for tests (qom-set /machine/peripheral/tp touch "<frame>"):
++ *   ""                       no finger on the pad
++ *   "x:y [x:y ...] [b=N]"    1 - 4 fingers at x, y in per mille of the pad
++ *                            (y downwards), N = buttons (bit 0 left / the
++ *                            ClickPad's button, bit 1 right)
++ *   "s=dx:dy[:b]"            a trackpoint packet (counts, y downwards)
++ * Each frame becomes the packets of the protocol (reporting must be on).
++ * "commands" counts the bytes written by the guest, "mode" is 1 once the pad
++ * is in its absolute mode.
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2 or later.
++ */
++
++#include "qemu/osdep.h"
++#include "hw/qdev-properties.h"
++#include "hw/input/ps2.h"
++#include "qemu/module.h"
++#include "qemu/timer.h"
++#include "qapi/error.h"
++#include "qom/object.h"
++
++#define TYPE_TP_PS2PAD "tp-ps2pad"
++OBJECT_DECLARE_SIMPLE_TYPE(TpPs2Pad, TP_PS2PAD)
++
++enum { P_SYN, P_ELAN, P_ALPS };
++
++#define FIFO 512
++
++struct TpPs2Pad {
++    DeviceState parent_obj;
++    char *proto_str;
++    bool stick;
++    uint32_t commands, mode;
++    int proto;
++    PS2MouseState *mouse;
++    QEMUTimer *timer;
++    uint8_t fifo[FIFO];
++    int fh, ft;
++    /* command decoding */
++    int arg_for;                /* E8 / F3 waiting for its argument */
++    uint8_t hist[16];
++    int nhist;
++    bool enabled;
++    /* Synaptics */
++    uint8_t syn_mode;
++    bool agm;
++    /* Elantech */
++    uint8_t reg07;
++    /* ALPS */
++    bool cmd_mode;
++    int addr_nib;
++    uint16_t addr;
++    uint8_t regs[0x400];
++    /* finger state */
++    int nfing_prev;
++};
++
++static TpPs2Pad *the_pad;
++
++static void out(TpPs2Pad *s, uint8_t b)
++{
++    if ((s->ft + 1) % FIFO != s->fh) {
++        s->fifo[s->ft] = b;
++        s->ft = (s->ft + 1) % FIFO;
++    }
++}
++
++/* the PS/2 queue holds 16 bytes: move the FIFO over as far as it has room */
++static void pump(TpPs2Pad *s)
++{
++    PS2State *ps2 = PS2_DEVICE(s->mouse);
++
++    while (s->fh != s->ft && ps2->queue.count < 16) {
++        ps2_queue(ps2, s->fifo[s->fh]);
++        s->fh = (s->fh + 1) % FIFO;
++    }
++    if (s->fh != s->ft) {
++        timer_mod(s->timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 2);
++    }
++}
++
++static void tick(void *opaque)
++{
++    TpPs2Pad *s = opaque;
++
++    pump(s);
++}
++
++static void reply(TpPs2Pad *s, int n, ...)
++{
++    va_list ap;
++    int i;
++
++    va_start(ap, n);
++    for (i = 0; i < n; i++) {
++        out(s, (uint8_t)va_arg(ap, int));
++    }
++    va_end(ap);
++}
++
++/* the bytes before the current one (h(1) = the one just before) */
++static int h(TpPs2Pad *s, int back)
++{
++    int i = s->nhist - 1 - back;
++    return i >= 0 ? s->hist[i % 16] : -1;
++}
++
++/* a Synaptics "special command" ended just before: E6 E8 a E8 b E8 c E8 d */
++static int sliced(TpPs2Pad *s, bool *with_e6)
++{
++    if (h(s, 2) != 0xE8 || h(s, 4) != 0xE8 || h(s, 6) != 0xE8 || h(s, 8) != 0xE8) {
++        return -1;
++    }
++    *with_e6 = h(s, 9) == 0xE6;
++    return (h(s, 7) << 6) | (h(s, 5) << 4) | (h(s, 3) << 2) | h(s, 1);
++}
++
++static void status_request(TpPs2Pad *s)
++{
++    bool e6 = false;
++    int q = sliced(s, &e6);
++
++    switch (s->proto) {
++    case P_SYN:
++        if (q >= 0 && !e6) q = 0;                       /* E8 00 x4 E9: identify */
++        if (q >= 0) {
++            switch (q) {
++            case 0x00: reply(s, 3, 0x01, 0x47, 0x18); return;                       /* TouchPad 8.1 */
++            case 0x01: reply(s, 3, 0x00, 0x00, 0x00); return;
++            case 0x02: reply(s, 3, 0xD0, 0x47, 0x03 | (s->stick ? 0x80 : 0)); return; /* extended, 5 requests */
++            case 0x03: reply(s, 3, 0x01, 0x00, 0xB1); return;                       /* new absolute format */
++            case 0x08: reply(s, 3, 0x55, 0x80, 0x40); return;
++            case 0x09: reply(s, 3, 0x00, 0x00, 0x00); return;
++            case 0x0C: reply(s, 3, 0x0A, 0x00, 0x00); return;   /* advanced gesture, max coordinates */
++            case 0x0D: reply(s, 3, 0xAB, 0x00, 0x8B); return;   /* 5472 x 4448 */
++            }
++        }
++        break;
++    case P_ELAN:
++        if (h(s, 1) == 0xE6 && h(s, 2) == 0xE6 && h(s, 3) == 0xE6) {
++            reply(s, 3, 0x3C, 0x03, 0xC8);              /* magic knock */
++            return;
++        }
++        if (q == 0x01 && e6) {
++            reply(s, 3, 0x46, 0x0F, 0x01);              /* firmware: v4 (ic 6), no button pad */
++            return;
++        }
++        if (h(s, 2) == 0xF8) {
++            switch (h(s, 1)) {
++            case 0x02: reply(s, 3, s->stick ? 0x80 : 0x00, 0x10, 0x0A); return;    /* capabilities */
++            case 0x03: reply(s, 3, 0x00, 0x00, 0x00); return;                       /* samples */
++            case 0x00: reply(s, 3, 0x7B, 0xB8, 0xD0); return;                       /* 3000 x 2000 */
++            }
++        }
++        break;
++    case P_ALPS:
++        if (s->cmd_mode && s->addr_nib == 4) {
++            reply(s, 3, s->addr >> 8, s->addr & 0xFF, s->regs[s->addr & 0x3FF]);
++            return;
++        }
++        if (h(s, 1) == 0xE6 && h(s, 2) == 0xE6 && h(s, 3) == 0xE6) {
++            reply(s, 3, 0x00, 0x00, 0x0A);
++            return;
++        }
++        if (h(s, 1) == 0xE7 && h(s, 2) == 0xE7 && h(s, 3) == 0xE7) {
++            reply(s, 3, 0x73, 0x03, 0x0A);
++            return;
++        }
++        if (h(s, 1) == 0xEC && h(s, 2) == 0xEC && h(s, 3) == 0xEC) {
++            reply(s, 3, 0x88, 0xBA, 0x00);              /* also: command mode */
++            s->cmd_mode = true;
++            s->addr_nib = -1;
++            return;
++        }
++        break;
++    }
++    reply(s, 3, 0x00, 0x02, 0x64);                      /* plain status */
++}
++
++static int alps_nibble(uint8_t c, int arg)
++{
++    static const uint8_t rate[7] = { 0x0A, 0x14, 0x28, 0x3C, 0x50, 0x64, 0xC8 };
++    int i;
++
++    switch (c) {
++    case 0xF0: return 0;
++    case 0xF6: return 1;
++    case 0xE7: return 2;
++    case 0xF2: return 10;
++    case 0xE6: return 15;
++    case 0xE8: return arg >= 0 && arg <= 3 ? 11 + arg : -1;
++    case 0xF3:
++        for (i = 0; i < 7; i++) {
++            if (rate[i] == arg) return 3 + i;
++        }
++    }
++    return -1;
++}
++
++static void alps_nib(TpPs2Pad *s, int n)
++{
++    if (n < 0 || s->addr_nib < 0) {
++        return;
++    }
++    if (s->addr_nib < 4) {
++        s->addr = (uint16_t)((s->addr << 4) | n);
++        s->addr_nib++;
++    } else {
++        s->regs[s->addr & 0x3FF] = (uint8_t)((s->regs[s->addr & 0x3FF] << 4) | n);
++    }
++}
++
++static void update_mode(TpPs2Pad *s)
++{
++    switch (s->proto) {
++    case P_SYN: s->mode = (s->syn_mode & 0x80) != 0; break;
++    case P_ELAN: s->mode = s->reg07 == 0x01; break;
++    case P_ALPS: s->mode = (s->regs[0xC2C4 & 0x3FF] & 0x02) != 0; break;
++    }
++}
++
++static void reset(TpPs2Pad *s)
++{
++    s->enabled = false;
++    s->syn_mode = 0;
++    s->agm = false;
++    s->reg07 = 0;
++    s->cmd_mode = false;
++    memset(s->regs, 0, sizeof(s->regs));
++    if (s->stick) {
++        s->regs[0xC2C8 & 0x3FF] = 0x80;                 /* ALPS: trackstick present */
++    }
++    s->nfing_prev = 0;
++    update_mode(s);
++}
++
++static void command(TpPs2Pad *s, int val)
++{
++    uint8_t b = (uint8_t)val;
++
++    s->commands++;
++    if (s->arg_for) {
++        uint8_t c = (uint8_t)s->arg_for;
++        bool e6;
++        int q;
++        s->arg_for = 0;
++        s->hist[s->nhist++ % 16] = b;
++        out(s, 0xFA);
++        if (s->proto == P_ALPS && s->cmd_mode) {
++            alps_nib(s, alps_nibble(c, b));
++        } else if (c == 0xF3 && s->proto == P_SYN) {
++            /* F3 after a special command: 14 = mode byte, C8 = advanced gesture mode, 28 = guest command */
++            s->nhist--;
++            q = sliced(s, &e6);
++            s->nhist++;
++            if (q >= 0 && e6 && b == 0x14) s->syn_mode = (uint8_t)q;
++            if (q == 0x03 && e6 && b == 0xC8) s->agm = true;
++            if (q >= 0 && e6 && b == 0x28 && s->stick) {
++                /* the guest answers in a pass-through packet */
++                reply(s, 6, 0x84, 0xFA, 0x00, 0xC4, 0x00, 0x00);
++            }
++        }
++        update_mode(s);
++        return;
++    }
++    s->hist[s->nhist++ % 16] = b;
++    if (b == 0xE8 || b == 0xF3) {
++        s->arg_for = b;
++        out(s, 0xFA);
++        return;
++    }
++    if (s->proto == P_ALPS && s->cmd_mode) {
++        out(s, 0xFA);
++        if (b == 0xEA) {
++            s->cmd_mode = false;
++        } else if (b == 0xEC) {
++            s->addr_nib = 0;
++            s->addr = 0;
++        } else if (b == 0xE9) {
++            status_request(s);
++        } else {
++            if (b == 0xF2) out(s, 0x00);
++            alps_nib(s, alps_nibble(b, -1));
++        }
++        update_mode(s);
++        return;
++    }
++    if (s->proto == P_ELAN && b == 0xE6 && h(s, 8) == 0xF8 && h(s, 7) == 0x00 && h(s, 6) == 0xF8 &&
++        h(s, 4) == 0xF8 && h(s, 3) == 0x00 && h(s, 2) == 0xF8) {
++        if (h(s, 5) == 0x07) s->reg07 = (uint8_t)h(s, 1);      /* v4 register write */
++    }
++    out(s, 0xFA);
++    switch (b) {
++    case 0xFF:
++        reset(s);
++        out(s, 0xAA);
++        out(s, 0x00);
++        break;
++    case 0xF2:
++        out(s, 0x00);
++        break;
++    case 0xF4:
++        s->enabled = true;
++        break;
++    case 0xF5:
++    case 0xF6:
++        s->enabled = false;
++        break;
++    case 0xE9:
++        status_request(s);
++        break;
++    }
++    update_mode(s);
++}
++
++static int write_hook(PS2MouseState *m, int val)
++{
++    TpPs2Pad *s = the_pad;
++
++    if (s == NULL || m != s->mouse) {
++        return 0;
++    }
++    command(s, val);
++    pump(s);
++    return 1;
++}
++
++/* ---- packets ---- */
++typedef struct { int x, y; } Pt;
++
++static void syn_packet(TpPs2Pad *s, int x, int y, int z, int w, int btn)
++{
++    /* y upwards on the pad; ClickPad button: not on this model */
++    uint8_t p[6];
++    p[0] = (uint8_t)(0x80 | ((w & 0x0C) << 2) | ((w & 0x02) << 1) | (btn & 3));
++    p[1] = (uint8_t)(((y >> 4) & 0xF0) | ((x >> 8) & 0x0F));
++    p[2] = (uint8_t)z;
++    p[3] = (uint8_t)(0xC0 | ((y & 0x1000) >> 7) | ((x & 0x1000) >> 8) | ((w & 1) << 2) | (btn & 1));
++    p[4] = (uint8_t)x;
++    p[5] = (uint8_t)y;
++    reply(s, 6, p[0], p[1], p[2], p[3], p[4], p[5]);
++}
++
++static void syn_frame(TpPs2Pad *s, Pt *f, int n, int btn)
++{
++    int x0 = 1472 + f[0].x * 4000 / 1000, y0 = 4448 - f[0].y * 3040 / 1000;
++
++    if (n == 0) {
++        syn_packet(s, 0, 0, 0, 0, btn);
++        return;
++    }
++    if (n >= 2 && s->agm) {
++        int x1 = (1472 + f[1].x * 4000 / 1000) >> 1, y1 = (4448 - f[1].y * 3040 / 1000) >> 1;
++        reply(s, 6, 0x80 | 0x04, x1 & 0xFF, y1 & 0xFF, 0xC0, ((y1 >> 4) & 0xF0) | ((x1 >> 8) & 0x0F), 0x10);
++    }
++    syn_packet(s, x0, y0, 60, n == 1 ? 5 : n == 2 ? 0 : 1, btn);
++}
++
++static void elan_frame(TpPs2Pad *s, Pt *f, int n, int btn)
++{
++    int i, mask = (1 << n) - 1;
++
++    if (n != s->nfing_prev || n == 0) {
++        reply(s, 6, btn & 3, mask, 0x00, 0x10, 0x00, 0x00);     /* status */
++    }
++    for (i = 0; i < n; i++) {
++        int x = f[i].x * 3000 / 1000, yr = 2000 - f[i].y * 2000 / 1000;
++        reply(s, 6, 0x10 | (btn & 3), 0x40 | ((x >> 8) & 0x0F), x & 0xFF, ((i + 1) << 5) | 0x10 | 0x01,
++              0x80 | ((yr >> 8) & 0x0F), yr & 0xFF);
++    }
++}
++
++static void alps_frame(TpPs2Pad *s, Pt *f, int n, int btn)
++{
++    int x0, r0, x1, r1;
++
++    if (n == 0) {
++        reply(s, 6, 0x48, 0x00, 0x40, 0x48, 0x00, 0x00);        /* idle */
++        return;
++    }
++    x0 = f[0].x * 0xFFF / 1000;
++    r0 = 0x7FF - f[0].y * 0x7FF / 1000;
++    if (n >= 2) {
++        x1 = f[1].x * 0xFFF / 1000;
++        r1 = 0x7FF - f[1].y * 0x7FF / 1000;
++    } else {
++        x1 = 0xFF0;
++        r1 = 0x7FF;
++    }
++    reply(s, 6, 0x48 | ((btn & 1) ? 0x80 : 0) | ((btn & 2) ? 0x20 : 0) | (r0 & 7), (r0 >> 3) & 0xFF,
++          0x40 | ((x0 & 0x800) >> 4) | ((x0 >> 5) & 0x3F),
++          0x48 | ((x1 & 0x800) >> 4) | ((x0 & 0x18) << 1) | (x0 & 7),
++          0x40 | ((x1 & 0x400) >> 3) | ((x1 >> 4) & 0x3F),
++          ((r1 & 0x400) >> 3) | ((r1 >> 4) & 0x3F));
++}
++
++static void stick_packet(TpPs2Pad *s, int dx, int dy, int btn)
++{
++    switch (s->proto) {
++    case P_SYN: {
++        int py = -dy;                                   /* PS/2: up is positive */
++        reply(s, 6, 0x84, 0x08 | (btn & 7) | (dx < 0 ? 0x10 : 0) | (py < 0 ? 0x20 : 0), 0x00, 0xC4, dx & 0xFF,
++              py & 0xFF);
++        break;
++    }
++    case P_ELAN: {
++        int v = -dy, sx = dx < 0, sy = v < 0;
++        reply(s, 6, (btn & 7) | (sx << 4) | (sy << 5), sx ? 0x00 : 0x80, sy ? 0x00 : 0x80,
++              0x06 | (sx ? 0 : 0x10) | (sy ? 0 : 0x20), dx & 0xFF, v & 0xFF);
++        break;
++    }
++    case P_ALPS: {
++        int y = -dy;
++        reply(s, 6, 0x48, btn & 7, 0x40 | (dx & 0xBF), 0x48 | ((dx & 0x40) >> 2) | (y & 0x07) | ((y & 0x40) >> 1),
++              0x06 | (y & 0xB8), 0x10);
++        break;
++    }
++    }
++}
++
++static void set_touch(Object *obj, const char *value, Error **errp)
++{
++    TpPs2Pad *s = TP_PS2PAD(obj);
++    Pt f[4];
++    int n = 0, btn = 0;
++    const char *p = value;
++
++    while (*p) {
++        int a, b, c = 0;
++        while (*p == ' ') p++;
++        if (!*p) break;
++        if (sscanf(p, "s=%d:%d:%d", &a, &b, &c) >= 2) {
++            if (s->enabled && s->mode && s->stick) stick_packet(s, a, b, c);
++        } else if (sscanf(p, "b=%d", &a) == 1) {
++            btn = a;
++        } else if (sscanf(p, "%d:%d", &a, &b) == 2 && n < 4) {
++            f[n].x = a < 0 ? 0 : a > 1000 ? 1000 : a;
++            f[n].y = b < 0 ? 0 : b > 1000 ? 1000 : b;
++            n++;
++        }
++        while (*p && *p != ' ') p++;
++    }
++    if (strncmp(value, "s=", 2) != 0 && s->enabled && s->mode) {
++        switch (s->proto) {
++        case P_SYN: syn_frame(s, f, n, btn); break;
++        case P_ELAN: elan_frame(s, f, n, btn); break;
++        case P_ALPS: alps_frame(s, f, n, btn); break;
++        }
++        s->nfing_prev = n;
++    }
++    pump(s);
++}
++
++static char *get_touch(Object *obj, Error **errp)
++{
++    return g_strdup("");
++}
++
++static void tp_realize(DeviceState *dev, Error **errp)
++{
++    TpPs2Pad *s = TP_PS2PAD(dev);
++    bool ambiguous = false;
++    Object *m;
++
++    if (s->proto_str == NULL || !strcmp(s->proto_str, "synaptics")) {
++        s->proto = P_SYN;
++    } else if (!strcmp(s->proto_str, "elantech")) {
++        s->proto = P_ELAN;
++    } else if (!strcmp(s->proto_str, "alps")) {
++        s->proto = P_ALPS;
++    } else {
++        error_setg(errp, "tp-ps2pad: proto must be synaptics, elantech or alps");
++        return;
++    }
++    m = object_resolve_path_type("", TYPE_PS2_MOUSE_DEVICE, &ambiguous);
++    if (m == NULL) {
++        error_setg(errp, "tp-ps2pad: no PS/2 mouse (i8042) to replace");
++        return;
++    }
++    if (the_pad != NULL) {
++        error_setg(errp, "tp-ps2pad: only one");
++        return;
++    }
++    s->mouse = PS2_MOUSE_DEVICE(m);
++    s->timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, tick, s);
++    reset(s);
++    the_pad = s;
++    ps2_mouse_write_hook = write_hook;
++}
++
++static void tp_init(Object *obj)
++{
++    object_property_add_str(obj, "touch", get_touch, set_touch);
++}
++
++static Property tp_props[] = {
++    DEFINE_PROP_STRING("proto", TpPs2Pad, proto_str),
++    DEFINE_PROP_BOOL("stick", TpPs2Pad, stick, false),
++    DEFINE_PROP_UINT32("commands", TpPs2Pad, commands, 0),
++    DEFINE_PROP_UINT32("mode", TpPs2Pad, mode, 0),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void tp_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = tp_realize;
++    dc->desc = "PS/2 touch pad (Synaptics, Elantech v4, ALPS v7) on the i8042 aux port";
++    dc->user_creatable = true;
++    device_class_set_props(dc, tp_props);
++    set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
++}
++
++static const TypeInfo tp_info = {
++    .name          = TYPE_TP_PS2PAD,
++    .parent        = TYPE_DEVICE,
++    .instance_size = sizeof(TpPs2Pad),
++    .instance_init = tp_init,
++    .class_init    = tp_class_init,
++};
++
++static void tp_register_types(void)
++{
++    type_register_static(&tp_info);
++}
++
++type_init(tp_register_types)

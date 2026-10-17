@@ -8,7 +8,7 @@
 
 #include "usbos.h"
 
-#define USBNT_VERSION_STR "1.0"
+#define USBNT_VERSION_STR "1.1"
 
 /* ------------------------------------------------------------------ */
 /* Utilities (usbutil.c)                                                */
@@ -82,6 +82,7 @@ void    PUTBE32(void *P, ULONG V);
 
 #define USB_FEATURE_ENDPOINT_HALT   0
 
+#define USB_CLASS_AUDIO     0x01
 #define USB_CLASS_HID       0x03
 #define USB_CLASS_MSC       0x08
 #define USB_CLASS_HUB       0x09
@@ -120,6 +121,18 @@ typedef struct _USB_XFER USB_XFER;
 
 typedef void (*USB_XFER_DONE)(USB_XFER *Xfer);
 
+/*
+ * Isochronous packet. Packet i of a transfer goes in the i-th service
+ * interval (frame or microframe slot) after the transfer's start; the
+ * host controller fills in Actual and Status on completion.
+ */
+typedef struct _USB_ISO_PACKET {
+    ULONG           Offset;         /* byte offset in the transfer buffer */
+    USHORT          Length;         /* OUT: bytes to send, IN: room */
+    USHORT          Actual;         /* bytes transferred */
+    LONG            Status;         /* USB_OK or USB_ERR_* (missed slot: USB_ERR_IO) */
+} USB_ISO_PACKET;
+
 struct _USB_XFER {
     USB_PIPE       *Pipe;
     UCHAR          *Buf;            /* virtual address of data */
@@ -128,6 +141,7 @@ struct _USB_XFER {
     ULONG           PageOff;        /* offset of the data in the first page */
     ULONG           Length;
     ULONG           SetupPhys;      /* control transfers only */
+    const UCHAR    *Setup;          /* control: the setup packet (virtual), NULL = the device page */
     UCHAR           DirIn;          /* direction of data stage */
     UCHAR           Busy;
     UCHAR           Pad[2];
@@ -138,6 +152,9 @@ struct _USB_XFER {
     ULONG           Hc[8];          /* host controller private */
     USB_XFER       *DoneNext;
     USB_XFER       *QNext;          /* next transfer queued on the pipe */
+    USB_ISO_PACKET *Iso;            /* isochronous: packet list (Buf/Phys contiguous) */
+    ULONG           IsoCount;
+    ULONG           IsoFrame;       /* frame (ms) the first packet was scheduled for */
 };
 
 struct _USB_PIPE {
@@ -158,6 +175,11 @@ struct _USB_PIPE {
     USHORT          Stream;         /* stream id, 0 = none */
     USHORT          NumStreams;     /* streams opened on this endpoint */
     USB_PIPE       *Parent;         /* stream pipes: the endpoint pipe */
+    UCHAR           Mult;           /* high speed periodic: transactions per microframe */
+    UCHAR           IsoLate;        /* isochronous: the schedule ran dry at least once */
+    USHORT          Pad3;
+    ULONG           IsoNext;        /* isochronous: next free slot, host controller units */
+    ULONG           IsoSlots;       /* isochronous: slots per packet in microframes */
 };
 
 struct _USB_DEV {
@@ -193,9 +215,14 @@ struct _USB_DEV {
     void           *Hub;
     void           *Msc;
     void           *Hid[4];
+    void           *Audio;
     char            Mfg[32];        /* string descriptors, ASCII */
     char            Product[48];
     char            Serial[32];
+    ULONG           NativeIf;       /* interfaces USBNT's own class drivers serve (bit = number) */
+    UCHAR           Ready;          /* enumerated and bound */
+    UCHAR           Pad4[3];
+    ULONG           Gen;            /* differs for every attach of a device in this slot */
 };
 
 #define USB_FUNC_HUB        0x01
@@ -203,6 +230,9 @@ struct _USB_DEV {
 #define USB_FUNC_MOUSE      0x04
 #define USB_FUNC_TABLET     0x08
 #define USB_FUNC_STORAGE    0x10
+#define USB_FUNC_AUDIO      0x20
+#define USB_FUNC_MIDI       0x40
+#define USB_FUNC_VIDEO      0x80
 
 /* Normalized root port status */
 #define PS_CONNECT          0x0001
@@ -263,7 +293,10 @@ struct _USB_HC {
     ULONG           SgMax;          /* largest page list transfer, 0 = none */
     UCHAR           QueueOk;        /* several transfers may be queued per pipe */
     UCHAR           MaxStreams;     /* bulk streams supported, 0 = none */
-    UCHAR           Pad2[2];
+    UCHAR           IsoOk;          /* isochronous transfers implemented */
+    UCHAR           Hot;            /* found after the start (PCIe hot plug: Thunderbolt / USB4 dock) */
+    UCHAR           Removed;        /* the PCI function went away */
+    UCHAR           Pad3[3];
     USHORT          VendorId;
     USHORT          DeviceId;
     USB_HC         *Ehci;           /* EHCI owning this companion */
@@ -304,6 +337,15 @@ void    UsbCancelPipe(USB_PIPE *Pipe);
 int     UsbClearHalt(USB_PIPE *Pipe);
 int     UsbResetPipeToggle(USB_PIPE *Pipe);
 int     UsbOpenStreams(USB_PIPE *Pipe, USB_PIPE *Child, int Count);
+/*
+ * A stream that ran dry restarts this many frames ahead. Real controllers
+ * would manage with two, but emulated ones advance their frame counter in
+ * bursts, and a short lead then means the first packets are missed.
+ */
+#define USB_ISO_RESTART_FRAMES  8
+
+int     UsbSetInterface(USB_DEV *Dev, UCHAR Interface, UCHAR Alt);
+ULONG   UsbIsoSlotUframes(USB_PIPE *Pipe);
 
 USB_DEV *UsbDevAttach(USB_HC *Hc, USB_DEV *Parent, int Port, UCHAR Speed);
 void    UsbDevDetach(USB_DEV *Dev);
@@ -336,11 +378,37 @@ void    HidDetach(USB_DEV *Dev);
 void    HidService(void);
 void    HidTick(void);
 
+int     AudioAttach(USB_DEV *Dev, const UCHAR *If, const UCHAR *End);
+void    AudioDetach(USB_DEV *Dev);
+void    AudioService(void);
+void    AudioTick(void);
+
 void    UsbPortPoll(USB_HC *Hc);
 
 /* Device or slot changes: counter for user mode and an OS notification */
 extern volatile ULONG UsbChangeCount;
 void    UsbNotifyChange(void);
+
+/* i2chid.c: HID over I2C (DesignWare I2C controllers) */
+void    I2cHidInit(void);
+void    I2cHidService(void);
+void    I2cHidShutdown(void);
+void    I2cPciProbe(UCHAR Bus, UCHAR Dev, UCHAR Fn, ULONG Id, ULONG Class);
+/* Windows 2000 / XP Plug and Play (usbcore.c) */
+void    UsbPnpInit(void);
+int     UsbPnpStart(UCHAR Bus, UCHAR Dev, UCHAR Fn);
+void    UsbPnpStop(UCHAR Bus, UCHAR Dev, UCHAR Fn, BOOLEAN Gone);
+void    UsbPnpSettle(UCHAR Bus, UCHAR Dev, UCHAR Fn, ULONG MaxMs);
+int     I2cHidDescribe(int Index, char *Buf, int Size);
+BOOLEAN I2cHidInfo(int Index, UCHAR *Kind, char *Name, int NameSize, char *Detail, int DetailSize);
+ULONG   UsbPciRelocateBar(UCHAR Bus, UCHAR Dev, UCHAR Fn, ULONG Off);
+void    UsbPciRelocateAll(void);                 /* every BAR above 4 GB -> below 4 GB */
+extern int I2cHidCount;
+extern ULONG UsbPollWantMs;
+/* Windows 2000 / XP: devices for Windows' own USB drivers (usbdi.c) */
+extern ULONG UsbPdoMode;        /* 0 none, 1 what USBNT has no driver for, 2 all but hubs */
+extern ULONG UsbWinVideo;       /* Windows 2000 / XP: cameras go to Windows' usbvideo.sys */
+extern void (*UsbDetachHook)(USB_DEV *Dev);     /* worker period wanted by polled devices (0 = default) */
 void    OsNotifyChange(void);
 
 #endif

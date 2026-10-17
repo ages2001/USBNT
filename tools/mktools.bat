@@ -15,11 +15,11 @@ link %LF% /subsystem:console,3.10 /out:usbinst.exe usbinst.obj kernel32.lib user
 if errorlevel 1 goto fail
 link %LF% /subsystem:console,3.10 /out:usbeject.exe usbeject.obj kernel32.lib user32.lib
 if errorlevel 1 goto fail
-link %LF% /subsystem:windows,3.10 /out:usbmon.exe usbmon.obj devmap.obj kernel32.lib user32.lib advapi32.lib
+link %LF% /subsystem:windows,3.10 /out:usbmon.exe usbmon.obj devmap.obj kernel32.lib user32.lib gdi32.lib advapi32.lib
 if errorlevel 1 goto fail
 link %LF% /subsystem:windows,3.10 /out:usbtree.exe usbtree.obj devmap.obj kernel32.lib user32.lib
 if errorlevel 1 goto fail
-link %LF% /subsystem:windows,3.10 /out:wheeltst.exe wheeltst.obj kernel32.lib user32.lib
+link %LF% /subsystem:windows,3.10 /out:wheeltst.exe wheeltst.obj kernel32.lib user32.lib gdi32.lib
 if errorlevel 1 goto fail
 
 del *.obj

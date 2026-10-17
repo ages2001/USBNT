@@ -1,0 +1,1209 @@
+diff --git a/hw/usb/dev-hub.c b/hw/usb/dev-hub.c
+index 5703e0e..e7d662a 100644
+--- a/hw/usb/dev-hub.c
++++ b/hw/usb/dev-hub.c
+@@ -47,6 +47,7 @@ struct USBHubState {
+     USBEndpoint *intr;
+     uint32_t num_ports;
+     bool port_power;
++    bool hs;
+     QEMUTimer *port_timer;
+     USBHubPort ports[MAX_PORTS];
+ };
+@@ -153,6 +154,53 @@ static const USBDesc desc_hub = {
+     .str  = desc_strings,
+ };
+ 
++/* high speed variant (single transaction translator), for tests of split
++   transactions: downstream ports stay low/full speed */
++static const USBDescIface desc_iface_hub_hs = {
++    .bInterfaceNumber              = 0,
++    .bNumEndpoints                 = 1,
++    .bInterfaceClass               = USB_CLASS_HUB,
++    .eps = (USBDescEndpoint[]) {
++        {
++            .bEndpointAddress      = USB_DIR_IN | 0x01,
++            .bmAttributes          = USB_ENDPOINT_XFER_INT,
++            .wMaxPacketSize        = 1 + DIV_ROUND_UP(MAX_PORTS, 8),
++            .bInterval             = 0x0c,
++        },
++    }
++};
++
++static const USBDescDevice desc_device_hub_hs = {
++    .bcdUSB                        = 0x0200,
++    .bDeviceClass                  = USB_CLASS_HUB,
++    .bDeviceProtocol               = 1,
++    .bMaxPacketSize0               = 64,
++    .bNumConfigurations            = 1,
++    .confs = (USBDescConfig[]) {
++        {
++            .bNumInterfaces        = 1,
++            .bConfigurationValue   = 1,
++            .bmAttributes          = USB_CFG_ATT_ONE | USB_CFG_ATT_SELFPOWER |
++                                     USB_CFG_ATT_WAKEUP,
++            .nif = 1,
++            .ifs = &desc_iface_hub_hs,
++        },
++    },
++};
++
++static const USBDesc desc_hub_hs = {
++    .id = {
++        .idVendor          = 0x0409,
++        .idProduct         = 0x55ab,
++        .bcdDevice         = 0x0101,
++        .iManufacturer     = STR_MANUFACTURER,
++        .iProduct          = STR_PRODUCT,
++        .iSerialNumber     = STR_SERIALNUMBER,
++    },
++    .high = &desc_device_hub_hs,
++    .str  = desc_strings,
++};
++
+ static const uint8_t qemu_hub_hub_descriptor[] =
+ {
+         0x00,                   /*  u8  bLength; patched in later */
+@@ -206,6 +254,11 @@ static bool usb_hub_port_update(USBHubPort *port)
+         } else {
+             usb_hub_port_clear(port, PORT_STAT_LOW_SPEED);
+         }
++        if (port->port.dev->speed == USB_SPEED_HIGH) {
++            usb_hub_port_set(port, PORT_STAT_HIGH_SPEED);
++        } else {
++            usb_hub_port_clear(port, PORT_STAT_HIGH_SPEED);
++        }
+     }
+     return notify;
+ }
+@@ -604,6 +657,9 @@ static void usb_hub_realize(USBDevice *dev, Error **errp)
+         return;
+     }
+ 
++    if (s->hs) {
++        dev->usb_desc = &desc_hub_hs;
++    }
+     usb_desc_create_serial(dev);
+     usb_desc_init(dev);
+     s->port_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+@@ -613,7 +669,8 @@ static void usb_hub_realize(USBDevice *dev, Error **errp)
+         port = &s->ports[i];
+         usb_register_port(usb_bus_from_device(dev),
+                           &port->port, s, i, &usb_hub_port_ops,
+-                          USB_SPEED_MASK_LOW | USB_SPEED_MASK_FULL);
++                          USB_SPEED_MASK_LOW | USB_SPEED_MASK_FULL |
++                          (s->hs ? USB_SPEED_MASK_HIGH : 0));
+         usb_port_location(&port->port, dev->port, i+1);
+     }
+     usb_hub_handle_reset(dev);
+@@ -667,6 +724,7 @@ static const VMStateDescription vmstate_usb_hub = {
+ static Property usb_hub_properties[] = {
+     DEFINE_PROP_UINT32("ports", USBHubState, num_ports, 8),
+     DEFINE_PROP_BOOL("port-power", USBHubState, port_power, false),
++    DEFINE_PROP_BOOL("hs", USBHubState, hs, false),
+     DEFINE_PROP_END_OF_LIST(),
+ };
+ 
+@@ -680,6 +738,7 @@ static void usb_hub_class_initfn(ObjectClass *klass, void *data)
+     uc->usb_desc       = &desc_hub;
+     uc->find_device    = usb_hub_find_device;
+     uc->handle_reset   = usb_hub_handle_reset;
++    uc->handle_attach  = usb_desc_attach;
+     uc->handle_control = usb_hub_handle_control;
+     uc->handle_data    = usb_hub_handle_data;
+     uc->unrealize      = usb_hub_unrealize;
+diff --git a/hw/usb/dev-uac.c b/hw/usb/dev-uac.c
+new file mode 100644
+index 0000000..264bcd2
+--- /dev/null
++++ b/hw/usb/dev-uac.c
+@@ -0,0 +1,1013 @@
++/*
++ * QEMU USB Audio Class 1 / 2 test device ("usb-uac").
++ *
++ * Written for testing the USBNT / AUDIONT drivers.  Unlike usb-audio it
++ * offers what real devices do and drivers must cope with:
++ *
++ *   uac=1  USB Audio 1.0, full speed       uac=2  USB Audio 2.0 (hs=on: high speed)
++ *   playback: alt 1 16-bit stereo, alt 2 24-bit stereo, (UAC2) alt 3 32-bit stereo
++ *   capture : alt 1 16-bit stereo, alt 2 16-bit mono (capture=on)
++ *   rates   : 44100 / 48000 / 96000 (ratemask bits 0/1/2)
++ *   sync    : asynchronous OUT with an explicit feedback endpoint (feedback=on,
++ *             fbppm = device clock offset) or adaptive OUT (feedback=off)
++ *   controls: feature unit mute + volume on both paths, UAC1 endpoint sampling
++ *             frequency control, UAC2 clock source frequency / validity
++ *
++ * Playback is decoded to S16 stereo and sent to the audio backend; capture
++ * produces a 1000 Hz (left) / 1500 Hz (right) sine at -6 dBFS.  With debug=1
++ * every class request, interface change and a periodic stream summary go to
++ * stderr ("uac: ..."), which the test scripts parse.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/module.h"
++#include "qemu/timer.h"
++#include "qemu/host-utils.h"
++#include "qapi/error.h"
++#include "hw/qdev-properties.h"
++#include "hw/usb.h"
++#include "migration/vmstate.h"
++#include "desc.h"
++#include "audio/audio.h"
++#include "qom/object.h"
++#include <math.h>
++
++#define UAC_VENDOR   0x46f4
++#define UAC_PRODUCT1 0x0101
++#define UAC_PRODUCT2 0x0102
++
++#define U16(x) ((x) & 0xff), (((x) >> 8) & 0xff)
++#define U24(x) U16(x), (((x) >> 16) & 0xff)
++#define U32(x) U24(x), (((x) >> 24) & 0xff)
++
++#define ID_CLOCK    10
++#define ID_IT_USB   1
++#define ID_FU_PLAY  2
++#define ID_OT_SPK   3
++#define ID_IT_MIC   4
++#define ID_FU_REC   5
++#define ID_OT_USB   6
++
++#define EP_OUT      0x01
++#define EP_FB       0x81
++#define EP_IN       0x82
++#define EP_MIDI     0x03
++
++enum {
++    STR_NULL, STR_MFG, STR_PRODUCT, STR_SERIAL, STR_CONFIG, STR_CONTROL,
++    STR_PLAY, STR_REC,
++};
++
++static const USBDescStrings uac_strings = {
++    [STR_MFG]     = "QEMU",
++    [STR_PRODUCT] = "QEMU UAC Test Device",
++    [STR_SERIAL]  = "1",
++    [STR_CONFIG]  = "Audio",
++    [STR_CONTROL] = "Audio Control",
++    [STR_PLAY]    = "Playback",
++    [STR_REC]     = "Capture",
++};
++
++static const uint32_t uac_rates[3] = { 44100, 48000, 96000 };
++
++struct fifo {
++    uint8_t *data;
++    size_t size;
++    uint64_t prod, cons;
++    bool primed;                /* enough queued to absorb frame timing jitter */
++};
++
++struct UACState {
++    USBDevice dev;
++    QEMUSoundCard card;
++
++    /* properties */
++    uint32_t version;
++    bool hs;
++    bool capture;
++    bool feedback;
++    int32_t fbppm;
++    uint32_t ratemask;
++    uint32_t hsint;
++    uint32_t debug;
++    bool midi;
++    bool implicit;
++
++    /* descriptors (built at realize) */
++    USBDesc desc;
++    USBDescDevice devdesc;
++    USBDescConfig conf;
++    USBDescIfaceAssoc iad;
++    USBDescIface ifs[12];
++    int nifs;
++
++    /* runtime */
++    int out_alt, in_alt;
++    uint32_t rate_out, rate_in;
++    SWVoiceOut *vout;
++    struct audsettings as;
++    struct fifo fifo;
++    bool mute[8];
++    int16_t vol[8];
++    double phase_l, phase_r;
++    uint64_t in_acc;
++    /* statistics */
++    uint64_t out_packets, out_frames, out_bad, out_overrun, out_underrun;
++    uint64_t fb_packets, in_packets, in_frames;
++    uint64_t last_report;
++    uint32_t min_pkt, max_pkt;
++};
++typedef struct UACState UACState;
++
++#define TYPE_USB_UAC "usb-uac"
++OBJECT_DECLARE_SIMPLE_TYPE(UACState, USB_UAC)
++
++#define DBG(s, ...) do { if ((s)->debug) { fprintf(stderr, "uac: " __VA_ARGS__); } } while (0)
++
++/* ------------------------------------------------------------------ */
++/* descriptor building                                                 */
++/* ------------------------------------------------------------------ */
++
++static USBDescOther *blob(const uint8_t *data, size_t len)
++{
++    USBDescOther *o = g_new0(USBDescOther, 1);
++    uint8_t *d = g_malloc(len);
++    memcpy(d, data, len);
++    o->length = len;
++    o->data = d;
++    return o;
++}
++
++/* collects class specific descriptors into one array */
++typedef struct {
++    USBDescOther list[16];
++    int n;
++} DescList;
++
++static void dl_add(DescList *l, const uint8_t *data, size_t len)
++{
++    USBDescOther *o = blob(data, len);
++    l->list[l->n++] = *o;
++    g_free(o);
++}
++
++static USBDescOther *dl_finish(DescList *l)
++{
++    USBDescOther *a = g_new0(USBDescOther, l->n);
++    memcpy(a, l->list, sizeof(USBDescOther) * l->n);
++    return a;
++}
++
++static int nrates(UACState *s)
++{
++    int i, n = 0;
++    for (i = 0; i < 3; i++) {
++        if (s->ratemask & (1 << i)) {
++            n++;
++        }
++    }
++    return n;
++}
++
++static void build_ac(UACState *s, USBDescIface *ifc)
++{
++    DescList l = { .n = 0 };
++    int total = 0, i;
++    bool v2 = s->version == 2;
++
++    memset(ifc, 0, sizeof(*ifc));
++    ifc->bInterfaceNumber = 0;
++    ifc->bInterfaceClass = USB_CLASS_AUDIO;
++    ifc->bInterfaceSubClass = USB_SUBCLASS_AUDIO_CONTROL;
++    ifc->bInterfaceProtocol = v2 ? 0x20 : 0x00;
++    ifc->iInterface = STR_CONTROL;
++
++    if (v2) {
++        uint8_t hdr[9] = { 9, USB_DT_CS_INTERFACE, 0x01, U16(0x0200), 0x08, U16(0), 0x00 };
++        uint8_t clk[8] = { 8, USB_DT_CS_INTERFACE, 0x0A, ID_CLOCK, 0x03, 0x07, 0x00, 0x00 };
++        uint8_t it[17] = { 17, USB_DT_CS_INTERFACE, 0x02, ID_IT_USB, U16(0x0101), 0, ID_CLOCK,
++                           2, U32(3), 0, U16(0), 0 };
++        uint8_t fu[18] = { 18, USB_DT_CS_INTERFACE, 0x06, ID_FU_PLAY, ID_IT_USB,
++                           U32(0x0f), U32(0x0c), U32(0x0c), 0 };
++        uint8_t ot[12] = { 12, USB_DT_CS_INTERFACE, 0x03, ID_OT_SPK, U16(0x0301), 0, ID_FU_PLAY,
++                           ID_CLOCK, U16(0), 0 };
++        uint8_t mic[17] = { 17, USB_DT_CS_INTERFACE, 0x02, ID_IT_MIC, U16(0x0201), 0, ID_CLOCK,
++                            2, U32(3), 0, U16(0), 0 };
++        uint8_t fu2[18] = { 18, USB_DT_CS_INTERFACE, 0x06, ID_FU_REC, ID_IT_MIC,
++                            U32(0x0f), U32(0x0c), U32(0x0c), 0 };
++        uint8_t ot2[12] = { 12, USB_DT_CS_INTERFACE, 0x03, ID_OT_USB, U16(0x0101), 0, ID_FU_REC,
++                            ID_CLOCK, U16(0), 0 };
++        total = 9 + 8 + 17 + 18 + 12 + (s->capture ? 17 + 18 + 12 : 0);
++        hdr[6] = total & 0xff;
++        hdr[7] = total >> 8;
++        dl_add(&l, hdr, 9);
++        dl_add(&l, clk, 8);
++        dl_add(&l, it, 17);
++        dl_add(&l, fu, 18);
++        dl_add(&l, ot, 12);
++        if (s->capture) {
++            dl_add(&l, mic, 17);
++            dl_add(&l, fu2, 18);
++            dl_add(&l, ot2, 12);
++        }
++    } else {
++        uint8_t hdr[11] = { 0, USB_DT_CS_INTERFACE, 0x01, U16(0x0100), U16(0), 0, 1, 2, 3 };
++        uint8_t it[12] = { 12, USB_DT_CS_INTERFACE, 0x02, ID_IT_USB, U16(0x0101), 0, 2, U16(3), 0, 0 };
++        uint8_t fu[10] = { 10, USB_DT_CS_INTERFACE, 0x06, ID_FU_PLAY, ID_IT_USB, 1, 0x03, 0x00, 0x00, 0 };
++        uint8_t ot[9] = { 9, USB_DT_CS_INTERFACE, 0x03, ID_OT_SPK, U16(0x0301), 0, ID_FU_PLAY, 0 };
++        uint8_t mic[12] = { 12, USB_DT_CS_INTERFACE, 0x02, ID_IT_MIC, U16(0x0201), 0, 2, U16(3), 0, 0 };
++        uint8_t fu2[10] = { 10, USB_DT_CS_INTERFACE, 0x06, ID_FU_REC, ID_IT_MIC, 1, 0x03, 0x00, 0x00, 0 };
++        uint8_t ot2[9] = { 9, USB_DT_CS_INTERFACE, 0x03, ID_OT_USB, U16(0x0101), 0, ID_FU_REC, 0 };
++        int ncol = 1 + (s->capture ? 1 : 0) + (s->midi ? 1 : 0);
++        int hlen = 8 + ncol;
++        hdr[0] = hlen;
++        hdr[7] = ncol;
++        hdr[8] = 1;
++        hdr[9] = s->capture ? 2 : 3;
++        hdr[10] = 3;
++        total = hlen + 12 + 10 + 9 + (s->capture ? 12 + 10 + 9 : 0);
++        hdr[5] = total & 0xff;
++        hdr[6] = total >> 8;
++        dl_add(&l, hdr, hlen);
++        dl_add(&l, it, 12);
++        dl_add(&l, fu, 10);
++        dl_add(&l, ot, 9);
++        if (s->capture) {
++            dl_add(&l, mic, 12);
++            dl_add(&l, fu2, 10);
++            dl_add(&l, ot2, 9);
++        }
++    }
++    (void)i;
++    ifc->ndesc = l.n;
++    ifc->descs = dl_finish(&l);
++}
++
++/* bytes per packet at the highest rate, with room for one extra frame */
++static uint16_t max_packet(UACState *s, int chans, int bytes)
++{
++    uint32_t maxrate = 0;
++    int i;
++    for (i = 0; i < 3; i++) {
++        if (s->ratemask & (1 << i)) {
++            maxrate = uac_rates[i];
++        }
++    }
++    if (s->hs) {
++        uint32_t per = 8000 >> (s->hsint - 1);
++        return (maxrate / per + 2) * chans * bytes;
++    }
++    return (maxrate / 1000 + 2) * chans * bytes;
++}
++
++static void build_as(UACState *s, USBDescIface *ifc, int ifnum, int alt, bool play)
++{
++    DescList l = { .n = 0 };
++    bool v2 = s->version == 2;
++    int chans = 2, sub = 2, bits = 16;
++    USBDescEndpoint *eps;
++    int neps = 0;
++
++    memset(ifc, 0, sizeof(*ifc));
++    ifc->bInterfaceNumber = ifnum;
++    ifc->bAlternateSetting = alt;
++    ifc->bInterfaceClass = USB_CLASS_AUDIO;
++    ifc->bInterfaceSubClass = USB_SUBCLASS_AUDIO_STREAMING;
++    ifc->bInterfaceProtocol = v2 ? 0x20 : 0x00;
++    ifc->iInterface = play ? STR_PLAY : STR_REC;
++    if (alt == 0) {
++        return;
++    }
++    if (play) {
++        if (alt == 2) {
++            sub = 3; bits = 24;
++        } else if (alt == 3) {
++            sub = 4; bits = 24;
++        }
++    } else if (alt == 2) {
++        chans = 1;
++    }
++
++    if (v2) {
++        uint8_t gen[16] = { 16, USB_DT_CS_INTERFACE, 0x01, play ? ID_IT_USB : ID_OT_USB, 0x00, 0x01,
++                            U32(1), chans, U32(chans == 2 ? 3 : 4), 0 };
++        uint8_t fmt[6] = { 6, USB_DT_CS_INTERFACE, 0x02, 0x01, sub, bits };
++        dl_add(&l, gen, 16);
++        dl_add(&l, fmt, 6);
++    } else {
++        uint8_t gen[7] = { 7, USB_DT_CS_INTERFACE, 0x01, play ? ID_IT_USB : ID_OT_USB, 1, U16(1) };
++        uint8_t fmt[8 + 9];
++        int n = 0, i;
++        fmt[0] = 8 + 3 * nrates(s);
++        fmt[1] = USB_DT_CS_INTERFACE;
++        fmt[2] = 0x02;
++        fmt[3] = 0x01;
++        fmt[4] = chans;
++        fmt[5] = sub;
++        fmt[6] = bits;
++        fmt[7] = nrates(s);
++        for (i = 0; i < 3; i++) {
++            if (s->ratemask & (1 << i)) {
++                fmt[8 + 3 * n] = uac_rates[i] & 0xff;
++                fmt[9 + 3 * n] = (uac_rates[i] >> 8) & 0xff;
++                fmt[10 + 3 * n] = uac_rates[i] >> 16;
++                n++;
++            }
++        }
++        dl_add(&l, gen, 7);
++        dl_add(&l, fmt, fmt[0]);
++    }
++    ifc->ndesc = l.n;
++    ifc->descs = dl_finish(&l);
++
++    eps = g_new0(USBDescEndpoint, 2);
++    if (play) {
++        eps[0].bEndpointAddress = EP_OUT;
++        eps[0].bmAttributes = (s->feedback || s->implicit) ? 0x05 : 0x09; /* iso async / adaptive */
++        eps[0].wMaxPacketSize = max_packet(s, chans, sub);
++        eps[0].bInterval = s->hs ? s->hsint : 1;
++        if (!v2) {
++            uint8_t cs[7] = { 7, USB_DT_CS_ENDPOINT, 0x01, 0x01, 0, U16(0) };
++            eps[0].is_audio = 1;
++            eps[0].bSynchAddress = s->feedback ? EP_FB : 0;
++            eps[0].extra = g_memdup2(cs, 7);
++        } else {
++            uint8_t cs[8] = { 8, USB_DT_CS_ENDPOINT, 0x01, 0x00, 0x00, 0, U16(0) };
++            eps[0].extra = g_memdup2(cs, 8);
++        }
++        neps = 1;
++        if (s->feedback) {
++            eps[1].bEndpointAddress = EP_FB;
++            eps[1].bmAttributes = v2 ? 0x11 : 0x01;           /* iso, feedback usage (UAC2) */
++            eps[1].wMaxPacketSize = (v2 && s->hs) ? 4 : 3;
++            eps[1].bInterval = s->hs ? 4 : 1;
++            if (!v2) {
++                eps[1].is_audio = 1;
++                eps[1].bRefresh = 2;                           /* every 4 ms */
++            }
++            neps = 2;
++        }
++    } else {
++        eps[0].bEndpointAddress = EP_IN;
++        eps[0].bmAttributes = 0x05;
++        eps[0].wMaxPacketSize = max_packet(s, chans, sub);
++        eps[0].bInterval = s->hs ? s->hsint : 1;
++        if (!v2) {
++            uint8_t cs[7] = { 7, USB_DT_CS_ENDPOINT, 0x01, 0x01, 0, U16(0) };
++            eps[0].is_audio = 1;
++            eps[0].extra = g_memdup2(cs, 7);
++        } else {
++            uint8_t cs[8] = { 8, USB_DT_CS_ENDPOINT, 0x01, 0x00, 0x00, 0, U16(0) };
++            eps[0].extra = g_memdup2(cs, 8);
++        }
++        neps = 1;
++    }
++    ifc->bNumEndpoints = neps;
++    ifc->eps = eps;
++}
++
++/* MIDI streaming: one embedded IN jack feeding an external OUT jack, bulk OUT */
++static void build_ms(UACState *s, USBDescIface *ifc, int ifnum)
++{
++    DescList l = { .n = 0 };
++    uint8_t hdr[7] = { 7, USB_DT_CS_INTERFACE, 0x01, U16(0x0100), U16(7 + 6 + 9) };
++    uint8_t jin[6] = { 6, USB_DT_CS_INTERFACE, 0x02, 0x01, 1, 0 };
++    uint8_t jout[9] = { 9, USB_DT_CS_INTERFACE, 0x03, 0x02, 2, 1, 1, 1, 0 };
++    uint8_t cs[5] = { 5, USB_DT_CS_ENDPOINT, 0x01, 1, 1 };
++    USBDescEndpoint *ep;
++
++    memset(ifc, 0, sizeof(*ifc));
++    ifc->bInterfaceNumber = ifnum;
++    ifc->bInterfaceClass = USB_CLASS_AUDIO;
++    ifc->bInterfaceSubClass = 3;
++    dl_add(&l, hdr, 7);
++    dl_add(&l, jin, 6);
++    dl_add(&l, jout, 9);
++    ifc->ndesc = l.n;
++    ifc->descs = dl_finish(&l);
++    ep = g_new0(USBDescEndpoint, 1);
++    ep->bEndpointAddress = EP_MIDI;
++    ep->bmAttributes = 0x02;
++    ep->wMaxPacketSize = s->hs ? 512 : 64;
++    ep->is_audio = s->version == 1;
++    ep->extra = g_memdup2(cs, 5);
++    ifc->bNumEndpoints = 1;
++    ifc->eps = ep;
++}
++
++static void build_desc(UACState *s)
++{
++    int n = 0, alt;
++    int playalts = s->version == 2 ? 3 : 2;
++
++    build_ac(s, &s->ifs[n++]);
++    for (alt = 0; alt <= playalts; alt++) {
++        build_as(s, &s->ifs[n++], 1, alt, true);
++    }
++    if (s->capture) {
++        for (alt = 0; alt <= 2; alt++) {
++            build_as(s, &s->ifs[n++], 2, alt, false);
++        }
++    }
++    if (s->midi) {
++        build_ms(s, &s->ifs[n++], s->capture ? 3 : 2);
++    }
++    s->nifs = n;
++
++    s->devdesc.bcdUSB = s->hs ? 0x0200 : 0x0110;
++    s->devdesc.bMaxPacketSize0 = 64;
++    s->devdesc.bNumConfigurations = 1;
++    s->devdesc.confs = &s->conf;
++    s->conf.bNumInterfaces = (s->capture ? 3 : 2) + (s->midi ? 1 : 0);
++    s->conf.bConfigurationValue = 1;
++    s->conf.iConfiguration = STR_CONFIG;
++    s->conf.bmAttributes = USB_CFG_ATT_ONE | USB_CFG_ATT_SELFPOWER;
++    s->conf.bMaxPower = 50;
++    if (s->version == 2) {
++        /* UAC2 functions are announced with an interface association */
++        s->devdesc.bDeviceClass = 0xEF;
++        s->devdesc.bDeviceSubClass = 0x02;
++        s->devdesc.bDeviceProtocol = 0x01;
++        s->iad.bFirstInterface = 0;
++        s->iad.bInterfaceCount = s->conf.bNumInterfaces;
++        s->iad.bFunctionClass = USB_CLASS_AUDIO;
++        s->iad.bFunctionSubClass = 0;
++        s->iad.bFunctionProtocol = 0x20;
++        s->iad.nif = s->nifs;
++        s->iad.ifs = s->ifs;
++        s->conf.nif_groups = 1;
++        s->conf.if_groups = &s->iad;
++    } else {
++        s->conf.nif = s->nifs;
++        s->conf.ifs = s->ifs;
++    }
++
++    s->desc.id.idVendor = UAC_VENDOR;
++    s->desc.id.idProduct = s->version == 2 ? UAC_PRODUCT2 : UAC_PRODUCT1;
++    s->desc.id.bcdDevice = 0x0100;
++    s->desc.id.iManufacturer = STR_MFG;
++    s->desc.id.iProduct = STR_PRODUCT;
++    s->desc.id.iSerialNumber = STR_SERIAL;
++    if (s->hs) {
++        s->desc.high = &s->devdesc;
++    } else {
++        s->desc.full = &s->devdesc;
++    }
++    s->desc.str = uac_strings;
++}
++
++/* ------------------------------------------------------------------ */
++/* playback                                                            */
++/* ------------------------------------------------------------------ */
++
++static void out_cb(void *opaque, int avail)
++{
++    UACState *s = opaque;
++
++    /* like a real device's elastic buffer: start (and restart after running
++       empty) only with 16 ms queued, so bursty frame timing of emulated host
++       controllers does not cut samples out of the stream */
++    if (!s->fifo.primed) {
++        if (s->fifo.prod - s->fifo.cons < s->fifo.size / 4) {
++            if (s->out_alt) {
++                s->out_underrun++;
++            }
++            return;
++        }
++        s->fifo.primed = true;
++    }
++    while (avail > 0) {
++        size_t used = s->fifo.prod - s->fifo.cons;
++        size_t off = s->fifo.cons % s->fifo.size;
++        size_t len = MIN(used, s->fifo.size - off);
++        size_t w;
++        if (len == 0) {
++            if (s->out_alt) {
++                s->out_underrun++;
++            }
++            s->fifo.primed = false;
++            return;
++        }
++        w = AUD_write(s->vout, s->fifo.data + off, MIN(len, (size_t)avail));
++        s->fifo.cons += w;
++        avail -= w;
++        if (w == 0) {
++            return;
++        }
++    }
++}
++
++static void open_voice(UACState *s)
++{
++    uint32_t rate = s->rate_out;
++    if ((s->feedback || s->implicit) && s->fbppm) {
++        rate = (uint32_t)((double)rate * (1.0 + s->fbppm / 1e6) + 0.5);
++    }
++    s->as.freq = rate;
++    s->as.nchannels = 2;
++    s->as.fmt = AUDIO_FORMAT_S16;
++    s->as.endianness = 0;
++    s->vout = AUD_open_out(&s->card, s->vout, TYPE_USB_UAC, s, out_cb, &s->as);
++    g_free(s->fifo.data);
++    s->fifo.size = rate / 1000 * 4 * 64;          /* 64 ms */
++    s->fifo.data = g_malloc0(s->fifo.size);
++    s->fifo.prod = s->fifo.cons = 0;
++    s->fifo.primed = false;
++    AUD_set_active_out(s->vout, s->out_alt != 0);
++    DBG(s, "voice %u Hz\n", rate);
++}
++
++static void report(UACState *s, bool force)
++{
++    uint64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
++    if (!s->debug || (!force && now - s->last_report < 1000)) {
++        return;
++    }
++    s->last_report = now;
++    DBG(s, "stats out_alt=%d rate=%u pkts=%" PRIu64 " frames=%" PRIu64 " pkt=%u..%u bad=%" PRIu64
++        " overrun=%" PRIu64 " underrun=%" PRIu64 " fifo=%" PRIu64 " fb=%" PRIu64 " in_alt=%d in_pkts=%"
++        PRIu64 " in_frames=%" PRIu64 "\n",
++        s->out_alt, s->rate_out, s->out_packets, s->out_frames, s->min_pkt, s->max_pkt, s->out_bad,
++        s->out_overrun, s->out_underrun, s->fifo.prod - s->fifo.cons, s->fb_packets, s->in_alt,
++        s->in_packets, s->in_frames);
++    s->min_pkt = 0xFFFF;
++    s->max_pkt = 0;
++}
++
++static void handle_out(UACState *s, USBPacket *p)
++{
++    int sub = s->out_alt == 2 ? 3 : (s->out_alt == 3 ? 4 : 2);
++    int fsz = sub * 2;
++    size_t len = p->iov.size;
++    uint8_t buf[4096];
++    size_t frames, i;
++
++    if (!s->out_alt) {
++        p->status = USB_RET_STALL;
++        return;
++    }
++    if (len > sizeof(buf)) {
++        len = sizeof(buf);
++    }
++    usb_packet_copy(p, buf, len);
++    if (len % fsz) {
++        s->out_bad++;
++    }
++    frames = len / fsz;
++    s->out_packets++;
++    s->out_frames += frames;
++    if (frames < s->min_pkt) {
++        s->min_pkt = frames;
++    }
++    if (frames > s->max_pkt) {
++        s->max_pkt = frames;
++    }
++    for (i = 0; i < frames; i++) {
++        int16_t lr[2];
++        int c;
++        for (c = 0; c < 2; c++) {
++            const uint8_t *d = buf + i * fsz + c * sub;
++            int16_t v = (int16_t)(d[sub - 2] | (d[sub - 1] << 8));    /* top 16 bits */
++            if (s->mute[0] || s->mute[1 + c]) {
++                v = 0;
++            }
++            lr[c] = v;
++        }
++        if (s->fifo.prod - s->fifo.cons + 4 > s->fifo.size) {
++            s->out_overrun++;
++            break;
++        }
++        memcpy(s->fifo.data + (s->fifo.prod % s->fifo.size), lr, 4);
++        s->fifo.prod += 4;
++    }
++    report(s, false);
++}
++
++static void handle_feedback(UACState *s, USBPacket *p)
++{
++    double rate = s->rate_out * (1.0 + s->fbppm / 1e6);
++    uint8_t v[4];
++    uint32_t f;
++    int n;
++
++    if (s->version == 2 && s->hs) {
++        f = (uint32_t)(rate / 8000.0 * 65536.0 + 0.5);        /* 16.16 per microframe */
++        v[0] = f; v[1] = f >> 8; v[2] = f >> 16; v[3] = f >> 24;
++        n = 4;
++    } else {
++        f = (uint32_t)(rate / 1000.0 * 16384.0 + 0.5);        /* 10.14 per frame */
++        v[0] = f; v[1] = f >> 8; v[2] = f >> 16;
++        n = 3;
++    }
++    if (p->iov.size < n) {
++        n = p->iov.size;
++    }
++    usb_packet_copy(p, v, n);
++    s->fb_packets++;
++}
++
++/* ------------------------------------------------------------------ */
++/* capture                                                             */
++/* ------------------------------------------------------------------ */
++
++static void handle_in(UACState *s, USBPacket *p)
++{
++    int chans = s->in_alt == 2 ? 1 : 2;
++    int fsz = 2 * chans;
++    uint32_t per = s->hs ? (8000 >> (s->hsint - 1)) : 1000;
++    uint8_t buf[2048];
++    uint32_t frames, i;
++
++    if (!s->in_alt) {
++        p->status = USB_RET_STALL;
++        return;
++    }
++    /* exact long term rate: frames in this packet from an accumulator */
++    /* the device clock (fbppm) also paces capture: implicit feedback */
++    s->in_acc += (uint64_t)s->rate_in * (uint64_t)(1000000 + s->fbppm);
++    frames = s->in_acc / ((uint64_t)per * 1000000);
++    s->in_acc %= (uint64_t)per * 1000000;
++    if (frames * fsz > p->iov.size) {
++        frames = p->iov.size / fsz;
++    }
++    if (frames * fsz > sizeof(buf)) {
++        frames = sizeof(buf) / fsz;
++    }
++    for (i = 0; i < frames; i++) {
++        int16_t l = (int16_t)(16384.0 * sin(s->phase_l));
++        int16_t r = (int16_t)(16384.0 * sin(s->phase_r));
++        s->phase_l += 2 * M_PI * 1000.0 / s->rate_in;
++        s->phase_r += 2 * M_PI * 1500.0 / s->rate_in;
++        if (s->phase_l > 2 * M_PI) {
++            s->phase_l -= 2 * M_PI;
++        }
++        if (s->phase_r > 2 * M_PI) {
++            s->phase_r -= 2 * M_PI;
++        }
++        if (s->mute[4]) {
++            l = r = 0;
++        }
++        buf[i * fsz] = l;
++        buf[i * fsz + 1] = l >> 8;
++        if (chans == 2) {
++            buf[i * fsz + 2] = r;
++            buf[i * fsz + 3] = r >> 8;
++        }
++    }
++    usb_packet_copy(p, buf, frames * fsz);
++    s->in_packets++;
++    s->in_frames += frames;
++}
++
++static void uac_handle_data(USBDevice *dev, USBPacket *p)
++{
++    UACState *s = USB_UAC(dev);
++
++    if (p->pid == USB_TOKEN_OUT && p->ep->nr == (EP_OUT & 0xf)) {
++        handle_out(s, p);
++        return;
++    }
++    if (p->pid == USB_TOKEN_IN && p->ep->nr == (EP_FB & 0xf) && s->feedback) {
++        handle_feedback(s, p);
++        return;
++    }
++    if (p->pid == USB_TOKEN_IN && p->ep->nr == (EP_IN & 0xf) && s->capture) {
++        handle_in(s, p);
++        return;
++    }
++    if (p->pid == USB_TOKEN_OUT && p->ep->nr == (EP_MIDI & 0xf) && s->midi) {
++        uint8_t b[512];
++        size_t len = MIN(p->iov.size, sizeof(b)), i;
++        usb_packet_copy(p, b, len);
++        for (i = 0; i + 3 < len; i += 4) {
++            DBG(s, "midi %02x %02x %02x %02x\n", b[i], b[i + 1], b[i + 2], b[i + 3]);
++        }
++        return;
++    }
++    p->status = USB_RET_STALL;
++}
++
++/* ------------------------------------------------------------------ */
++/* controls                                                            */
++/* ------------------------------------------------------------------ */
++
++static bool rate_ok(UACState *s, uint32_t r)
++{
++    int i;
++    for (i = 0; i < 3; i++) {
++        if ((s->ratemask & (1 << i)) && uac_rates[i] == r) {
++            return true;
++        }
++    }
++    return false;
++}
++
++static void set_rate(UACState *s, bool out, uint32_t r)
++{
++    if (!rate_ok(s, r)) {
++        DBG(s, "SET rate %u rejected\n", r);
++        return;
++    }
++    DBG(s, "SET rate %s %u\n", out ? "out" : "in", r);
++    if (out || s->version == 2) {
++        s->rate_out = r;
++        open_voice(s);
++    }
++    if (!out || s->version == 2) {
++        s->rate_in = r;
++        s->in_acc = 0;
++    }
++}
++
++/* index into mute/vol: 0..3 playback master/L/R, 4..7 capture */
++static int ctl_slot(uint8_t unit, uint8_t cn)
++{
++    if (cn > 2) {
++        return -1;
++    }
++    if (unit == ID_FU_PLAY) {
++        return cn;
++    }
++    if (unit == ID_FU_REC) {
++        return 4 + cn;
++    }
++    return -1;
++}
++
++static int uac2_request(UACState *s, int request, int value, int index, int length, uint8_t *data)
++{
++    uint8_t cs = value >> 8, cn = value & 0xff, ent = index >> 8;
++    bool get = (request >> 8) & 0x80;
++    uint8_t req = request & 0xff;
++    int slot;
++
++    if (ent == ID_CLOCK) {
++        if (cs == 1 && req == 1) {                      /* SAM_FREQ CUR */
++            if (get) {
++                uint32_t r = s->rate_out;
++                data[0] = r; data[1] = r >> 8; data[2] = r >> 16; data[3] = r >> 24;
++                return 4;
++            }
++            set_rate(s, true, data[0] | (data[1] << 8) | (data[2] << 16) | ((uint32_t)data[3] << 24));
++            return 0;
++        }
++        if (cs == 1 && req == 2 && get) {               /* SAM_FREQ RANGE */
++            int i, n = 0;
++            uint8_t out[2 + 12 * 3];
++            for (i = 0; i < 3; i++) {
++                if (s->ratemask & (1 << i)) {
++                    uint8_t *e = out + 2 + 12 * n;
++                    uint32_t r = uac_rates[i];
++                    e[0] = r; e[1] = r >> 8; e[2] = r >> 16; e[3] = 0;
++                    e[4] = r; e[5] = r >> 8; e[6] = r >> 16; e[7] = 0;
++                    memset(e + 8, 0, 4);
++                    n++;
++                }
++            }
++            out[0] = n; out[1] = 0;
++            DBG(s, "GET clock range (%d)\n", length);
++            n = MIN(2 + 12 * n, length);
++            memcpy(data, out, n);
++            return n;
++        }
++        if (cs == 2 && req == 1 && get) {               /* CLOCK_VALID */
++            data[0] = 1;
++            return 1;
++        }
++        return -1;
++    }
++    slot = ctl_slot(ent, cn);
++    if (slot < 0) {
++        return -1;
++    }
++    if (cs == 1 && req == 1) {                          /* MUTE CUR */
++        if (get) {
++            data[0] = s->mute[slot];
++            return 1;
++        }
++        s->mute[slot] = data[0] & 1;
++        DBG(s, "SET mute unit %u ch %u = %u\n", ent, cn, data[0] & 1);
++        return 0;
++    }
++    if (cs == 2 && req == 1) {                          /* VOLUME CUR */
++        if (get) {
++            data[0] = s->vol[slot]; data[1] = s->vol[slot] >> 8;
++            return 2;
++        }
++        s->vol[slot] = (int16_t)(data[0] | (data[1] << 8));
++        DBG(s, "SET volume unit %u ch %u = %d\n", ent, cn, s->vol[slot]);
++        return 0;
++    }
++    if (cs == 2 && req == 2 && get) {                   /* VOLUME RANGE */
++        uint8_t r[8] = { 1, 0, U16(0xC400), U16(0x0600), U16(0x0100) };  /* -60 .. +6 dB, 1 dB */
++        int n = MIN(8, length);
++        memcpy(data, r, n);
++        return n;
++    }
++    return -1;
++}
++
++static int uac1_request(UACState *s, int request, int value, int index, int length, uint8_t *data)
++{
++    uint8_t cs = value >> 8, cn = value & 0xff, unit = index >> 8;
++    uint8_t req = request & 0xff;
++    bool ep = (request >> 8 & 0x1f) == 2;
++    int slot;
++
++    if (ep) {
++        if (cs == 1 && req == 0x01) {                   /* SET_CUR SAMPLING_FREQ */
++            set_rate(s, (index & 0x80) == 0, data[0] | (data[1] << 8) | (data[2] << 16));
++            return 0;
++        }
++        if (cs == 1 && req == 0x81) {
++            uint32_t r = (index & 0x80) ? s->rate_in : s->rate_out;
++            data[0] = r; data[1] = r >> 8; data[2] = r >> 16;
++            return 3;
++        }
++        return -1;
++    }
++    slot = ctl_slot(unit, cn);
++    if (slot < 0) {
++        return -1;
++    }
++    if (cs == 1) {
++        if (req == 0x01) {
++            s->mute[slot] = data[0] & 1;
++            DBG(s, "SET mute unit %u ch %u = %u\n", unit, cn, data[0] & 1);
++            return 0;
++        }
++        if (req == 0x81) {
++            data[0] = s->mute[slot];
++            return 1;
++        }
++        return -1;
++    }
++    if (cs == 2) {
++        int16_t v;
++        switch (req) {
++        case 0x01:
++            s->vol[slot] = (int16_t)(data[0] | (data[1] << 8));
++            DBG(s, "SET volume unit %u ch %u = %d\n", unit, cn, s->vol[slot]);
++            return 0;
++        case 0x81: v = s->vol[slot]; break;
++        case 0x82: v = (int16_t)0xC400; break;
++        case 0x83: v = 0x0600; break;
++        case 0x84: v = 0x0100; break;
++        default: return -1;
++        }
++        data[0] = v; data[1] = v >> 8;
++        return 2;
++    }
++    return -1;
++}
++
++static void uac_handle_control(USBDevice *dev, USBPacket *p, int request, int value,
++                               int index, int length, uint8_t *data)
++{
++    UACState *s = USB_UAC(dev);
++    int ret;
++
++    ret = usb_desc_handle_control(dev, p, request, value, index, length, data);
++    if (ret >= 0) {
++        return;
++    }
++    if (((request >> 8) & 0x60) != 0x20) {
++        p->status = USB_RET_STALL;
++        return;
++    }
++    ret = (s->version == 2) ? uac2_request(s, request, value, index, length, data)
++                            : uac1_request(s, request, value, index, length, data);
++    if (ret < 0) {
++        DBG(s, "request %04x value %04x index %04x len %d stalled\n", request, value, index, length);
++        p->status = USB_RET_STALL;
++        return;
++    }
++    p->actual_length = ret;
++}
++
++static void uac_set_interface(USBDevice *dev, int iface, int old, int value)
++{
++    UACState *s = USB_UAC(dev);
++
++    DBG(s, "set_interface if=%d alt=%d\n", iface, value);
++    if (iface == 1) {
++        s->out_alt = value;
++        s->fifo.prod = s->fifo.cons = 0;
++        AUD_set_active_out(s->vout, value != 0);
++    } else if (iface == 2) {
++        s->in_alt = value;
++        s->in_acc = 0;
++    }
++    report(s, true);
++}
++
++static void uac_handle_reset(USBDevice *dev)
++{
++    UACState *s = USB_UAC(dev);
++
++    s->out_alt = s->in_alt = 0;
++    if (s->vout) {
++        AUD_set_active_out(s->vout, false);
++    }
++}
++
++static void uac_unrealize(USBDevice *dev)
++{
++    UACState *s = USB_UAC(dev);
++
++    report(s, true);
++    AUD_close_out(&s->card, s->vout);
++    AUD_remove_card(&s->card);
++    g_free(s->fifo.data);
++}
++
++static void uac_realize(USBDevice *dev, Error **errp)
++{
++    UACState *s = USB_UAC(dev);
++    int i;
++
++    if (s->version != 1 && s->version != 2) {
++        error_setg(errp, "uac must be 1 or 2");
++        return;
++    }
++    if (s->version == 1) {
++        s->hs = false;
++    }
++    if (s->implicit) {
++        s->feedback = false;        /* asynchronous, paced by the capture stream */
++    }
++    if (s->hsint < 1 || s->hsint > 4) {
++        s->hsint = 1;
++    }
++    if (!(s->ratemask & 7)) {
++        s->ratemask = 7;
++    }
++    if (!AUD_register_card(TYPE_USB_UAC, &s->card, errp)) {
++        return;
++    }
++    build_desc(s);
++    dev->usb_desc = &s->desc;
++    usb_desc_create_serial(dev);
++    usb_desc_init(dev);
++    s->rate_out = s->rate_in = (s->ratemask & 2) ? 48000 : uac_rates[ctz32(s->ratemask)];
++    for (i = 0; i < 8; i++) {
++        s->mute[i] = (i == 0 || i == 4);    /* like many real devices: muted until told */
++        s->vol[i] = (int16_t)0xE200;        /* -30 dB */
++    }
++    s->min_pkt = 0xFFFF;
++    open_voice(s);
++    DBG(s, "uac%u %s speed, capture %d, feedback %d (%d ppm), rates %x\n", s->version,
++        s->hs ? "high" : "full", s->capture, s->feedback, s->fbppm, s->ratemask);
++}
++
++static const VMStateDescription vmstate_uac = {
++    .name = TYPE_USB_UAC,
++    .unmigratable = 1,
++};
++
++static Property uac_properties[] = {
++    DEFINE_AUDIO_PROPERTIES(UACState, card),
++    DEFINE_PROP_UINT32("uac", UACState, version, 2),
++    DEFINE_PROP_BOOL("hs", UACState, hs, true),
++    DEFINE_PROP_BOOL("capture", UACState, capture, true),
++    DEFINE_PROP_BOOL("feedback", UACState, feedback, true),
++    DEFINE_PROP_INT32("fbppm", UACState, fbppm, 0),
++    DEFINE_PROP_UINT32("ratemask", UACState, ratemask, 7),
++    DEFINE_PROP_UINT32("hsint", UACState, hsint, 1),
++    DEFINE_PROP_UINT32("debug", UACState, debug, 0),
++    DEFINE_PROP_BOOL("midi", UACState, midi, false),
++    DEFINE_PROP_BOOL("implicit", UACState, implicit, false),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void uac_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    USBDeviceClass *k = USB_DEVICE_CLASS(klass);
++
++    dc->vmsd = &vmstate_uac;
++    device_class_set_props(dc, uac_properties);
++    set_bit(DEVICE_CATEGORY_SOUND, dc->categories);
++    k->product_desc = "QEMU USB Audio Class test device";
++    k->realize = uac_realize;
++    k->handle_reset = uac_handle_reset;
++    k->handle_attach = usb_desc_attach;
++    k->handle_control = uac_handle_control;
++    k->handle_data = uac_handle_data;
++    k->unrealize = uac_unrealize;
++    k->set_interface = uac_set_interface;
++}
++
++static const TypeInfo uac_info = {
++    .name = TYPE_USB_UAC,
++    .parent = TYPE_USB_DEVICE,
++    .instance_size = sizeof(UACState),
++    .class_init = uac_class_init,
++};
++
++static void uac_register_types(void)
++{
++    type_register_static(&uac_info);
++}
++
++type_init(uac_register_types)
+diff --git a/hw/usb/hcd-ehci.c b/hw/usb/hcd-ehci.c
+index 19b4534..cbd5207 100644
+--- a/hw/usb/hcd-ehci.c
++++ b/hw/usb/hcd-ehci.c
+@@ -1743,8 +1743,56 @@ static int ehci_state_fetchsitd(EHCIState *ehci, int async)
+     if (!(sitd.results & SITD_RESULTS_ACTIVE)) {
+         /* siTD is not active, nothing to do */;
+     } else {
+-        /* TODO: split transfers are not implemented */
+-        warn_report("Skipping active siTD");
++        /* split isochronous transfer, executed directly on the full speed
++           device (no transaction translator timing) */
++        uint32_t len = (sitd.results & SITD_RESULTS_TBYTES_MASK) >> 16;
++        uint32_t dir = (sitd.epchar & SITD_EPCHAR_IO) ? 1 : 0;
++        uint32_t devaddr = sitd.epchar & SITD_EPCHAR_DEVADDR_MASK;
++        uint32_t endp = (sitd.epchar & SITD_EPCHAR_EPNUM_MASK) >> SITD_EPCHAR_EPNUM_SH;
++        uint32_t off = sitd.bufptr[0] & SITD_BUFPTR_CURROFF_MASK;
++        uint32_t ptr1 = sitd.bufptr[0] & SITD_BUFPTR_MASK;
++        uint32_t ptr2 = sitd.bufptr[1] & SITD_BUFPTR_MASK;
++        USBDevice *dev = ehci_find_device(ehci, devaddr);
++        USBEndpoint *ep;
++        uint32_t pid = dir ? USB_TOKEN_IN : USB_TOKEN_OUT;
++
++        ehci->periodic_sched_active = PERIODIC_ACTIVE;
++        if (len > 1023) {
++            len = 1023;
++        }
++        qemu_sglist_init(&ehci->isgl, ehci->device, 2, ehci->as);
++        if (off + len > 4096) {
++            qemu_sglist_add(&ehci->isgl, ptr1 + off, 4096 - off);
++            qemu_sglist_add(&ehci->isgl, ptr2, off + len - 4096);
++        } else if (len) {
++            qemu_sglist_add(&ehci->isgl, ptr1 + off, len);
++        }
++        ehci->ipacket.actual_length = 0;
++        ep = dev ? usb_ep_get(dev, pid, endp) : NULL;
++        if (ep && ep->type == USB_ENDPOINT_XFER_ISOC) {
++            usb_packet_setup(&ehci->ipacket, pid, ep, 0, entry, false,
++                             (sitd.results & SITD_RESULTS_IOC) != 0);
++            if (usb_packet_map(&ehci->ipacket, &ehci->isgl) == 0) {
++                usb_handle_packet(dev, &ehci->ipacket);
++                usb_packet_unmap(&ehci->ipacket, &ehci->isgl);
++            }
++        } else {
++            ehci->ipacket.status = USB_RET_NODEV;
++        }
++        qemu_sglist_destroy(&ehci->isgl);
++        if (ehci->ipacket.status != USB_RET_SUCCESS &&
++            ehci->ipacket.status != USB_RET_NAK) {
++            sitd.results |= SITD_RESULTS_XACTERR;
++            ehci_raise_irq(ehci, USBSTS_ERRINT);
++        }
++        sitd.results = (sitd.results & ~SITD_RESULTS_TBYTES_MASK) |
++                       (((len - ehci->ipacket.actual_length) << 16) & SITD_RESULTS_TBYTES_MASK);
++        sitd.results &= ~SITD_RESULTS_ACTIVE;
++        if (sitd.results & SITD_RESULTS_IOC) {
++            ehci_raise_irq(ehci, USBSTS_INT);
++        }
++        put_dwords(ehci, NLPTR_GET(entry), (uint32_t *)&sitd,
++                   sizeof(EHCIsitd) >> 2);
+     }
+ 
+     ehci_set_fetch_addr(ehci, async, sitd.next);
+diff --git a/hw/usb/meson.build b/hw/usb/meson.build
+index e94149e..fd817da 100644
+--- a/hw/usb/meson.build
++++ b/hw/usb/meson.build
+@@ -41,7 +41,7 @@ system_ss.add(when: 'CONFIG_USB_STORAGE_CORE', if_true: files('dev-storage.c'))
+ system_ss.add(when: 'CONFIG_USB_STORAGE_BOT', if_true: files('dev-storage-bot.c'))
+ system_ss.add(when: 'CONFIG_USB_STORAGE_CLASSIC', if_true: files('dev-storage-classic.c'))
+ system_ss.add(when: 'CONFIG_USB_STORAGE_UAS', if_true: files('dev-uas.c'))
+-system_ss.add(when: 'CONFIG_USB_AUDIO', if_true: files('dev-audio.c'))
++system_ss.add(when: 'CONFIG_USB_AUDIO', if_true: files('dev-audio.c', 'dev-uac.c'))
+ system_ss.add(when: 'CONFIG_USB_SERIAL', if_true: files('dev-serial.c'))
+ system_ss.add(when: 'CONFIG_USB_NETWORK', if_true: files('dev-network.c'))
+ system_ss.add(when: ['CONFIG_POSIX', 'CONFIG_USB_STORAGE_MTP'], if_true: files('dev-mtp.c'))

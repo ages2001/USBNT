@@ -70,6 +70,7 @@
 #define TRB_SETUP           2
 #define TRB_DATA            3
 #define TRB_STATUS          4
+#define TRB_ISOCH           5
 #define TRB_LINK            6
 #define TRB_ENABLE_SLOT     9
 #define TRB_DISABLE_SLOT    10
@@ -104,6 +105,9 @@
 #define CC_TRB_ERROR        5
 #define CC_STALL            6
 #define CC_SHORT_PACKET     13
+#define CC_RING_UNDERRUN    14
+#define CC_RING_OVERRUN     15
+#define CC_MISSED_SERVICE   23
 #define CC_CONTEXT_STATE    19
 #define CC_STOPPED          26
 #define CC_STOPPED_LEN      27
@@ -111,6 +115,8 @@
 #define SEG_TRBS            256         /* TRBs per ring segment, the last is a link */
 #define RING_MAX_SEGS       4
 #define BULK_SEGS           4
+#define ISO_SEGS            4
+#define TRB_SIA             0x80000000
 #define EVENT_TRBS          256
 #define XHCI_MAX_SLOTS      64
 #define XHCI_MAX_STREAMS    32
@@ -370,6 +376,9 @@ static int XhciCommand(XHC *x, ULONG d0, ULONG d1, ULONG d2, ULONG d3, ULONG *Sl
     OS_IRQL irql;
     ULONG code;
 
+    if (x->Hc->Removed) {
+        return -1;                                  /* unplugged (Thunderbolt dock): nobody answers */
+    }
     OsEventReset(&x->CmdEvent);
     irql = OsLock();
     x->CmdBusy = 1;
@@ -464,6 +473,12 @@ static ULONG EpInterval(USB_PIPE *p)
             b = 16;
         }
         return b - 1;
+    } else if (p->Type == USB_EP_ISOCH) {
+        /* full speed isochronous: 2^(bInterval-1) frames */
+        if (b == 0) {
+            b = 1;
+        }
+        return (b + 2 > 15) ? 15 : b + 2;
     } else {
         ULONG frames = b ? b : 1;
         ULONG units = frames * 8;
@@ -483,6 +498,8 @@ static void FillEpCtx(XHC *x, XSLOT *s, XEP *ep, USB_PIPE *p)
     ULONG burst = p->MaxBurst;
     ULONG avg;
     ULONG esit = 0;
+    ULONG mult = 0;
+    ULONG cerr = 3;
 
     switch (p->Type) {
     case USB_EP_CONTROL:   type = 4; avg = 8; break;
@@ -493,9 +510,19 @@ static void FillEpCtx(XHC *x, XSLOT *s, XEP *ep, USB_PIPE *p)
     if (p->Type == USB_EP_INTERRUPT) {
         esit = mps * (burst + 1);
     }
+    if (p->Type == USB_EP_ISOCH) {
+        if (p->Dev->Speed == USB_SPEED_HIGH) {
+            burst = p->Mult ? p->Mult - 1UL : 0;     /* high bandwidth: transactions per microframe */
+        } else if (p->Dev->Speed == USB_SPEED_SUPER) {
+            mult = p->Mult ? p->Mult - 1UL : 0;
+        }
+        esit = mps * (burst + 1) * (mult + 1);
+        avg = esit;
+        cerr = 0;
+    }
     UsbMemSet(ec, 0, x->CtxSize);
-    ec[0] = (EpInterval(p) << 16) | ((esit >> 16) << 24);
-    ec[1] = (3UL << 1) | (type << 3) | (burst << 8) | (mps << 16);
+    ec[0] = (EpInterval(p) << 16) | ((esit >> 16) << 24) | (mult << 8);
+    ec[1] = (cerr << 1) | (type << 3) | (burst << 8) | (mps << 16);
     if (ep->NumStreams != 0) {
         ULONG n = 0;
         while ((2UL << n) < ep->PsaSize) {
@@ -622,6 +649,23 @@ static int XhciStart(USB_HC *Hc)
         OpWr(x, XOP_USBCMD, OpRd(x, XOP_USBCMD) & ~CMD_RS);
         WaitOp(x, XOP_USBSTS, STS_HCH, STS_HCH, 100);
     }
+    /* 64 bit base addresses the firmware (or an earlier driver) left: zeroed before the reset -
+       Renesas uPD720201 / 720202 keep the upper half through a reset and then mix it with ours
+       (Linux XHCI_ZERO_64B_REGS); harmless on the others, the controller is halted */
+    if (OpRd(x, XOP_DCBAAP + 4) != 0 || OpRd(x, XOP_CRCR + 4) != 0 || RtRd(x, XRT_ERSTBA + 4) != 0 ||
+        RtRd(x, XRT_ERDP + 4) != 0) {
+        UsbLog(LOG_INFO, "xhci: 64 bit base registers left by the firmware, zeroed before the reset\n");
+        OpWr(x, XOP_USBCMD, OpRd(x, XOP_USBCMD) & ~0x8UL);          /* HSEIE off: the fault may come */
+        OpWr(x, XOP_DCBAAP, 0);
+        OpWr(x, XOP_DCBAAP + 4, 0);
+        OpWr(x, XOP_CRCR, 0);
+        OpWr(x, XOP_CRCR + 4, 0);
+        RtWr(x, XRT_ERSTBA, 0);
+        RtWr(x, XRT_ERSTBA + 4, 0);
+        RtWr(x, XRT_ERDP, 0);
+        RtWr(x, XRT_ERDP + 4, 0);
+        OsSleepMs(1);
+    }
     OpWr(x, XOP_USBCMD, CMD_HCRST);
     OsSleepMs(2);
     if (!WaitOp(x, XOP_USBCMD, CMD_HCRST, 0, 1000) || !WaitOp(x, XOP_USBSTS, STS_CNR, 0, 1000)) {
@@ -642,6 +686,7 @@ static int XhciStart(USB_HC *Hc)
     Hc->MaxXfer = 0x10000;
     Hc->SgMax = 0x200000;
     Hc->QueueOk = 1;
+    Hc->IsoOk = 1;
     if (((hcc >> 12) & 0xF) != 0) {
         ULONG psa = 2UL << ((hcc >> 12) & 0xF);
         Hc->MaxStreams = (UCHAR)((psa - 1 > XHCI_MAX_STREAMS) ? XHCI_MAX_STREAMS : psa - 1);
@@ -766,7 +811,8 @@ static void XhciLinkRate(USB_HC *Hc, int Port, ULONG sc)
     if (XhciPortSpeed(sc) == USB_SPEED_SUPER) {
         g = x->SsGbps[id];
         if (g == 0) {
-            g = (UCHAR)((id == 5) ? 10 : 5);
+            /* default speed ids: 4 Gen 1, 5 Gen 2, 6 Gen 1x2, 7 Gen 2x2 */
+            g = (UCHAR)((id == 7) ? 20 : (id == 5 || id == 6) ? 10 : 5);
         }
     }
     Hc->PortGbps[Port] = g;
@@ -903,7 +949,8 @@ static XEP *EpAlloc(XSLOT *s, ULONG Dci, USB_PIPE *Pipe)
         }
         s->Ep[Dci] = ep;
     }
-    if (RingInit(&ep->Ring, (Pipe->Type == USB_EP_BULK) ? BULK_SEGS : 1) != USB_OK) {
+    if (RingInit(&ep->Ring, (Pipe->Type == USB_EP_BULK) ? BULK_SEGS : (Pipe->Type == USB_EP_ISOCH) ? ISO_SEGS : 1) !=
+        USB_OK) {
         return NULL;
     }
     ep->Dci = (UCHAR)Dci;
@@ -1143,6 +1190,147 @@ static ULONG TdTrbCount(USB_XFER *X)
     return n;
 }
 
+/*
+ * Isochronous: one TD per packet (an Isoch TRB, plus a Normal TRB when the
+ * packet crosses a 64 KB boundary), each scheduled as soon as possible
+ * after the previous one. IN TDs interrupt on completion so that every
+ * packet's length is reported; OUT transfers only on their last TD.
+ * Off[] holds the packet index (bit 16: second TRB of the packet).
+ */
+static int IsoSubmit(XRING *r, USB_XFER *X)
+{
+    USB_PIPE *p = X->Pipe;
+    ULONG mps = p->MaxPacket;
+    ULONG bsize = 1;
+    ULONG need = 0;
+    ULONG i;
+    ULONG *first = NULL;
+
+    if (p->Dev->Speed == USB_SPEED_HIGH) {
+        bsize = p->Mult ? p->Mult : 1;
+    } else if (p->Dev->Speed == USB_SPEED_SUPER) {
+        bsize = (ULONG)p->MaxBurst + 1;
+    }
+    for (i = 0; i < X->IsoCount; i++) {
+        ULONG a = X->Phys + X->Iso[i].Offset;
+        need += (X->Iso[i].Length && ((a ^ (a + X->Iso[i].Length - 1)) & 0xFFFF0000UL)) ? 2 : 1;
+    }
+    if (r->Used + need > RingCapacity(r)) {
+        return USB_ERR_BUSY;
+    }
+    for (i = 0; i < X->IsoCount; i++) {
+        USB_ISO_PACKET *pk = &X->Iso[i];
+        ULONG a = X->Phys + pk->Offset;
+        ULONG len = pk->Length;
+        ULONG len0 = len;
+        ULONG tdpc = (len + mps - 1) / mps;
+        ULONG tbc, tlbpc;
+        ULONG ioc = (p->DirIn || i + 1 == X->IsoCount) ? TRB_IOC : 0;
+        ULONG trb;
+        BOOLEAN split = (BOOLEAN)(len && ((a ^ (a + len - 1)) & 0xFFFF0000UL));
+        if (tdpc == 0) {
+            tdpc = 1;
+        }
+        tbc = (tdpc + bsize - 1) / bsize - 1;
+        tlbpc = (tdpc % bsize) ? (tdpc % bsize) - 1 : bsize - 1;
+        if (split) {
+            len0 = 0x10000 - (a & 0xFFFF);
+        }
+        pk->Actual = 0;
+        pk->Status = USB_ERR_BUSY;
+        trb = RingPutEx(r, a, 0, len0 | ((split ? 1UL : 0UL) << 17),
+                        TRB_TYPE(TRB_ISOCH) | TRB_ISP | TRB_SIA | (tbc << 7) | (tlbpc << 16) |
+                        (split ? TRB_CH : ioc), (BOOLEAN)(i == 0));
+        r->Owner[r->LastIdx] = X;
+        r->Off[r->LastIdx] = i;
+        if (i == 0) {
+            X->Hc[0] = trb;
+            first = r->Last;
+        }
+        X->Hc[2] = trb;
+        if (split) {
+            trb = RingPut(r, a + len0, 0, len - len0, TRB_TYPE(TRB_NORMAL) | TRB_ISP | ioc);
+            r->Owner[r->LastIdx] = X;
+            r->Off[r->LastIdx] = i | 0x10000;
+            X->Hc[2] = trb;
+        }
+    }
+    X->Hc[6] = need;
+    r->Used += need;
+    RingRelease(first);
+    return USB_OK;
+}
+
+/* completes an isochronous transfer; packets without an event went out (OUT) or were missed (IN) */
+static void IsoFinish(XRING *r, USB_XFER *X)
+{
+    ULONG i, total = 0;
+
+    for (i = 0; i < X->IsoCount; i++) {
+        USB_ISO_PACKET *pk = &X->Iso[i];
+        if (pk->Status == USB_ERR_BUSY) {
+            if (X->Pipe->DirIn) {
+                pk->Status = USB_ERR_IO;
+                pk->Actual = 0;
+            } else {
+                pk->Status = USB_OK;
+                pk->Actual = pk->Length;
+            }
+        }
+        total += pk->Actual;
+    }
+    if (r->Used >= X->Hc[6]) {
+        r->Used -= X->Hc[6];
+    } else {
+        r->Used = 0;
+    }
+    UsbXferDone(X, USB_OK, total);
+}
+
+static void IsoEvent(XRING *r, USB_PIPE *pipe, LONG idx, ULONG ptr, ULONG cc, ULONG resid)
+{
+    USB_XFER *X = r->Owner[idx];
+    USB_ISO_PACKET *pk;
+    ULONG pi = r->Off[idx] & 0xFFFF;
+    BOOLEAN second = (BOOLEAN)((r->Off[idx] & 0x10000) != 0);
+    ULONG len = RingTrb(r, (ULONG)idx)[2] & 0x1FFFF;
+
+    if (X == NULL || !X->Busy || pi >= X->IsoCount) {
+        return;
+    }
+    /* earlier transfers the controller skipped over */
+    while (pipe->Cur != NULL && pipe->Cur != X) {
+        IsoFinish(r, pipe->Cur);
+    }
+    pk = &X->Iso[pi];
+    if (cc == CC_SUCCESS || cc == CC_SHORT_PACKET) {
+        if (!second) {
+            if (pk->Status == USB_ERR_BUSY) {
+                pk->Actual = (USHORT)(len - (resid > len ? len : resid));
+                if (cc == CC_SHORT_PACKET || pk->Actual >= pk->Length) {
+                    pk->Status = USB_OK;
+                }
+            }
+        } else if (pk->Status == USB_ERR_BUSY) {
+            ULONG first = pk->Length - len;
+            pk->Actual = (USHORT)(first + len - (resid > len ? len : resid));
+            pk->Status = USB_OK;
+        }
+        if (pk->Status == USB_ERR_BUSY && !second && cc == CC_SUCCESS) {
+            pk->Status = USB_OK;
+        }
+    } else if (cc != CC_STOPPED && cc != CC_STOPPED_LEN) {
+        pk->Status = (cc == CC_BABBLE) ? USB_ERR_BABBLE : USB_ERR_IO;
+        pk->Actual = 0;
+        if (cc == CC_MISSED_SERVICE) {
+            pipe->IsoLate = 1;
+        }
+    }
+    if (ptr == X->Hc[2]) {
+        IsoFinish(r, X);
+    }
+}
+
 static int XhciSubmit(USB_XFER *X)
 {
     USB_PIPE *p = X->Pipe;
@@ -1159,7 +1347,7 @@ static int XhciSubmit(USB_XFER *X)
     UsbMemSet(X->Hc, 0, sizeof(X->Hc));
 
     if (p->Type == USB_EP_CONTROL) {
-        const UCHAR *su = Dev->Page;
+        const UCHAR *su = X->Setup != NULL ? X->Setup : Dev->Page;
         ULONG trt = 0;
         if (X->Length != 0) {
             trt = X->DirIn ? 3 : 2;
@@ -1172,6 +1360,11 @@ static int XhciSubmit(USB_XFER *X)
         }
         X->Hc[2] = RingPut(r, 0, 0, 0, TRB_TYPE(TRB_STATUS) | TRB_IOC |
                            ((X->Length == 0 || !X->DirIn) ? TRB_DIR_IN : 0));
+    } else if (p->Type == USB_EP_ISOCH) {
+        int rr = IsoSubmit(r, X);
+        if (rr != USB_OK) {
+            return rr;
+        }
     } else {
         ULONG maxp = p->MaxPacket ? p->MaxPacket : 8;
         ULONG n = TdTrbCount(X);
@@ -1268,7 +1461,15 @@ static void HandleTransferEvent(XHC *x, ULONG *ev)
         pipe = ep->Pipe;
         idx = RingIndex(r, ptr);
     }
+    if ((cc == CC_RING_UNDERRUN || cc == CC_RING_OVERRUN) && ep->Pipe != NULL) {
+        ep->Pipe->IsoLate = 1;
+        return;
+    }
     if (idx < 0 || pipe == NULL) {
+        return;
+    }
+    if (pipe->Type == USB_EP_ISOCH) {
+        IsoEvent(r, pipe, idx, ptr, cc, resid);
         return;
     }
     X = pipe->Cur;

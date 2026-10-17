@@ -7,6 +7,16 @@
 #include "../src/usbscsi.h"
 #include "../src/usbinput.h"
 #include "harness.h"
+#include "../src/tbt.h"
+
+void AudioHarnessInit(void);
+int AudioCommand(const char *c);
+int I2cHarnessCommand(const char *c);       /* i2c.c */
+int VideoHarnessCommand(const char *c);     /* video.c */
+int Ps2HarnessCommand(const char *c);       /* ps2.c */
+void Ps2HarnessPoll(void);
+int SmbusHarnessCommand(const char *c);     /* smbhar.c */
+void HarnessPs2Init(void);                  /* smbhar.c */
 
 static UCHAR DataBuf[0x10000];
 static UCHAR BigBuf[0x401000] __attribute__((aligned(4096)));
@@ -14,6 +24,8 @@ static ULONG BigPfn[0x402];
 static volatile ULONG ReqDone;
 static void HarnessReqDone(SCSI_REQ *r);
 static char Line[128];
+ULONG HarnessPollMs;
+static ULONG LastPoll;
 static int LinePos;
 
 void OsKbdInput(const USB_KEY_EVENT *Events, ULONG Count)
@@ -380,10 +392,35 @@ static void Command(const char *c)
         p = c + 5;
         UsbScsiEject((int)ParseNum(&p));
         HarnessPrintf("EJECT ok\n");
+    } else if (StartsWith(c, "tbt")) {
+        char name[48], detail[160];
+        int i, k;
+        UsbWorkerIteration();
+        for (i = 0; TbtInfo(i, name, sizeof(name), detail, sizeof(detail)); i++) {
+            for (k = 0; detail[k]; k++) {
+                if (detail[k] == '\n') {
+                    detail[k] = '|';
+                }
+            }
+            HarnessPrintf("TBT %s | %s\n", name, detail);
+        }
+    } else if (StartsWith(c, "pollms")) {
+        p = c + 6;
+        HarnessPollMs = ParseNum(&p);
+        HarnessPrintf("POLLMS ok\n");
     } else if (StartsWith(c, "debug")) {
         p = c + 5;
         UsbDebugLevel = ParseNum(&p);
         HarnessPrintf("DEBUG ok\n");
+    } else if (AudioCommand(c)) {
+        /* handled */
+    } else if (I2cHarnessCommand(c)) {
+        /* handled */
+    } else if (VideoHarnessCommand(c)) {
+        /* handled */
+    } else if (Ps2HarnessCommand(c)) {
+    } else if (SmbusHarnessCommand(c)) {
+        /* handled */
     } else if (c[0] != 0) {
         HarnessPrintf("ERR unknown\n");
     }
@@ -395,14 +432,38 @@ void kmain(unsigned long magic, unsigned long info)
     ULONG lastWork;
 
     (void)magic;
-    (void)info;
     SerialInit();
     OsInitHarness();
     HarnessPrintf("harness: start\n");
+    /* multiboot command line (-append): Name=Value settings before the start */
+    if (magic == 0x2BADB002 && info != 0 && (*(ULONG *)info & 4)) {
+        const char *cl = (const char *)*(ULONG *)(info + 16);
+        while (cl != NULL && *cl) {
+            char name[32];
+            int n = 0;
+            while (*cl == ' ') cl++;
+            while (*cl && *cl != '=' && *cl != ' ' && n < 31) name[n++] = *cl++;
+            name[n] = 0;
+            if (*cl == '=') {
+                const char *v = cl + 1;
+                ULONG val = ParseNum(&v);
+                cl = v;
+                if (n) {
+                    HarnessSetConfig(name, val);
+                    HarnessPrintf("harness: %s=%u\n", name, val);
+                }
+            }
+            while (*cl && *cl != ' ') cl++;
+        }
+    }
     UsbDebugLevel = LOG_INFO;
     UsbScsiInit();
+    AudioHarnessInit();
     if (UsbInit() != USB_OK) {
         HarnessPrintf("harness: no USB controller started\n");
+    }
+    if (OsGetConfig("HarnessPs2", 0)) {
+        HarnessPs2Init();                       /* the PS/2 mouse, as ntps2.c sees it */
     }
     UsbWorkerIteration();
     UsbWorkerIteration();
@@ -412,9 +473,13 @@ void kmain(unsigned long magic, unsigned long info)
 
     for (;;) {
         int ch;
-        UsbPollAll();
+        if (HarnessPollMs == 0 || OsTimeMs() - LastPoll >= HarnessPollMs) {
+            LastPoll = OsTimeMs();
+            UsbPollAll();
+        }
         HidTick();
-        if (HarnessWorkerWake || OsTimeMs() - lastWork > 100) {
+        Ps2HarnessPoll();
+        if (HarnessWorkerWake || OsTimeMs() - lastWork > (UsbPollWantMs ? UsbPollWantMs : 100)) {
             HarnessWorkerWake = 0;
             lastWork = OsTimeMs();
             UsbWorkerIteration();

@@ -1,0 +1,53 @@
+--- a/hw/usb/dev-uvc.c
++++ b/hw/usb/dev-uvc.c
+@@ -125,6 +125,7 @@
+ 
+     /* probe / commit */
+     uint8_t probe[34];
++    bool uvc10;                 /* UVC 1.0 camera (26 byte probe) */
+     uint8_t commit[34];
+     bool committed;
+     int alt;
+@@ -570,14 +571,14 @@
+     return g_memdup2(l->list, sizeof(USBDescOther) * l->n);
+ }
+ 
+-static void build_vc(USBDescIface *ifc)
++static void build_vc(USBDescIface *ifc, bool uvc10)
+ {
+     DescList l = { .n = 0 };
+     uint8_t ct[18] = { 18, 0x24, 0x02, ID_CAMERA, U16(0x0201), 0, 0, U16(0), U16(0), U16(0), 3, 0, 0, 0 };
+     uint8_t pu[12] = { 12, 0x24, 0x05, ID_PU, ID_CAMERA, U16(0), 2, 0x5F, 0x06, 0, 0 };
+     uint8_t ot[9] = { 9, 0x24, 0x03, ID_OT, U16(0x0101), 0, ID_PU, 0 };
+     uint16_t total = 13 + sizeof(ct) + sizeof(pu) + sizeof(ot);
+-    uint8_t hdr[13] = { 13, 0x24, 0x01, U16(0x0110), U16(total), U32(48000000), 1, 1 };
++    uint8_t hdr[13] = { 13, 0x24, 0x01, U16(uvc10 ? 0x0100 : 0x0110), U16(total), U32(48000000), 1, 1 };
+ 
+     dl_add(&l, hdr, sizeof(hdr));
+     dl_add(&l, ct, sizeof(ct));
+@@ -698,7 +699,7 @@
+                       USBDescIface *ifs, bool hs)
+ {
+     int n = 0;
+-    build_vc(&ifs[n++]);
++    build_vc(&ifs[n++], s->uvc10);
+     build_vs(s, ifs, &n, hs);
+     d->bcdUSB = 0x0200;
+     d->bDeviceClass = 0xEF;
+@@ -987,7 +988,7 @@
+         memcpy(data, tmp, n);
+         return n;
+     case 0x85:                                          /* GET_LEN */
+-        data[0] = sizeof(s->probe); data[1] = 0;
++        data[0] = s->uvc10 ? 26 : sizeof(s->probe); data[1] = 0;
+         return MIN(length, 2);
+     case 0x86:                                          /* GET_INFO */
+         data[0] = 3;
+@@ -1155,6 +1156,7 @@
+ 
+ static Property uvc_properties[] = {
+     DEFINE_PROP_BOOL("bulk", UVCState, bulk, false),
++    DEFINE_PROP_BOOL("uvc10", UVCState, uvc10, false),
+     DEFINE_PROP_BOOL("mjpeg-dht", UVCState, mjpeg_dht, false),
+     DEFINE_PROP_BOOL("mjpeg420", UVCState, mjpeg420, false),
+     DEFINE_PROP_UINT8("force-frame", UVCState, force_frame, 0),

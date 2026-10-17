@@ -47,6 +47,7 @@ typedef struct _CFG_ENTRY {
     BOOLEAN Present;
 } CFG_ENTRY;
 
+/* every name OsGetConfig is asked for must be here (build/ntbuild.sh checks) */
 static CFG_ENTRY Config[] = {
     { "DebugLevel",         L"DebugLevel",         0, FALSE },
     { "DebugPort",          L"DebugPort",          0, FALSE },
@@ -67,6 +68,37 @@ static CFG_ENTRY Config[] = {
     { "MaxTransferKB",      L"MaxTransferKB",      0, FALSE },
     { "Usb3Hubs",           L"Usb3Hubs",           0, FALSE },
     { "TimerResolution",    L"TimerResolution",    0, FALSE },
+    { "AudioLatencyMs",     L"AudioLatencyMs",     0, FALSE },
+    { "DisableAudio",       L"DisableAudio",       0, FALSE },
+    { "Ps2",                L"Ps2",                0, FALSE },
+    { "Ps2Touchpad",        L"Ps2Touchpad",        0, FALSE },
+    { "DisableSd",         L"DisableSd",         0, FALSE },
+    { "DisableVideo",      L"DisableVideo",      0, FALSE },
+    { "I2cHid",            L"I2cHid",            0, FALSE },
+    { "I2cHidAml",         L"I2cHidAml",         0, FALSE },
+    { "I2cHidGpio",        L"I2cHidGpio",        0, FALSE },
+    { "Smbus",             L"Smbus",             0, FALSE },
+    { "SmbusTouchpad",     L"SmbusTouchpad",     0, FALSE },
+    { "PciHotPlug",        L"PciHotPlug",        0, FALSE },
+    { "RelocateBars",      L"RelocateBars",      0, FALSE },
+    { "SdBrokenCd",        L"SdBrokenCd",        0, FALSE },
+    { "TouchpadGestures",  L"TouchpadGestures",  0, FALSE },
+    { "TouchpadScroll",    L"TouchpadScroll",    0, FALSE },
+    { "TouchpadSpeed",     L"TouchpadSpeed",     0, FALSE },
+    { "TouchpadTap",       L"TouchpadTap",       0, FALSE },
+    { "TouchpadEdgeScroll", L"TouchpadEdgeScroll", 0, FALSE },
+    { "TouchpadScrollSpeed", L"TouchpadScrollSpeed", 0, FALSE },
+    { "TouchpadAccel",     L"TouchpadAccel",     0, FALSE },
+    { "DisableNvme",       L"DisableNvme",       0, FALSE },
+    { "NvmeAtBoot",        L"NvmeAtBoot",        0, FALSE },
+    { "DisableTbt",        L"DisableTbt",        0, FALSE },
+    { "TbtApprove",        L"TbtApprove",        0, FALSE },
+    { "TbtUsb3Tunnel",     L"TbtUsb3Tunnel",     0, FALSE },
+    { "TbtLaneBonding",    L"TbtLaneBonding",    0, FALSE },
+    { "UsbPdo",            L"UsbPdo",            0, FALSE },
+    { "WindowsCamera",     L"WindowsCamera",     0, FALSE },
+    { "MaxPartitions",     L"MaxPartitions",     0, FALSE },
+    { "RemovableAsFixed",  L"RemovableAsFixed",  0, FALSE },
     { NULL, NULL, 0, FALSE }
 };
 
@@ -127,6 +159,11 @@ static BOOLEAN QueryDword(const WCHAR *Path, const WCHAR *Name, ULONG *Out)
     return FALSE;
 }
 
+BOOLEAN NtQueryDword(const WCHAR *Path, const WCHAR *Name, ULONG *Out)
+{
+    return QueryDword(Path, Name, Out);
+}
+
 /* Values are read from <service>\Parameters, then from the service key itself */
 static void ReadConfig(void)
 {
@@ -158,6 +195,90 @@ static void ReadConfig(void)
     }
 }
 
+/* Windows 2000 / XP: the parameters again (a controller that starts after usbinst changed them while
+   the driver was loaded, e.g. IntelRouteToXhci); PASSIVE_LEVEL */
+void NtReloadConfig(void)
+{
+    if (NtRegistryPath.Buffer != NULL && KeGetCurrentIrql() == PASSIVE_LEVEL) {
+        ReadConfig();
+    }
+}
+
+/* binary values in the service key (Thunderbolt keys: Tbt<uuid>) */
+typedef struct _STORE_Q {
+    void   *Data;
+    ULONG   Len;
+    BOOLEAN Found;
+} STORE_Q;
+
+static NTSTATUS NTAPI StoreQueryRoutine(PWSTR ValueName, ULONG ValueType, PVOID ValueData, ULONG ValueLength,
+                                        PVOID Context, PVOID EntryContext)
+{
+    STORE_Q *q = (STORE_Q *)EntryContext;
+
+    (void)ValueName;
+    (void)Context;
+    if (ValueType == REG_BINARY && ValueLength == q->Len) {
+        RtlMoveMemory(q->Data, ValueData, ValueLength);
+        q->Found = TRUE;
+    }
+    return STATUS_SUCCESS;
+}
+
+static void StoreName(const char *Name, WCHAR *W)
+{
+    int i;
+
+    for (i = 0; i < 63 && Name[i]; i++) {
+        W[i] = (WCHAR)(UCHAR)Name[i];
+    }
+    W[i] = 0;
+}
+
+BOOLEAN OsStoreGet(const char *Name, void *Data, ULONG Len)
+{
+    RTL_QUERY_REGISTRY_TABLE table[2];
+    WCHAR wname[64];
+    STORE_Q q;
+
+    if (NtRegistryPath.Buffer == NULL || KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return FALSE;
+    }
+    StoreName(Name, wname);
+    q.Data = Data;
+    q.Len = Len;
+    q.Found = FALSE;
+    RtlZeroMemory(table, sizeof(table));
+    table[0].QueryRoutine = StoreQueryRoutine;
+    table[0].Flags = RTL_QUERY_REGISTRY_REQUIRED | RTL_QUERY_REGISTRY_NOEXPAND;
+    table[0].Name = wname;
+    table[0].EntryContext = &q;
+    RtlQueryRegistryValues(RTL_REGISTRY_ABSOLUTE, NtRegistryPath.Buffer, table, NULL, NULL);
+    return q.Found;
+}
+
+BOOLEAN OsStoreSet(const char *Name, const void *Data, ULONG Len)
+{
+    WCHAR wname[64];
+
+    if (NtRegistryPath.Buffer == NULL || KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return FALSE;
+    }
+    StoreName(Name, wname);
+    return NT_SUCCESS(RtlWriteRegistryValue(RTL_REGISTRY_ABSOLUTE, NtRegistryPath.Buffer, wname, REG_BINARY,
+                                            (PVOID)Data, Len));
+}
+
+ULONGLONG OsEntropy(void)
+{
+    LARGE_INTEGER pc, st, tc;
+
+    pc = KeQueryPerformanceCounter(NULL);
+    KeQuerySystemTime(&st);
+    KeQueryTickCount(&tc);
+    return (ULONGLONG)pc.QuadPart ^ ((ULONGLONG)st.QuadPart << 7) ^ ((ULONGLONG)tc.QuadPart << 41);
+}
+
 void NtOsInit(PUNICODE_STRING RegistryPath)
 {
 
@@ -183,13 +304,13 @@ void NtOsInit(PUNICODE_STRING RegistryPath)
     DebugPort = OsGetConfig("DebugPort", 0);
     FastPollUs = OsGetConfig("FastPollUs", 3000);
     if (DebugPort != 0) {
-        WRITE_PORT_UCHAR((PUCHAR)(DebugPort + 1), 0x00);
-        WRITE_PORT_UCHAR((PUCHAR)(DebugPort + 3), 0x80);
-        WRITE_PORT_UCHAR((PUCHAR)(DebugPort + 0), 0x01);
-        WRITE_PORT_UCHAR((PUCHAR)(DebugPort + 1), 0x00);
-        WRITE_PORT_UCHAR((PUCHAR)(DebugPort + 3), 0x03);
-        WRITE_PORT_UCHAR((PUCHAR)(DebugPort + 2), 0xC7);
-        WRITE_PORT_UCHAR((PUCHAR)(DebugPort + 4), 0x03);
+        WRITE_PORT_UCHAR((PUCHAR)(ULONG_PTR)(DebugPort + 1), 0x00);
+        WRITE_PORT_UCHAR((PUCHAR)(ULONG_PTR)(DebugPort + 3), 0x80);
+        WRITE_PORT_UCHAR((PUCHAR)(ULONG_PTR)(DebugPort + 0), 0x01);
+        WRITE_PORT_UCHAR((PUCHAR)(ULONG_PTR)(DebugPort + 1), 0x00);
+        WRITE_PORT_UCHAR((PUCHAR)(ULONG_PTR)(DebugPort + 3), 0x03);
+        WRITE_PORT_UCHAR((PUCHAR)(ULONG_PTR)(DebugPort + 2), 0xC7);
+        WRITE_PORT_UCHAR((PUCHAR)(ULONG_PTR)(DebugPort + 4), 0x03);
     }
 }
 
@@ -314,7 +435,7 @@ static void PciLookup(void)
 static ULONG PciPortAccess(UCHAR Bus, UCHAR Dev, UCHAR Fn, ULONG Off, ULONG Val, int Size, BOOLEAN Write)
 {
     ULONG addr = 0x80000000UL | ((ULONG)Bus << 16) | ((ULONG)(Dev & 31) << 11) | ((ULONG)(Fn & 7) << 8) | (Off & 0xFC);
-    PUCHAR data = (PUCHAR)(ULONG)(0xCFC + (Off & 3));
+    PUCHAR data = (PUCHAR)(ULONG_PTR)(0xCFC + (Off & 3));
     KIRQL old;
     ULONG v = 0xFFFFFFFF;
 
@@ -401,7 +522,11 @@ LONG NtAtomicAdd(LONG volatile *Value, LONG Delta)
 
 PDRIVER_CANCEL NtSetCancelRoutine(PIRP Irp, PDRIVER_CANCEL Routine)
 {
+#ifdef USB_WDM
+    return IoSetCancelRoutine(Irp, Routine);
+#else
     return (PDRIVER_CANCEL)NtAtomicSwap((LONG volatile *)&Irp->CancelRoutine, (LONG)Routine);
+#endif
 }
 
 LONG NtAtomicSwap(LONG volatile *Value, LONG New)
@@ -418,6 +543,13 @@ LONG NtAtomicSwap(LONG volatile *Value, LONG New)
 #else
     return __sync_lock_test_and_set(Value, New);
 #endif
+}
+
+void OsUnmapMmio(void *Va, ULONG Len)
+{
+    if (Va != NULL) {
+        MmUnmapIoSpace(Va, Len);
+    }
 }
 
 void *OsMapMmio(UCHAR Bus, ULONG Phys, ULONG Len)
@@ -438,12 +570,12 @@ void *OsMapMmio(UCHAR Bus, ULONG Phys, ULONG Len)
     return MmMapIoSpace(tr, Len, MmNonCached);
 }
 
-UCHAR  OsIn8(ULONG Port)   { return READ_PORT_UCHAR((PUCHAR)Port); }
-USHORT OsIn16(ULONG Port)  { return READ_PORT_USHORT((PUSHORT)Port); }
-ULONG  OsIn32(ULONG Port)  { return READ_PORT_ULONG((PULONG)Port); }
-void   OsOut8(ULONG Port, UCHAR Val)   { WRITE_PORT_UCHAR((PUCHAR)Port, Val); }
-void   OsOut16(ULONG Port, USHORT Val) { WRITE_PORT_USHORT((PUSHORT)Port, Val); }
-void   OsOut32(ULONG Port, ULONG Val)  { WRITE_PORT_ULONG((PULONG)Port, Val); }
+UCHAR  OsIn8(ULONG Port)   { return READ_PORT_UCHAR((PUCHAR)(ULONG_PTR)Port); }
+USHORT OsIn16(ULONG Port)  { return READ_PORT_USHORT((PUSHORT)(ULONG_PTR)Port); }
+ULONG  OsIn32(ULONG Port)  { return READ_PORT_ULONG((PULONG)(ULONG_PTR)Port); }
+void   OsOut8(ULONG Port, UCHAR Val)   { WRITE_PORT_UCHAR((PUCHAR)(ULONG_PTR)Port, Val); }
+void   OsOut16(ULONG Port, USHORT Val) { WRITE_PORT_USHORT((PUSHORT)(ULONG_PTR)Port, Val); }
+void   OsOut32(ULONG Port, ULONG Val)  { WRITE_PORT_ULONG((PULONG)(ULONG_PTR)Port, Val); }
 
 /* ------------------------------------------------------------------ */
 
@@ -458,6 +590,19 @@ OS_IRQL OsLock(void)
 void OsUnlock(OS_IRQL Irql)
 {
     KeReleaseSpinLock(&GlobalLock, Irql);
+}
+
+OS_IRQL OsRaise(void)
+{
+    KIRQL old;
+
+    KeRaiseIrql(DISPATCH_LEVEL, &old);
+    return old;
+}
+
+void OsLower(OS_IRQL Irql)
+{
+    KeLowerIrql(Irql);
 }
 
 void OsEventInit(OS_EVENT *Ev)
@@ -524,6 +669,38 @@ BOOLEAN OsEventWait(OS_EVENT *Ev, ULONG TimeoutMs)
     }
 }
 
+#ifdef USB_WDM
+/* Windows 2000 / XP: the kernel finds exports of the kernel and the HAL itself */
+void NtKernelInit(PDRIVER_OBJECT Drv)
+{
+    (void)Drv;
+}
+
+static PVOID SystemRoutine(const char *Name)
+{
+    WCHAR w[64];
+    UNICODE_STRING u;
+    int i;
+
+    for (i = 0; i < 63 && Name[i]; i++) {
+        w[i] = (WCHAR)(UCHAR)Name[i];
+    }
+    w[i] = 0;
+    RtlInitUnicodeString(&u, w);
+    return MmGetSystemRoutineAddress(&u);
+}
+
+PVOID NtHalExport(const char *Name)
+{
+    return SystemRoutine(Name);
+}
+
+PVOID NtKernelExport(const char *Name)
+{
+    return SystemRoutine(Name);
+}
+
+#else
 static UCHAR *KernelBase;
 static UCHAR *HalBase;
 
@@ -651,27 +828,67 @@ PVOID NtKernelExport(const char *Name)
     return ImageExport(KernelBase, Name);
 }
 
+#endif
+
 void OsWakeWorker(void)
 {
     KeSetEvent(&NtWorkerEvent, 0, FALSE);
 }
 
+PKTHREAD NtWorkerThread;
+
+/* DriverEntry runs the worker iterations itself until the thread exists */
+BOOLEAN OsInWorker(void)
+{
+    return (BOOLEAN)(NtWorkerThread == NULL || KeGetCurrentThread() == NtWorkerThread);
+}
+
+/* the last 32 KB of the log, for usbtree /dump (most machines have no serial port) */
+#define LOG_RING    32768
+static char LogRing[LOG_RING];
+static ULONG LogTotal;
+
+ULONG OsLogRead(char *Out, ULONG Max)
+{
+    KIRQL old;
+    ULONG n, start, i;
+
+    KeAcquireSpinLock(&LogLock, &old);
+    n = LogTotal < LOG_RING ? LogTotal : LOG_RING;
+    if (n > Max) {
+        n = Max;
+    }
+    start = LogTotal - n;
+    for (i = 0; i < n; i++) {
+        Out[i] = LogRing[(start + i) % LOG_RING];
+    }
+    KeReleaseSpinLock(&LogLock, old);
+    return n;
+}
+
 void OsLogStr(const char *Str)
 {
+    KIRQL old;
+    const char *p;
+
+    KeAcquireSpinLock(&LogLock, &old);
+    for (p = Str; *p; p++) {
+        LogRing[LogTotal++ % LOG_RING] = *p;
+    }
+    KeReleaseSpinLock(&LogLock, old);
     if (DebugPort != 0) {
-        KIRQL old;
         KeAcquireSpinLock(&LogLock, &old);
         while (*Str) {
             ULONG spin = 0;
             if (*Str == '\n') {
-                while (!(READ_PORT_UCHAR((PUCHAR)(DebugPort + 5)) & 0x20) && spin++ < 100000) {
+                while (!(READ_PORT_UCHAR((PUCHAR)(ULONG_PTR)(DebugPort + 5)) & 0x20) && spin++ < 100000) {
                 }
-                WRITE_PORT_UCHAR((PUCHAR)DebugPort, '\r');
+                WRITE_PORT_UCHAR((PUCHAR)(ULONG_PTR)DebugPort, '\r');
                 spin = 0;
             }
-            while (!(READ_PORT_UCHAR((PUCHAR)(DebugPort + 5)) & 0x20) && spin++ < 100000) {
+            while (!(READ_PORT_UCHAR((PUCHAR)(ULONG_PTR)(DebugPort + 5)) & 0x20) && spin++ < 100000) {
             }
-            WRITE_PORT_UCHAR((PUCHAR)DebugPort, (UCHAR)*Str++);
+            WRITE_PORT_UCHAR((PUCHAR)(ULONG_PTR)DebugPort, (UCHAR)*Str++);
         }
         KeReleaseSpinLock(&LogLock, old);
     } else {

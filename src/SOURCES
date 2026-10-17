@@ -10,18 +10,37 @@ INCLUDES=$(BASEDIR)\src\storage\inc;$(BASEDIR)\src\input\inc
 
 SUBSYSTEM_VERSION=3.10
 
-SOURCES=usbutil.c  \
-        dmapool.c  \
-        usbcore.c  \
-        usbhub.c   \
-        usbmsc.c   \
-        usbhid.c   \
+SOURCES=usbutil.c \
+        dmapool.c \
+        usbcore.c \
+        usbhub.c \
+        usbmsc.c \
+        usbhid.c \
         hidparse.c \
-        hcxhci.c   \
-        hcehci.c   \
-        hcuhci.c   \
-        hcohci.c   \
-        ntos.c     \
-        ntmain.c   \
-        ntscsi.c   \
-        ntinput.c
+        hcxhci.c \
+        hcehci.c \
+        hcuhci.c \
+        hcohci.c \
+        usbaudio.c \
+        ntos.c \
+        ntmain.c \
+        ntscsi.c \
+        ntinput.c \
+        ntaudio.c \
+        ntps2.c \
+        sdcard.c \
+        sdhci.c \
+        rtsxusb.c \
+        rtsxpci.c \
+        usbvideo.c \
+        i2chid.c \
+        aml.c \
+        gpio.c \
+        acpi.c \
+        ptp.c \
+        ps2pad.c \
+        nvmehp.c \
+        tbt.c \
+        smbus.c \
+        smbtp.c \
+        smbtpdec.c

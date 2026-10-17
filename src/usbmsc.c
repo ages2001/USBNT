@@ -10,6 +10,7 @@
  */
 
 #include "usbscsi.h"
+#include "usbblk.h"
 
 #define MSC_BUF_SIZE        0x10000
 
@@ -17,6 +18,7 @@
 #define MSC_PROTO_CBI       0x01
 #define MSC_PROTO_BOT       0x50
 #define MSC_PROTO_UAS       0x62
+#define MSC_PROTO_VIRT      0xFE    /* not USB: a BLK_TARGET (SD card readers) */
 
 #define MSC_OK              0
 #define MSC_FAILED          1
@@ -91,7 +93,14 @@ typedef struct _SCSI_SLOT {
     UCHAR       MaybeMounted;   /* media was accessed since the last eject */
     UCHAR       MediaReady;
     UCHAR       SenseValid;
-    UCHAR       Pad;
+    UCHAR       Ph;             /* NT 3.x / 4.0: placeholder medium until the disk driver read its table */
+    UCHAR       Parts;          /* partitions on the medium (MBR primary and logical, GPT), 0 = none */
+    UCHAR       Fixed;          /* reported to the OS as a fixed medium (RMB 0) */
+    UCHAR       DevRmb;         /* the device's own RMB bit */
+    UCHAR       Rescan;         /* the medium may be new: count its partitions again */
+    UCHAR       PollGone;       /* media poll: no medium seen since the slot was ejected */
+    ULONG       MediaGen;       /* changes with every new medium */
+    ULONG       PollMs;         /* last media poll */
     ULONG       Identity;
     ULONG       LastLba;
     ULONG       BlockSize;
@@ -155,9 +164,21 @@ struct _MSC_DEV {
     UAS_TAG     Tags[UAS_MAX_TAGS];
     SCSI_REQ   *WaitHead;       /* UAS: requests waiting for a free tag */
     SCSI_REQ   *WaitTail;
+    /* MSC_PROTO_VIRT */
+    UCHAR       VKind;                  /* BLK_KIND_* */
+    const BLK_TARGET_OPS *VOps;
+    void       *VCtx;
+    UCHAR       VSense[18];
+    UCHAR       VSenseValid;
+    USB_DEV     VDev;           /* stand-in for the USB device the slot code refers to */
+    USB_HC      VHc;
+    char        VName[24];
 };
 
 ULONG UsbScsiSlotCount = 4;
+ULONG UsbScsiFixedMode;         /* Windows 2000 / XP: RemovableAsFixed */
+static ULONG PhParts;           /* NT 3.x / 4.0: partition devices prepared per slot, 0 = none */
+static ULONG FreezeMs;
 static SCSI_SLOT Slots[SCSI_MAX_SLOTS];
 static SCSI_REQ *QueueHead;
 static SCSI_REQ *QueueTail;
@@ -914,6 +935,55 @@ static void UasRecover(MSC_DEV *m)
 /* Transport selection                                                  */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* Virtual targets (usbblk.h)                                           */
+/* ------------------------------------------------------------------ */
+
+void BlkSense(UCHAR *Sense, UCHAR Key, UCHAR Asc, UCHAR Ascq)
+{
+    UsbMemSet(Sense, 0, 18);
+    Sense[0] = 0x70;
+    Sense[2] = Key;
+    Sense[7] = 10;
+    Sense[12] = Asc;
+    Sense[13] = Ascq;
+}
+
+static int VirtCommand(MSC_DEV *m, const UCHAR *Cdb, UCHAR CdbLen, UCHAR Dir, ULONG Len, const MSC_DATA *d,
+                       ULONG *Done)
+{
+    int r;
+
+    *Done = 0;
+    if (Cdb[0] == 0x03) {                                   /* REQUEST SENSE: the stored sense */
+        ULONG n = Len < 18 ? Len : 18;
+        if (!m->VSenseValid) {
+            BlkSense(m->VSense, 0, 0, 0);
+        }
+        if (d->Va != NULL && n != 0) {
+            UsbMemCpy(d->Va, m->VSense, n);
+        }
+        m->VSenseValid = 0;
+        *Done = n;
+        return MSC_OK;
+    }
+    if (Len != 0 && d->Va == NULL) {
+        return MSC_ERROR;
+    }
+    r = m->VOps->Command(m->VCtx, Cdb, CdbLen, Dir, Len, d->Va, Done, m->VSense);
+    switch (r) {
+    case BLK_OK:
+        return MSC_OK;
+    case BLK_FAILED:
+        m->VSenseValid = 1;
+        return MSC_FAILED;
+    case BLK_NODEV:
+        return MSC_NODEV;
+    default:
+        return MSC_ERROR;
+    }
+}
+
 static int MscCommandD(MSC_DEV *m, UCHAR Lun, const UCHAR *Cdb, UCHAR CdbLen, UCHAR Dir, ULONG Len,
                        const MSC_DATA *d, ULONG *Done)
 {
@@ -932,6 +1002,8 @@ static int MscCommandD(MSC_DEV *m, UCHAR Lun, const UCHAR *Cdb, UCHAR CdbLen, UC
         CdbLen = 12;
     }
     switch (m->Proto) {
+    case MSC_PROTO_VIRT:
+        return VirtCommand(m, cdb, CdbLen, Dir, Len, d, Done);
     case MSC_PROTO_BOT:
         if (m->Dev->Hc->QueueOk && (Len == 0 || DataSg(m, d) || d->Va == m->Buf)) {
             return BotCommandQueued(m, Lun, cdb, CdbLen, Dir, Len, d, Done);
@@ -1043,7 +1115,7 @@ static void SlotInquiry(SCSI_SLOT *s, UCHAR *Out)
         Out[35] = ' ';
     }
     Out[0] = s->Type;
-    Out[1] = 0x80;
+    Out[1] = (UCHAR)(s->Fixed ? 0x00 : 0x80);
     Out[2] = 2;
     Out[3] = 2;
     Out[4] = 31;
@@ -1062,7 +1134,24 @@ static void CompleteFromDevice(SCSI_REQ *r, SCSI_SLOT *s, int st, ULONG Done, BO
         } else {
             r->SrbStatus = SRBST_SUCCESS;
         }
-        s->MediaReady = 1;
+        switch (r->Cdb[0]) {
+        case SCSIOP_TEST_UNIT_READY:
+        case SCSIOP_READ_CAPACITY:
+        case SCSIOP_READ6:
+        case SCSIOP_READ10:
+        case SCSIOP_READ12:
+        case SCSIOP_WRITE6:
+        case SCSIOP_WRITE10:
+        case SCSIOP_WRITE12:
+            /* (not every command needs the medium: PREVENT ALLOW MEDIUM REMOVAL does not) */
+            if (!s->MediaReady) {
+                s->Rescan = 1;                  /* a medium came (card reader) */
+            }
+            s->MediaReady = 1;
+            break;
+        default:
+            break;
+        }
         return;
     }
     if (st == MSC_FAILED) {
@@ -1086,7 +1175,13 @@ static void CompleteFromDevice(SCSI_REQ *r, SCSI_SLOT *s, int st, ULONG Done, BO
             s->WriteProtect = 1;
         }
         if ((r->Sense[2] & 0x0F) == SENSE_NOT_READY && r->Sense[12] == 0x3A) {
+            if (s->MediaReady || s->Fixed) {
+                s->Rescan = 1;                  /* the medium went away */
+            }
             s->MediaReady = 0;
+        }
+        if ((r->Sense[2] & 0x0F) == SENSE_UNIT_ATTENTION && r->Sense[12] == 0x28) {
+            s->Rescan = 1;                      /* another medium */
         }
         return;
     }
@@ -1296,6 +1391,387 @@ static void ModeSense6As10(SCSI_REQ *r, SCSI_SLOT *s)
     CompleteFromDevice(r, s, st, 0, FALSE);
 }
 
+/* ------------------------------------------------------------------ */
+/* Partitions                                                           */
+/*                                                                      */
+/* The disk drivers of NT treat a removable medium as one volume:       */
+/*                                                                      */
+/* - Windows 2000 / XP show only its first partition.  A medium with    */
+/*   several partitions (RemovableAsFixed 1, also a device that is a    */
+/*   fixed disk itself) or every medium (2) is reported as fixed; the   */
+/*   bus side (wdmbus.c) makes it a new Plug and Play disk for every    */
+/*   medium, and a fixed reported slot of a device with removable media */
+/*   (card reader) is polled, so that a medium that goes away or is     */
+/*   swapped is noticed.                                                */
+/* - NT 3.x / 4.0 create the partition devices of a disk once, when the */
+/*   disk driver starts: as many as the medium in the slot has then,    */
+/*   one for an empty slot.  A removable disk keeps them and maps the   */
+/*   n-th one to the n-th partition of whatever medium is in the slot.  */
+/*   So until the disk driver has read the partition table of a slot,   */
+/*   the slot holds a placeholder medium with MaxPartitions partitions  */
+/*   (the real medium, if any, appears right after that); usbmon gives  */
+/*   the partitions drive letters.  Reporting a slot as fixed would not */
+/*   do on these versions: a fixed disk's partitions and size are read  */
+/*   only once (never again for another medium, and NT 3.1 cannot make  */
+/*   partition devices later at all).                                   */
+/* ------------------------------------------------------------------ */
+
+#define PH_STEP     2048        /* placeholder: partition k at block PH_STEP * k, 1024 blocks */
+#define PH_TIMEOUT  60000       /* placeholder at most this long after the disk driver started */
+
+static BOOLEAN IsContainer(UCHAR t)
+{
+    return (BOOLEAN)(t == 0x05 || t == 0x0F || t == 0x85);
+}
+
+/* Count blocks from Lba into m->Buf */
+static BOOLEAN ReadBlocks(MSC_DEV *m, UCHAR Lun, ULONG Lba, ULONG Count, ULONG Bs)
+{
+    UCHAR cdb[10];
+    ULONG done = 0;
+    UCHAR sense[18];
+    int st;
+
+    UsbMemSet(cdb, 0, sizeof(cdb));
+    cdb[0] = SCSIOP_READ10;
+    PUTBE32(cdb + 2, Lba);
+    PUTBE16(cdb + 7, (USHORT)Count);
+    st = MscCommand(m, Lun, cdb, 10, SCSI_DIR_IN, Count * Bs, &done);
+    if (st == MSC_FAILED) {
+        MscRequestSense(m, Lun, sense);
+    }
+    return (BOOLEAN)(st == MSC_OK && done == Count * Bs);
+}
+
+/* an MBR or EBR: the entries look like a partition table (an unpartitioned medium
+   has the boot code of its file system there) */
+static BOOLEAN TableOk(const UCHAR *b, ULONG Blocks)
+{
+    int i;
+
+    if (b[510] != 0x55 || b[511] != 0xAA) {
+        return FALSE;
+    }
+    for (i = 0; i < 4; i++) {
+        const UCHAR *e = b + 446 + 16 * i;
+        if (e[0] != 0x00 && e[0] != 0x80) {
+            return FALSE;
+        }
+        if (e[4] != 0 && (GET32(e + 8) == 0 || GET32(e + 12) == 0 || GET32(e + 8) >= Blocks)) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+/* GPT: the used entries of the partition array (1 if the header is not valid) */
+static ULONG GptParts(PART_READ Read, void *Ctx, UCHAR *B, ULONG BufSize, ULONG Bs, ULONG Blocks)
+{
+    static const UCHAR sig[8] = { 'E', 'F', 'I', ' ', 'P', 'A', 'R', 'T' };
+    ULONG lba, cnt, esz, per = BufSize / Bs, done = 0, n = 0;
+
+    if (!Read(Ctx, 1, 1, B) || UsbMemCmp(B, sig, 8) != 0 || GET32(B + 76) != 0) {
+        return 1;
+    }
+    lba = GET32(B + 72);
+    cnt = GET32(B + 80);
+    esz = GET32(B + 84);
+    if (esz < 128 || esz > 1024 || (esz & (esz - 1)) != 0 || cnt == 0 || cnt > 1024 || lba < 2 || lba >= Blocks ||
+        per == 0) {
+        return 1;
+    }
+    while (done < cnt) {
+        ULONG blocks = ((cnt - done) * esz + Bs - 1) / Bs, i, k;
+        if (blocks > per) {
+            blocks = per;
+        }
+        if (!Read(Ctx, lba, blocks, B)) {
+            break;
+        }
+        for (i = 0; i < blocks * Bs / esz && done < cnt; i++, done++) {
+            for (k = 0; k < 16 && B[i * esz + k] == 0; k++) {
+            }
+            n += (k < 16);
+        }
+        lba += blocks;
+    }
+    return n;
+}
+
+/* sector 0 is an MBR with a disk signature (or a GPT disk's protective MBR, which needs none):
+   Windows 2000 / XP mount no volume of a fixed disk without one */
+BOOLEAN UsbSignedDisk(PART_READ Read, void *Ctx, UCHAR *Buf)
+{
+    ULONG i;
+
+    if (!Read(Ctx, 0, 1, Buf) || Buf[510] != 0x55 || Buf[511] != 0xAA) {
+        return FALSE;
+    }
+    for (i = 0; i < 4; i++) {
+        if (Buf[446 + 16 * i + 4] == 0xEE) {
+            return TRUE;
+        }
+    }
+    return (BOOLEAN)((Buf[440] | Buf[441] | Buf[442] | Buf[443]) != 0);
+}
+
+/* partitions of a medium: MBR primary and logical ones, or GPT; 0 for a medium without a
+   partition table.  Buf: BufSize bytes (at least 4 blocks) for the reads. */
+UCHAR UsbCountPartitions(PART_READ Read, void *Ctx, UCHAR *Buf, ULONG BufSize, ULONG Bs, ULONG Blocks)
+{
+    UCHAR *b = Buf;
+    ULONG ext = 0, n = 0, cur, i, guard;
+
+    if (Bs < 512 || Bs > 4096 || Blocks < 2 || BufSize < Bs || !Read(Ctx, 0, 1, b) || !TableOk(b, Blocks)) {
+        return 0;
+    }
+    for (i = 0; i < 4; i++) {
+        if (b[446 + 16 * i + 4] == 0xEE) {
+            n = GptParts(Read, Ctx, Buf, BufSize, Bs, Blocks);
+            return (UCHAR)(n > 255 ? 255 : n);
+        }
+    }
+    for (i = 0; i < 4; i++) {
+        const UCHAR *e = b + 446 + 16 * i;
+        if (IsContainer(e[4])) {
+            if (ext == 0) {
+                ext = GET32(e + 8);
+            }
+        } else if (e[4] != 0) {
+            n++;
+        }
+    }
+    /* the chain of extended boot records: one logical partition and the link to the next each */
+    for (cur = ext, guard = 0; cur != 0 && guard < 128; guard++) {
+        ULONG next = 0;
+        if (cur >= Blocks || !Read(Ctx, cur, 1, b) || !TableOk(b, Blocks)) {
+            break;
+        }
+        for (i = 0; i < 4; i++) {
+            const UCHAR *e = b + 446 + 16 * i;
+            if (IsContainer(e[4])) {
+                if (next == 0) {
+                    next = ext + GET32(e + 8);
+                }
+            } else if (e[4] != 0) {
+                n++;
+            }
+        }
+        cur = (next == cur) ? 0 : next;
+    }
+    return (UCHAR)(n > 255 ? 255 : n);
+}
+
+typedef struct _SLOT_READ {
+    MSC_DEV    *M;
+    UCHAR       Lun;
+    ULONG       Bs;
+} SLOT_READ;
+
+static BOOLEAN SlotRead(void *Ctx, ULONG Lba, ULONG Count, UCHAR *Buf)
+{
+    SLOT_READ *r = (SLOT_READ *)Ctx;
+
+    (void)Buf;                                  /* = m->Buf, where the reads land */
+    return ReadBlocks(r->M, r->Lun, Lba, Count, r->Bs);
+}
+
+/* worker: the medium of the slot is (or may be) new - its partitions, and whether the OS gets
+   it as a fixed medium */
+static void SlotScan(SCSI_SLOT *s)
+{
+    MSC_DEV *m = s->Msc;
+    UCHAR fixed = 0;
+
+    s->Rescan = 0;
+    s->Parts = 0;
+    if (m != NULL && !m->Gone && IsDiskType(s->Type) && s->MediaReady && s->BlockSize != 0) {
+        SLOT_READ rd;
+        rd.M = m;
+        rd.Lun = s->Lun;
+        rd.Bs = s->BlockSize;
+        s->Parts = UsbCountPartitions(SlotRead, &rd, m->Buf, MSC_BUF_SIZE, s->BlockSize, s->LastLba + 1);
+        fixed = (UCHAR)(UsbScsiFixedMode >= 2 || (UsbScsiFixedMode == 1 && (s->Parts > 1 || !s->DevRmb)));
+        if (fixed && UsbScsiFixedMode == 1 && !UsbSignedDisk(SlotRead, &rd, m->Buf)) {
+            /* Windows 2000 / XP mount no volume of a fixed disk without a disk signature (it waits
+               for Disk Management to write one): such a disk stays removable (first partition) */
+            UsbLog(LOG_INFO, "slot %d: no disk signature in the MBR, stays a removable medium\n", (int)(s - Slots));
+            fixed = 0;
+        }
+    }
+    if (fixed != s->Fixed || s->Parts > 1) {
+        UsbLog(LOG_INFO, "slot %d: %u partition(s), %s medium\n", (int)(s - Slots), s->Parts,
+               fixed ? "reported as a fixed" : "a removable");
+    }
+    s->Fixed = fixed;
+}
+
+/* NT 3.x / 4.0 (ntscsi.c), before the disk driver starts: every slot holds a placeholder medium
+   with Parts partitions until the disk driver has read its partition table */
+void UsbScsiPlaceholder(ULONG Parts)
+{
+    ULONG i;
+
+    if (Parts < 2) {
+        return;
+    }
+    PhParts = Parts > 24 ? 24 : Parts;
+    for (i = 0; i < SCSI_MAX_SLOTS; i++) {
+        Slots[i].Ph = 1;
+    }
+}
+
+/* partitions 1 .. PhPrimary() are primary, the others logical (always at least one: the
+   placeholder ends when the last extended boot record has been read) */
+static ULONG PhPrimary(void)
+{
+    return PhParts - 1 < 3 ? PhParts - 1 : 3;
+}
+
+static ULONG PhEbr(ULONG k)
+{
+    return PH_STEP * k - 32;
+}
+
+static void PhEntry(UCHAR *e, UCHAR Type, ULONG Start, ULONG Count)
+{
+    ULONG end = Start + Count - 1;
+
+    e[0] = 0;
+    e[1] = (UCHAR)((Start / 32) % 64);          /* CHS with 64 heads, 32 sectors */
+    e[2] = (UCHAR)(((Start / 2048) >> 2 & 0xC0) | (Start % 32 + 1));
+    e[3] = (UCHAR)(Start / 2048);
+    e[4] = Type;
+    e[5] = (UCHAR)((end / 32) % 64);
+    e[6] = (UCHAR)(((end / 2048) >> 2 & 0xC0) | (end % 32 + 1));
+    e[7] = (UCHAR)(end / 2048);
+    e[8] = (UCHAR)Start;
+    e[9] = (UCHAR)(Start >> 8);
+    e[10] = (UCHAR)(Start >> 16);
+    e[11] = (UCHAR)(Start >> 24);
+    e[12] = (UCHAR)Count;
+    e[13] = (UCHAR)(Count >> 8);
+    e[14] = (UCHAR)(Count >> 16);
+    e[15] = (UCHAR)(Count >> 24);
+}
+
+/* one 512 byte block of the placeholder; returns 1 for a partition table, 2 for the last one */
+static int PhBlock(ULONG Lba, UCHAR *B)
+{
+    ULONG p = PhPrimary(), ext = PhEbr(p + 1), k;
+
+    UsbMemSet(B, 0, 512);
+    if (Lba == 0) {
+        for (k = 1; k <= p; k++) {
+            PhEntry(B + 446 + 16 * (k - 1), 0x06, PH_STEP * k, 1024);
+        }
+        PhEntry(B + 446 + 16 * p, 0x05, ext, PH_STEP * (PhParts + 1) - ext);
+        B[510] = 0x55;
+        B[511] = 0xAA;
+        return 1;
+    }
+    for (k = p + 1; k <= PhParts; k++) {
+        if (Lba == PhEbr(k)) {
+            PhEntry(B + 446, 0x06, 32, 1024);
+            if (k < PhParts) {
+                PhEntry(B + 462, 0x05, PhEbr(k + 1) - ext, PH_STEP);
+            }
+            B[510] = 0x55;
+            B[511] = 0xAA;
+            return k == PhParts ? 2 : 1;
+        }
+    }
+    return 0;
+}
+
+static void PhEnd(SCSI_SLOT *s, const char *Why)
+{
+    s->Ph = 0;
+    if (Why == NULL) {
+        return;                                 /* not a disk slot */
+    }
+    if (s->Present && !s->Ejected) {
+        s->UnitAttention = 1;                   /* the real medium comes in */
+    }
+    UsbLog(LOG_INFO, "slot %d: placeholder done (%s), %u partition devices\n", (int)(s - Slots), Why, PhParts);
+}
+
+static BOOLEAN PhExecute(SCSI_REQ *r, SCSI_SLOT *s)
+{
+    UCHAR op = r->Cdb[0];
+
+    switch (op) {
+    case SCSIOP_TEST_UNIT_READY:
+    case SCSIOP_START_STOP:
+    case SCSIOP_MEDIUM_REMOVAL:
+    case SCSIOP_SYNC_CACHE:
+    case SCSIOP_VERIFY10:
+        r->ScsiStatus = SCSIST_GOOD;
+        r->SrbStatus = SRBST_SUCCESS;
+        return TRUE;
+    case SCSIOP_READ_CAPACITY: {
+        UCHAR cap[8];
+        PUTBE32(cap, PH_STEP * (PhParts + 1) - 1);
+        PUTBE32(cap + 4, 512);
+        ReqData(r, cap, 8);
+        return TRUE;
+    }
+    case SCSIOP_MODE_SENSE6:
+    case SCSIOP_MODE_SENSE10: {
+        UCHAR hdr[8];
+        UsbMemSet(hdr, 0, sizeof(hdr));
+        if (op == SCSIOP_MODE_SENSE10) {
+            hdr[1] = 6;
+            hdr[3] = 0x80;                      /* write protected */
+            ReqData(r, hdr, 8);
+        } else {
+            hdr[0] = 3;
+            hdr[2] = 0x80;
+            ReqData(r, hdr, 4);
+        }
+        return TRUE;
+    }
+    case SCSIOP_READ6:
+    case SCSIOP_READ10:
+    case SCSIOP_READ12: {
+        ULONG lba, cnt, i;
+        int kind, last = 0, data = 0;
+        if (op == SCSIOP_READ6) {
+            lba = ((ULONG)(r->Cdb[1] & 0x1F) << 16) | ((ULONG)r->Cdb[2] << 8) | r->Cdb[3];
+            cnt = r->Cdb[4] ? r->Cdb[4] : 256;
+        } else {
+            lba = GETBE32(r->Cdb + 2);
+            cnt = RwCount(r->Cdb);
+        }
+        if (r->Data == NULL || r->DataLength < cnt * 512) {
+            ReqCheck(r, s, SENSE_ILLEGAL_REQUEST, 0x24, 0);
+            return TRUE;
+        }
+        for (i = 0; i < cnt; i++) {
+            kind = PhBlock(lba + i, (UCHAR *)r->Data + 512 * i);
+            last |= (kind == 2);
+            data |= (kind == 0);
+        }
+        r->Transferred = cnt * 512;
+        r->ScsiStatus = SCSIST_GOOD;
+        r->SrbStatus = SRBST_SUCCESS;
+        if (last || data) {
+            PhEnd(s, last ? "partition table read" : "data read");
+        }
+        return TRUE;
+    }
+    case SCSIOP_WRITE6:
+    case SCSIOP_WRITE10:
+    case SCSIOP_WRITE12:
+        PhEnd(s, "write");
+        ReqCheck(r, s, SENSE_DATA_PROTECT, 0x27, 0);
+        return TRUE;
+    default:
+        ReqCheck(r, s, SENSE_ILLEGAL_REQUEST, 0x20, 0);
+        return TRUE;
+    }
+}
+
 /* Returns FALSE when the request completes later */
 static BOOLEAN ExecuteOnSlot(SCSI_REQ *r, SCSI_SLOT *s)
 {
@@ -1335,6 +1811,16 @@ static BOOLEAN ExecuteOnSlot(SCSI_REQ *r, SCSI_SLOT *s)
         break;
     }
 
+    /* the placeholder is there from the moment the class drivers asked for the slots (UsbScsiFreeze) */
+    if (s->Ph && Frozen) {
+        if (PhParts == 0 || !IsDiskType(s->Type)) {
+            PhEnd(s, NULL);
+        } else if (Frozen && OsTimeMs() - FreezeMs > PH_TIMEOUT) {
+            PhEnd(s, "time");
+        } else {
+            return PhExecute(r, s);
+        }
+    }
     if (!s->Present || s->Ejected) {
         ReqCheck(r, s, SENSE_NOT_READY, 0x3A, 0);
         return TRUE;
@@ -1508,6 +1994,121 @@ static void UasService(void)
     }
 }
 
+#define MEDIA_POLL_MS   1000
+
+/* READ CAPACITY of a slot's medium (worker, nothing else running on the device) */
+static void SlotCapacity(SCSI_SLOT *s)
+{
+    MSC_DEV *m = s->Msc;
+    UCHAR cdb[10], sense[18];
+    ULONG done = 0;
+    int st;
+
+    UsbMemSet(cdb, 0, sizeof(cdb));
+    cdb[0] = SCSIOP_READ_CAPACITY;
+    st = MscCommand(m, s->Lun, cdb, 10, SCSI_DIR_IN, 8, &done);
+    if (st == MSC_OK && done >= 8) {
+        s->LastLba = GETBE32(m->Buf);
+        s->BlockSize = GETBE32(m->Buf + 4);
+        s->MediaReady = 1;
+        return;
+    }
+    if (st == MSC_FAILED && MscRequestSense(m, s->Lun, sense) == MSC_OK && (sense[2] & 0x0F) == SENSE_UNIT_ATTENTION) {
+        st = MscCommand(m, s->Lun, cdb, 10, SCSI_DIR_IN, 8, &done);      /* once more after the attention */
+        if (st == MSC_OK && done >= 8) {
+            s->LastLba = GETBE32(m->Buf);
+            s->BlockSize = GETBE32(m->Buf + 4);
+            s->MediaReady = 1;
+            return;
+        }
+        if (st == MSC_FAILED) {
+            MscRequestSense(m, s->Lun, sense);
+        }
+    }
+    s->MediaReady = 0;
+    s->LastLba = 0;
+    s->BlockSize = 0;
+}
+
+/* Windows 2000 / XP: TEST UNIT READY on a fixed reported slot of a device with removable media
+   (nobody else asks a fixed disk whether its medium is still there), and on an ejected one, which
+   comes back with the next medium put in */
+static void SlotPoll(SCSI_SLOT *s)
+{
+    MSC_DEV *m = s->Msc;
+    UCHAR cdb[6], sense[18];
+    ULONG done = 0;
+    int st;
+
+    UsbMemSet(cdb, 0, sizeof(cdb));
+    st = MscCommand(m, s->Lun, cdb, 6, SCSI_DIR_NONE, 0, &done);
+    if (st == MSC_OK) {
+        if (s->Ejected && s->PollGone) {
+            UsbLog(LOG_INFO, "slot %d: new medium after the removal\n", (int)(s - Slots));
+            s->Ejected = 0;
+            s->PollGone = 0;
+            s->MediaReady = 0;
+            s->Rescan = 1;
+        } else if (!s->Ejected && !s->MediaReady) {
+            s->Rescan = 1;
+        }
+        return;
+    }
+    if (st != MSC_FAILED || MscRequestSense(m, s->Lun, sense) != MSC_OK) {
+        return;
+    }
+    if ((sense[2] & 0x0F) == SENSE_NOT_READY && sense[12] == 0x3A) {
+        if (s->Ejected) {
+            s->PollGone = 1;
+        } else if (s->MediaReady || s->Fixed) {
+            s->MediaReady = 0;
+            s->Rescan = 1;
+        }
+    } else if ((sense[2] & 0x0F) == SENSE_UNIT_ATTENTION && sense[12] == 0x28) {
+        if (s->Ejected) {
+            s->PollGone = 1;
+        } else {
+            s->Rescan = 1;
+        }
+    }
+}
+
+/* worker, nothing queued: slots whose medium may be new are looked at again (a fixed reported
+   medium that changed is a new disk to Windows 2000 / XP) */
+static void MscMediaService(void)
+{
+    ULONG i, now = OsTimeMs();
+
+    for (i = 0; i < UsbScsiSlotCount; i++) {
+        SCSI_SLOT *s = &Slots[i];
+        MSC_DEV *m = s->Msc;
+        UCHAR fixed;
+        if (!s->Present || m == NULL || m->Gone || m->Dev->Gone || !IsDiskType(s->Type) || m->WaitHead != NULL ||
+            (s->Ph && Frozen)) {
+            continue;
+        }
+        if (UsbScsiFixedMode != 0 && s->DevRmb && m->Proto != MSC_PROTO_VIRT && (s->Fixed || s->Ejected) &&
+            now - s->PollMs >= MEDIA_POLL_MS) {
+            s->PollMs = now;
+            SlotPoll(s);
+        }
+        if (!s->Rescan || s->Ejected) {
+            continue;
+        }
+        fixed = s->Fixed;
+        SlotCapacity(s);
+        s->MediaGen++;
+        s->SenseValid = 0;
+        SlotScan(s);
+        s->PollMs = now;
+        if (s->Fixed != fixed) {
+            OsScsiMediaChange((int)i);
+        }
+        UsbNotifyChange();
+        UsbLog(LOG_INFO, "slot %u: medium %s\n", i, s->MediaReady ? "in" : "out");
+    }
+}
+
 void MscService(void)
 {
     int rounds = 0;
@@ -1543,6 +2144,9 @@ void MscService(void)
             break;
         }
     }
+    if (UasBusy == 0 && QueueHead == NULL) {
+        MscMediaService();
+    }
 }
 
 void UsbScsiInit(void)
@@ -1561,6 +2165,9 @@ void UsbScsiInit(void)
 
 void UsbScsiFreeze(void)
 {
+    if (!Frozen) {
+        FreezeMs = OsTimeMs();
+    }
     Frozen = 1;
 }
 
@@ -1584,6 +2191,9 @@ void UsbScsiGetSlot(int Slot, SCSI_SLOT_INFO *Info)
         Info->BlockSize = s->BlockSize;
         Info->MaxXfer = m->MaxXfer;
         Info->Identity = s->Identity;
+        Info->Fixed = s->Fixed;
+        Info->Parts = s->Parts;
+        Info->MediaGen = s->MediaGen;
     }
 }
 
@@ -1611,9 +2221,17 @@ void UsbScsiEject(int Slot)
     UsbMemSet(cdb, 0, sizeof(cdb));
     cdb[0] = SCSIOP_SYNC_CACHE;
     MscCommand(s->Msc, s->Lun, cdb, 10, SCSI_DIR_NONE, 0, &done);
+    if (s->Msc->Proto == MSC_PROTO_VIRT) {
+        /* card readers power the card down, NVMe drives shut down */
+        UsbMemSet(cdb, 0, sizeof(cdb));
+        cdb[0] = 0x1B;
+        cdb[4] = 0x02;
+        MscCommand(s->Msc, s->Lun, cdb, 6, SCSI_DIR_NONE, 0, &done);
+    }
     s->Ejected = 1;
     s->UnitAttention = 0;
     s->MaybeMounted = 0;
+    OsScsiMediaChange(Slot);
     UsbNotifyChange();
     UsbLog(LOG_INFO, "slot %d: ready for removal\n", Slot);
 }
@@ -1725,6 +2343,7 @@ static void MscAttachLun(MSC_DEV *m, UCHAR Lun)
     s->LastLba = 0;
     s->BlockSize = 0;
     UsbMemCpy(s->Inquiry, inq, 36);
+    s->DevRmb = (UCHAR)(inq[1] & 0x80);
     s->Inquiry[1] |= 0x80;
     if (!s->TypeFixed) {
         s->Type = IsDiskType((UCHAR)(inq[0] & 0x1F)) ? 0 : (UCHAR)(inq[0] & 0x1F);
@@ -1758,10 +2377,19 @@ static void MscAttachLun(MSC_DEV *m, UCHAR Lun)
         }
     }
 
+    s->MediaGen++;
+    s->PollGone = 0;
+    s->Fixed = 0;
+    SlotScan(s);
+    s->PollMs = OsTimeMs();
+
     /* a media change only matters if a file system may still have the old media mounted */
     s->UnitAttention = (UCHAR)(Frozen && s->MaybeMounted);
     s->MaybeMounted = 0;
     s->Present = 1;
+    if (Frozen) {
+        OsScsiMediaChange((int)(s - Slots));
+    }
     UsbNotifyChange();
     UsbLog(LOG_INFO, "msc %u lun %u: slot %u, type %u, '%c%c%c%c%c%c%c%c %c%c%c%c%c%c%c%c%c%c%c%c%c%c%c%c'%s\n",
            m->Dev->Index, Lun, (ULONG)(s - Slots), s->Type,
@@ -2064,6 +2692,7 @@ void MscDetach(USB_DEV *Dev)
             Slots[i].UnitAttention = 0;
             Slots[i].MediaReady = 0;
             UsbLog(LOG_INFO, "slot %d: device removed\n", i);
+            OsScsiMediaChange(i);
         }
     }
     MscClosePipes(m);
@@ -2084,4 +2713,138 @@ void MscDetach(USB_DEV *Dev)
     OsDmaFree(m->Buf, MSC_BUF_SIZE);
     Dev->Msc = NULL;
     OsFree(m);
+}
+
+/* ------------------------------------------------------------------ */
+/* Virtual target attach / detach                                       */
+/* ------------------------------------------------------------------ */
+
+BLK_TARGET *MscVirtAttach(const char *Name, ULONG Identity, ULONG MaxXfer, const BLK_TARGET_OPS *Ops, void *Ctx)
+{
+    static UCHAR next = 0xF0;
+    MSC_DEV *m = (MSC_DEV *)OsAlloc(sizeof(MSC_DEV));
+    int i;
+
+    if (m == NULL) {
+        return NULL;
+    }
+    m->Buf = (UCHAR *)OsDmaAlloc(MSC_BUF_SIZE, &m->BufPhys);
+    if (m->Buf == NULL) {
+        OsFree(m);
+        return NULL;
+    }
+    m->Proto = MSC_PROTO_VIRT;
+    m->VOps = Ops;
+    m->VCtx = Ctx;
+    m->VDev.InUse = 1;
+    m->VDev.Index = next;
+    m->VDev.Hc = &m->VHc;
+    m->VDev.Msc = m;
+    next = (UCHAR)(next == 0xFD ? 0xF0 : next + 1);
+    m->Dev = &m->VDev;
+    m->Identity = Identity & 0x0FFFFFFF;
+    m->MaxXfer = MaxXfer ? MaxXfer : 0x10000;
+    if (m->MaxXfer > MSC_BUF_SIZE * 16) {
+        m->MaxXfer = MSC_BUF_SIZE * 16;
+    }
+    for (i = 0; i < (int)sizeof(m->VName) - 1 && Name[i]; i++) {
+        m->VName[i] = Name[i];
+    }
+    UsbLog(LOG_INFO, "%s: block device %u\n", m->VName, m->VDev.Index);
+    MscAttachLun(m, 0);
+    return m;
+}
+
+void MscVirtSetKind(BLK_TARGET *m, UCHAR Kind)
+{
+    if (m != NULL) {
+        m->VKind = Kind;
+        UsbNotifyChange();
+    }
+}
+
+void MscVirtDetach(BLK_TARGET *m)
+{
+    int i;
+
+    if (m == NULL) {
+        return;
+    }
+    m->Gone = 1;
+    m->VDev.Gone = 1;
+    for (i = 0; i < SCSI_MAX_SLOTS; i++) {
+        if (Slots[i].Msc == m) {
+            Slots[i].Present = 0;
+            Slots[i].Msc = NULL;
+            Slots[i].Ejected = 0;
+            Slots[i].UnitAttention = 0;
+            Slots[i].MediaReady = 0;
+            UsbLog(LOG_INFO, "slot %d: %s removed\n", i, m->VName);
+            OsScsiMediaChange(i);
+        }
+    }
+    UsbNotifyChange();
+    OsDmaFree(m->Buf, MSC_BUF_SIZE);
+    OsFree(m);
+}
+
+void MscVirtMediaChange(BLK_TARGET *m)
+{
+    int i;
+
+    for (i = 0; i < SCSI_MAX_SLOTS; i++) {
+        SCSI_SLOT *s = &Slots[i];
+        if (s->Msc != m || !s->Present) {
+            continue;
+        }
+        s->MediaReady = 0;
+        s->SenseValid = 0;
+        s->Ejected = 0;
+        s->LastLba = 0;
+        s->BlockSize = 0;
+        if (s->MaybeMounted && Frozen) {
+            s->UnitAttention = 1;
+        }
+        s->MaybeMounted = 0;
+        {
+            /* the new card's size at once, for usbtree and usbmon (the disk
+               driver asks only when something opens the drive) */
+            static const UCHAR rc[10] = { 0x25 };
+            UCHAR cap[8], sense[18];
+            ULONG done = 0;
+            if (m->VOps->Command(m->VCtx, rc, 10, SCSI_DIR_IN, 8, cap, &done, sense) == BLK_OK && done == 8) {
+                s->LastLba = GETBE32(cap);
+                s->BlockSize = GETBE32(cap + 4);
+                s->MediaReady = 1;
+            }
+        }
+        s->MediaGen++;
+        SlotScan(s);
+        OsScsiMediaChange(i);
+        UsbLog(LOG_INFO, "slot %d: medium changed (%s)\n", i, m->VName);
+    }
+    UsbNotifyChange();
+}
+
+/* name of the card reader behind a disk slot that is not a USB device */
+BOOLEAN UsbScsiSlotHost(int Slot, char *Buf, int Size, UCHAR *Kind)
+{
+    MSC_DEV *m;
+    int i;
+
+    if (Slot < 0 || (ULONG)Slot >= UsbScsiSlotCount || Size < 1) {
+        return FALSE;
+    }
+    m = Slots[Slot].Msc;
+    if (!Slots[Slot].Present || m == NULL || m->Proto != MSC_PROTO_VIRT) {
+        return FALSE;
+    }
+    for (i = 0; i < Size - 1 && m->VName[i]; i++) {
+        Buf[i] = m->VName[i];
+    }
+    Buf[i] = 0;
+    if (Kind != NULL) {
+        *Kind = m->VKind;
+    }
+    return TRUE;
 }

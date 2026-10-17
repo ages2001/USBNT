@@ -11,17 +11,21 @@ KERNEL = os.path.join(HERE, "..", "harness", "kernel.elf")
 
 
 class Harness:
-    def __init__(self, args, kernel=KERNEL, log=None, mem=256):
+    def __init__(self, args, kernel=KERNEL, log=None, mem=256, machine="pc"):
         self.dir = tempfile.mkdtemp(prefix="usbq")
         self.ser_path = os.path.join(self.dir, "ser")
         self.qmp_path = os.path.join(self.dir, "qmp")
         self.log = open(log or os.path.join(self.dir, "serial.log"), "w")
-        cmd = ["qemu-system-i386", "-machine", "pc", "-m", str(mem), "-display", "none",
+        qemu = os.environ.get("QEMU", "qemu-system-i386")
+        extra = ["-L", os.environ["QEMU_BIOS"]] if os.environ.get("QEMU_BIOS") else []
+        cmd = [qemu] + extra + ["-machine", machine, "-m", str(mem), "-display", "none",
                "-nodefaults", "-kernel", kernel,
                "-chardev", "socket,id=ser,path=%s,server=on,wait=on" % self.ser_path,
                "-serial", "chardev:ser",
                "-qmp", "unix:%s,server=on,wait=off" % self.qmp_path] + args
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.qlog_path = os.path.join(self.dir, "qemu.log")
+        self.qlog = open(self.qlog_path, "w")
+        self.proc = subprocess.Popen(cmd, stdout=self.qlog, stderr=subprocess.STDOUT)
         self.ser = self._connect(self.ser_path)
         self.ser.settimeout(0.05)
         self.buf = b""
@@ -41,7 +45,7 @@ class Harness:
                 return s
             except OSError:
                 if self.proc.poll() is not None:
-                    raise RuntimeError("qemu exited: %s" % self.proc.stdout.read().decode())
+                    raise RuntimeError("qemu exited: %s" % open(self.qlog_path).read())
                 time.sleep(0.05)
         raise RuntimeError("cannot connect to %s" % path)
 
@@ -113,6 +117,12 @@ class Harness:
 
     def hmp(self, line):
         return self.qmp_cmd("human-monitor-command", **{"command-line": line})
+
+    def qemu_lines(self, prefix=""):
+        """lines QEMU wrote to stdout / stderr so far"""
+        self.qlog.flush()
+        with open(self.qlog_path) as f:
+            return [l.rstrip("\n") for l in f if l.startswith(prefix)]
 
     def close(self):
         try:

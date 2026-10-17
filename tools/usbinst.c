@@ -1,19 +1,32 @@
 /*
  * usbinst.c - installs or removes usbnt.sys on Windows NT 3.1 - 4.0.
  *
- * usbinst /install [/maxdisks N] [/irq] [/nomon] [/set Name=Value ...]
- *     copies usbnt.sys, usbmon.exe, usbtree.exe and usbeject.exe from the
- *     directory of usbinst.exe, registers the boot start driver, lets
- *     kbdclass and mouclass serve more than one port and starts usbmon.exe
- *     at every logon. /set stores a DWORD driver parameter (decimal or 0x
- *     hex), for example /set DebugPort=0x2f8.
+ * usbinst /install [/maxdisks N] [/irq] [/nomon] [/nogroup] [/keepi8042] [/set Name=Value ...]
+ *     copies usbnt.sys and the tools (usbtree, usbmon, usbeject, usbcam,
+ *     usbinst) from the directory of usbinst.exe, registers the boot start
+ *     driver, lets kbdclass and mouclass serve more than one port, starts
+ *     usbmon.exe at every logon and creates the USBNT program group.  The
+ *     PS/2 keyboard and mouse go over to usbnt.sys (i8042prt is disabled)
+ *     unless /keepi8042 is given.  /set stores a DWORD driver parameter
+ *     (decimal or 0x hex), for example /set DebugPort=0x2f8.
  * usbinst /remove
- *     removes the driver service and the logon entry (the files stay).
+ *     removes the driver service and the logon entry and enables i8042prt
+ *     again (the files stay).
  * usbinst /status
  *     shows the service configuration.
+ *
+ * On Windows 2000 and XP (x86 and x64) the driver is a Plug and Play driver
+ * (2kxp folder, pnpinst.c): /install installs it for the USB host
+ * controllers Windows has no driver for (xHCI, EHCI on 2000 before SP4 and XP
+ * before SP1; /all: every controller, /ehci: EHCI too, /noehci: no EHCI) and
+ * the other devices of usbnt.inf, /remove gives them back to Windows'
+ * drivers.  The PS/2 keyboard and mouse stay with i8042prt there; usbnt
+ * becomes the upper filter of i8042prt's mouse (touch pad protocols) unless
+ * /nops2 is given.
  */
 
 #include <windows.h>
+#include <ddeml.h>
 
 static BOOL SameNoCase(const char *A, const char *B, int Len)
 {
@@ -31,9 +44,29 @@ static BOOL SameNoCase(const char *A, const char *B, int Len)
 
 static HANDLE Out;
 
+int PnpInstall(const char *Dir, const char *Cmd);
+int PnpRemove(const char *Dir);
+int PnpStatus(void);
+int PnpFilters(const char *Dir, BOOL Add, BOOL Quiet);
+int PnpPs2Filter(const char *Dir, BOOL Add);
+BOOL PnpWow64(void);
+BOOL PnpWindowsCamera(const char *Cmd);
+
 static void Print(const char *Fmt, ...)
 {
     char buf[512];
+    DWORD n;
+    va_list ap;
+
+    va_start(ap, Fmt);
+    wvsprintfA(buf, Fmt, ap);
+    va_end(ap);
+    WriteFile(Out, buf, lstrlenA(buf), &n, NULL);
+}
+
+void PnpPrint(const char *Fmt, ...)
+{
+    char buf[1024];
     DWORD n;
     va_list ap;
 
@@ -180,7 +213,26 @@ static BOOL CopyOne(const char *SrcDir, const char *DstDir, const char *Name, BO
         return !Required;
     }
     if (!CopyFileA(src, dst, FALSE)) {
-        Print("  cannot copy %s to %s (error %lu)\r\n", Name, DstDir, GetLastError());
+        DWORD e = GetLastError();
+        char old[MAX_PATH];
+        /* a running program cannot be overwritten, but it can be renamed */
+        wsprintfA(old, "%s.old", dst);
+        if ((e == ERROR_SHARING_VIOLATION || e == ERROR_ACCESS_DENIED) &&
+            (DeleteFileA(old) || GetFileAttributesA(old) == 0xFFFFFFFF) && MoveFileA(dst, old) &&
+            CopyFileA(src, dst, FALSE)) {
+            MoveFileExA(old, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+            Print("  copied %s (the running copy is removed at the next start)\r\n", dst);
+            return TRUE;
+        }
+        /* NT 3.1 cannot rename a running program either: the new copy goes in
+           when Windows NT starts the next time */
+        wsprintfA(old, "%s.new", dst);
+        if ((e == ERROR_SHARING_VIOLATION || e == ERROR_ACCESS_DENIED) && CopyFileA(src, old, FALSE) &&
+            MoveFileExA(old, dst, MOVEFILE_DELAY_UNTIL_REBOOT | MOVEFILE_REPLACE_EXISTING)) {
+            Print("  %s is in use: it is replaced when Windows NT starts again\r\n", dst);
+            return FALSE;
+        }
+        Print("  cannot copy %s to %s (error %lu)\r\n", Name, DstDir, e);
         return FALSE;
     }
     Print("  copied %s\r\n", dst);
@@ -188,6 +240,73 @@ static BOOL CopyOne(const char *SrcDir, const char *DstDir, const char *Name, BO
 }
 
 #define WINLOGON "Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon"
+#define DRIVERS32 "Software\\Microsoft\\Windows NT\\CurrentVersion\\Drivers32"
+#define DRVDESC "Software\\Microsoft\\Windows NT\\CurrentVersion\\drivers.desc"
+
+static BOOL RegSz(const char *Key, const char *Name, char *Out, DWORD Size)
+{
+    HKEY k;
+    DWORD t, n = Size;
+    BOOL ok = FALSE;
+    Out[0] = 0;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, Key, 0, KEY_READ, &k) == ERROR_SUCCESS) {
+        ok = RegQueryValueExA(k, Name, NULL, &t, (BYTE *)Out, &n) == ERROR_SUCCESS && t == REG_SZ;
+        RegCloseKey(k);
+    }
+    return ok && Out[0];
+}
+
+static void RegPut(const char *Key, const char *Name, const char *Val)
+{
+    HKEY k;
+    DWORD disp;
+    if (RegCreateKeyExA(HKEY_LOCAL_MACHINE, Key, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &k, &disp) == ERROR_SUCCESS) {
+        if (Val != NULL) {
+            RegSetValueExA(k, Name, 0, REG_SZ, (const BYTE *)Val, (DWORD)lstrlenA(Val) + 1);
+        } else {
+            RegDeleteValueA(k, Name);
+        }
+        RegCloseKey(k);
+    }
+}
+
+/* usbntcap.dll, the Video for Windows capture driver of the USB cameras (msvideo, msvideo1 ...) */
+static void Capture(const char *Dir, const char *Sys, BOOL Add)
+{
+    char name[16], val[MAX_PATH];
+    int i, freeSlot = -1;
+
+    if (Add && !CopyOne(Dir, Sys, "usbntcap.dll", FALSE)) {
+        return;
+    }
+    if (Add) {
+        char f[MAX_PATH];
+        wsprintfA(f, "%s\\usbntcap.dll", Sys);
+        if (GetFileAttributesA(f) == 0xFFFFFFFF) {
+            return;                         /* not in this release */
+        }
+    }
+    for (i = 0; i < 10; i++) {
+        if (i) wsprintfA(name, "msvideo%d", i); else lstrcpyA(name, "msvideo");
+        if (RegSz(DRIVERS32, name, val, sizeof(val))) {
+            if (lstrcmpiA(val, "usbntcap.dll") == 0) {
+                if (!Add) {
+                    RegPut(DRIVERS32, name, NULL);
+                    Print("  Video for Windows driver %s removed\r\n", name);
+                }
+                return;
+            }
+        } else if (freeSlot < 0) {
+            freeSlot = i;
+        }
+    }
+    if (Add && freeSlot >= 0) {
+        if (freeSlot) wsprintfA(name, "msvideo%d", freeSlot); else lstrcpyA(name, "msvideo");
+        RegPut(DRIVERS32, name, "usbntcap.dll");
+        RegPut(DRVDESC, "usbntcap.dll", "USBNT USB Video Camera");
+        Print("  usbntcap.dll registered as Video for Windows driver %s (cameras)\r\n", name);
+    }
+}
 
 /* Finds Name as one entry of a comma separated list, case insensitive */
 static char *FindEntry(char *List, const char *Name)
@@ -257,6 +376,88 @@ static void SetLogonEntry(BOOL Add)
     RegCloseKey(k);
 }
 
+/* ------------------------------------------------------------------ */
+/* Program Manager group (DDE; on NT 4.0 Explorer turns it into a      */
+/* Start menu folder)                                                  */
+/* ------------------------------------------------------------------ */
+static HDDEDATA CALLBACK DdeCb(UINT t, UINT f, HCONV c, HSZ a, HSZ b, HDDEDATA d, DWORD x, DWORD y)
+{
+    (void)t; (void)f; (void)c; (void)a; (void)b; (void)d; (void)x; (void)y;
+    return 0;
+}
+
+static BOOL Progman(const char *Cmds)
+{
+    DWORD inst = 0;
+    HSZ hs;
+    HCONV conv;
+    BOOL ok = FALSE;
+
+    if (DdeInitializeA(&inst, (PFNCALLBACK)DdeCb, APPCMD_CLIENTONLY, 0)) {
+        return FALSE;
+    }
+    hs = DdeCreateStringHandleA(inst, "PROGMAN", CP_WINANSI);
+    conv = DdeConnect(inst, hs, hs, NULL);
+    if (conv) {
+        ok = DdeClientTransaction((LPBYTE)Cmds, (DWORD)lstrlenA(Cmds) + 1, conv, 0, 0, XTYP_EXECUTE, 5000, NULL) != 0;
+        DdeDisconnect(conv);
+    }
+    DdeFreeStringHandle(inst, hs);
+    DdeUninitialize(inst);
+    return ok;
+}
+
+static void MakeGroup(const char *Sys, const char *Dir)
+{
+    char cmd[1600];
+    char f[MAX_PATH];
+    int n;
+
+    /* a group from an earlier version goes first (its items would stay) */
+    Progman("[DeleteGroup(USBNT)]");
+    n = wsprintfA(cmd, "[CreateGroup(USBNT)][AddItem(%s\\usbtree.exe,USB Devices,%s\\usbtree.exe,0)]"
+                       "[AddItem(%s\\usbmon.exe /show,USB Monitor,%s\\usbmon.exe,0)]", Sys, Sys, Sys, Sys);
+    wsprintfA(f, "%s\\usbcam.exe", Sys);
+    if (GetFileAttributesA(f) != 0xFFFFFFFF) {
+        n += wsprintfA(cmd + n, "[AddItem(%s\\usbcam.exe,USB Camera,%s\\usbcam.exe,0)]", Sys, Sys);
+    }
+    wsprintfA(f, "%s\\README.TXT", Dir);
+    if (GetFileAttributesA(f) != 0xFFFFFFFF) {
+        n += wsprintfA(cmd + n, "[AddItem(notepad.exe %s,USBNT Read Me)]", f);
+    }
+    wsprintfA(cmd + n, "[AddItem(%s\\usbinst.exe /remove,Uninstall USBNT,%s\\usbinst.exe,1)][ShowGroup(USBNT,1)]", Sys,
+              Sys);
+    if (Progman(cmd)) {
+        Print("  program group USBNT created\r\n");
+    } else {
+        Print("  no Program Manager to create the USBNT group in (run usbinst again after logon)\r\n");
+    }
+}
+
+/* i8042prt off (usbnt.sys drives the keyboard controller) or back on */
+static BOOL SetI8042(BOOL On)
+{
+    SC_HANDLE scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+    SC_HANDLE svc;
+    BOOL ok;
+    if (scm == NULL) {
+        return FALSE;
+    }
+    svc = OpenServiceA(scm, "i8042prt", SERVICE_CHANGE_CONFIG);
+    if (svc == NULL) {
+        CloseServiceHandle(scm);
+        return TRUE;                    /* no i8042prt: nothing to do */
+    }
+    ok = ChangeServiceConfigA(svc, SERVICE_NO_CHANGE, On ? SERVICE_SYSTEM_START : SERVICE_DISABLED, SERVICE_NO_CHANGE,
+                              NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    if (!ok) {
+        Print("  cannot change the i8042prt service (error %lu)\r\n", GetLastError());
+    }
+    CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return ok;
+}
+
 static int Install(const char *Cmd)
 {
     char dir[MAX_PATH];
@@ -276,7 +477,25 @@ static int Install(const char *Cmd)
     }
     CopyOne(dir, sys, "usbeject.exe", FALSE);
     CopyOne(dir, sys, "usbtree.exe", FALSE);
-    CopyOne(dir, sys, "usbmon.exe", FALSE);
+    {
+        /* a running usbmon (an older one has no window) cannot be replaced
+           on NT 3.1: ask it to end, start the new one afterwards */
+        HWND mon = FindWindowA("UsbNtMonitor", NULL);
+        int i;
+        if (mon != NULL) {
+            PostMessageA(mon, WM_USER + 12, 0, 0);
+            for (i = 0; i < 30 && IsWindow(mon); i++) Sleep(100);
+            Sleep(300);
+        }
+        if (CopyOne(dir, sys, "usbmon.exe", FALSE) && mon != NULL) {
+            char cmd[MAX_PATH];
+            wsprintfA(cmd, "%s\\usbmon.exe", sys);
+            WinExec(cmd, SW_HIDE);
+        }
+    }
+    CopyOne(dir, sys, "usbcam.exe", FALSE);
+    CopyOne(dir, sys, "usbinst.exe", FALSE);
+    Capture(dir, sys, TRUE);
 
     scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_ALL_ACCESS);
     if (scm == NULL) {
@@ -303,6 +522,17 @@ static int Install(const char *Cmd)
     CloseServiceHandle(scm);
     Print("  service usbnt registered (boot start, group SCSI miniport)\r\n");
 
+    /* the PS/2 keyboard and mouse: usbnt.sys takes over from i8042prt */
+    if (!HasArg(Cmd, "/keepi8042")) {
+        if (SetI8042(FALSE)) {
+            SetDword(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Services\\usbnt\\Parameters", "Ps2", 1);
+            Print("  i8042prt disabled, usbnt drives the PS/2 keyboard and mouse\r\n");
+        }
+    } else {
+        SetDword(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Services\\usbnt\\Parameters", "Ps2", 0);
+        Print("  PS/2 keyboard and mouse left to i8042prt\r\n");
+    }
+
     SetDword(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Services\\Kbdclass\\Parameters", "ConnectMultiplePorts", 1);
     SetDword(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Services\\Mouclass\\Parameters", "ConnectMultiplePorts", 1);
     Print("  kbdclass and mouclass set to serve USB and PS/2 together\r\n");
@@ -318,6 +548,9 @@ static int Install(const char *Cmd)
     SetParams(Cmd);
     if (!HasArg(Cmd, "/nomon")) {
         SetLogonEntry(TRUE);
+    }
+    if (!HasArg(Cmd, "/nogroup")) {
+        MakeGroup(sys, dir);
     }
     Print("Done. Restart Windows NT to load the driver.\r\n");
     return 0;
@@ -339,6 +572,11 @@ static int Remove(void)
         return 1;
     }
     SetLogonEntry(FALSE);
+    Progman("[DeleteGroup(USBNT)]");
+    Capture(NULL, NULL, FALSE);
+    if (SetI8042(TRUE)) {
+        Print("i8042prt enabled again for the PS/2 keyboard and mouse.\r\n");
+    }
     if (!DeleteService(svc)) {
         Print("Cannot remove the service (error %lu)\r\n", GetLastError());
     } else {
@@ -392,12 +630,172 @@ static int Status(void)
     return 0;
 }
 
+/* the folder the tools go to: System32, on 64 bit Windows SysWOW64 (they are 32 bit programs) */
+static void ToolDir(char *Buf, DWORD Size)
+{
+    typedef UINT (WINAPI *P_Wow64Dir)(LPSTR, UINT);
+    P_Wow64Dir f = (P_Wow64Dir)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetSystemWow64DirectoryA");
+
+    if (sizeof(void *) == 4 && PnpWow64() && f != NULL && f(Buf, Size) != 0) {
+        return;
+    }
+    GetSystemDirectoryA(Buf, Size);
+}
+
+#define RUNKEY "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+
+/* Windows 2000 / XP: usbmon starts at logon from the Run key */
+static void SetRunEntry(const char *Sys, BOOL Add)
+{
+    HKEY k;
+    char cmd[MAX_PATH];
+
+    if (RegCreateKeyExA(HKEY_LOCAL_MACHINE, RUNKEY, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &k, NULL) != ERROR_SUCCESS) {
+        return;
+    }
+    if (Add) {
+        wsprintfA(cmd, "\"%s\\usbmon.exe\"", Sys);
+        RegSetValueExA(k, "USBNT Monitor", 0, REG_SZ, (const BYTE *)cmd, (DWORD)lstrlenA(cmd) + 1);
+        Print("  usbmon.exe starts at every logon\r\n");
+    } else {
+        RegDeleteValueA(k, "USBNT Monitor");
+    }
+    RegCloseKey(k);
+}
+
+/* RemovableAsFixed of the driver (1 if not set) */
+static DWORD FixedMode(void)
+{
+    HKEY k;
+    DWORD v = 1, type = 0, len = sizeof(v);
+
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Services\\usbnt\\Parameters", 0, KEY_READ, &k) ==
+        ERROR_SUCCESS) {
+        if (RegQueryValueExA(k, "RemovableAsFixed", NULL, &type, (BYTE *)&v, &len) != ERROR_SUCCESS || type != REG_DWORD) {
+            v = 1;
+        }
+        RegCloseKey(k);
+    }
+    return v;
+}
+
+static int Install5(const char *Cmd)
+{
+    char dir[MAX_PATH];
+    char sys[MAX_PATH];
+
+    ExeDir(dir, sizeof(dir));
+    if (!HasArg(Cmd, "/pnp")) {
+        /* the tools (the 64 bit usbinst.exe started by the 32 bit one only does the devices) */
+        ToolDir(sys, sizeof(sys));
+        Print("Installing the USBNT tools\r\n");
+        CopyOne(dir, sys, "usbeject.exe", FALSE);
+        CopyOne(dir, sys, "usbtree.exe", FALSE);
+        CopyOne(dir, sys, "usbmon.exe", FALSE);
+        CopyOne(dir, sys, "usbcam.exe", FALSE);
+        if (sizeof(void *) == 4) {
+            CopyOne(dir, sys, "usbinst.exe", FALSE);
+        }
+        if (HasArg(Cmd, "/irq")) {
+            SetDword(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Services\\usbnt\\Parameters", "UseInterrupts", 1);
+        }
+        {
+            DWORD maxDisks = ArgNumber(Cmd, "/maxdisks", 0);
+            if (maxDisks != 0) {
+                SetDword(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Services\\usbnt\\Parameters", "MaxDisks",
+                         maxDisks);
+            }
+        }
+        SetParams(Cmd);
+        if (!HasArg(Cmd, "/nomon")) {
+            char f[MAX_PATH];
+            wsprintfA(f, "%s\\usbmon.exe", sys);
+            if (GetFileAttributesA(f) != 0xFFFFFFFF) {
+                SetRunEntry(sys, TRUE);
+            }
+        }
+        if (!HasArg(Cmd, "/nogroup")) {
+            MakeGroup(sys, dir);
+        }
+        /* 32 bit programs (on x64: SysWOW64, the 32 bit registry); where Windows' own camera driver
+           takes the cameras, usbntcap.dll has none and is not offered */
+        Capture(dir, sys, !PnpWindowsCamera(Cmd));
+    } else if (sizeof(void *) == 8) {
+        char sys64[MAX_PATH], self[MAX_PATH], dst[MAX_PATH];
+        GetSystemDirectoryA(sys64, sizeof(sys64));
+        Capture(dir, sys64, !PnpWindowsCamera(Cmd));   /* 64 bit programs */
+        /* for usbinst /filters from the system folder (usbmon) */
+        if (GetModuleFileNameA(NULL, self, sizeof(self))) {
+            wsprintfA(dst, "%s\\usbinst64.exe", sys64);
+            CopyFileA(self, dst, FALSE);
+        }
+    }
+    {
+        int rc = PnpInstall(dir, Cmd);
+        if (rc == 0 && FixedMode() != 0 && !PnpWow64()) {   /* (on x64 the 64 bit usbinst did it) */
+            Print("The disks of Windows' USB storage driver\r\n");
+            PnpFilters(dir, TRUE, FALSE);
+        }
+        if (rc == 0 && !PnpWow64()) {
+            Print("The PS/2 mouse (touch pads)\r\n");
+            PnpPs2Filter(dir, !HasArg(Cmd, "/nops2"));      /* /nops2: not (or no longer) */
+        }
+        return rc;
+    }
+}
+
+static int Remove5(void)
+{
+    char dir[MAX_PATH];
+    int rc;
+
+    ExeDir(dir, sizeof(dir));
+    if (!PnpWow64()) {
+        PnpFilters(dir, FALSE, TRUE);           /* (on x64 the 64 bit usbinst does it) */
+        PnpPs2Filter(dir, FALSE);
+    }
+    rc = PnpRemove(dir);
+    Capture(NULL, NULL, FALSE);
+    if (!HasArg(GetCommandLineA(), "/pnp")) {
+        char sys[MAX_PATH];
+        ToolDir(sys, sizeof(sys));
+        SetRunEntry(sys, FALSE);
+        Progman("[DeleteGroup(USBNT)]");
+    }
+    return rc;
+}
+
 void __stdcall Entry(void)
 {
     const char *cmd = GetCommandLineA();
     int rc;
 
     Out = GetStdHandle(STD_OUTPUT_HANDLE);
+    if ((GetVersion() & 0x80000000) == 0 && (GetVersion() & 0xFF) >= 5) {
+        /* Windows 2000, XP and later: Plug and Play */
+        if (HasArg(cmd, "/install")) {
+            rc = Install5(cmd);
+        } else if (HasArg(cmd, "/remove")) {
+            rc = Remove5();
+        } else if (HasArg(cmd, "/status")) {
+            rc = PnpStatus();
+        } else if (HasArg(cmd, "/filters") || HasArg(cmd, "/nofilters")) {
+            char dir[MAX_PATH];
+            ExeDir(dir, sizeof(dir));
+            rc = PnpFilters(dir, !HasArg(cmd, "/nofilters") && FixedMode() != 0, HasArg(cmd, "/quiet"));
+        } else {
+            Print("usage: usbinst /install [/all | /ehci | /noehci] [/maxdisks N] [/irq] [/nomon] [/nogroup]\r\n"
+                  "                        [/nops2] [/set Name=Value ...]\r\n"
+                  "         USB host controllers: Windows' drivers where Windows has one (UHCI, OHCI,\r\n"
+                  "         EHCI from 2000 SP4 / XP SP1 on), USBNT for xHCI and the rest;\r\n"
+                  "         /all every controller to USBNT, /ehci EHCI to USBNT, /noehci EHCI never\r\n"
+                  "       usbinst /remove\r\n"
+                  "       usbinst /status\r\n"
+                  "       usbinst /filters | /nofilters   (USB storage disks of Windows' driver)\r\n");
+            rc = 1;
+        }
+        ExitProcess((UINT)rc);
+    }
     if (HasArg(cmd, "/install")) {
         rc = Install(cmd);
     } else if (HasArg(cmd, "/remove")) {
@@ -405,7 +803,7 @@ void __stdcall Entry(void)
     } else if (HasArg(cmd, "/status")) {
         rc = Status();
     } else {
-        Print("usage: usbinst /install [/maxdisks N] [/irq] [/nomon] [/set Name=Value ...]\r\n"
+        Print("usage: usbinst /install [/maxdisks N] [/irq] [/nomon] [/nogroup] [/keepi8042] [/set Name=Value ...]\r\n"
               "       usbinst /remove\r\n"
               "       usbinst /status\r\n");
         rc = 1;

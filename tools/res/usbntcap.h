@@ -1,0 +1,9 @@
+#define IDD_FORMAT      100
+#define IDD_SOURCE      101
+#define IDC_LIST        1001
+#define IDC_RGB         1002
+#define IDC_CAMERA      1003
+#define IDC_BRIGHT      1004
+#define IDC_CONTRAST    1005
+#define IDC_SAT         1006
+#define IDC_GAIN        1007

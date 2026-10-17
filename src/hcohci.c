@@ -20,6 +20,7 @@
 #define OR_BULKHEAD     0x28
 #define OR_BULKCUR      0x2C
 #define OR_FMINTERVAL   0x34
+#define OR_FMNUMBER     0x3C
 #define OR_PERIODICSTART 0x40
 #define OR_LSTHRESHOLD  0x44
 #define OR_RHDESCA      0x48
@@ -29,6 +30,7 @@
 
 #define CTL_CBSR3       0x00000003
 #define CTL_PLE         0x00000004
+#define CTL_IE          0x00000008
 #define CTL_CLE         0x00000010
 #define CTL_BLE         0x00000020
 #define CTL_HCFS_MASK   0x000000C0
@@ -58,6 +60,9 @@
 #define RH_CHANGES      0x001F0000
 
 #define ED_SKIP         0x00004000
+#define ED_ISO          0x00008000
+#define ED_DIR_OUT      0x00000800
+#define ED_DIR_IN       0x00001000
 #define ED_LOWSPEED     0x00002000
 #define ED_HALTED       0x00000001
 #define ED_CARRY        0x00000002
@@ -104,9 +109,32 @@ typedef struct _OHC {
     UCHAR      *Regs;
     ULONG      *Hcca;
     ULONG       HccaPhys;
-    OED         Head[3];
+    OED         Head[4];        /* interrupt, control, bulk, isochronous */
     BOOLEAN     UseIrq;
+    ULONG       FrameExt;       /* 32 bit frame counter */
+    ULONG       FrameRaw;
+    struct _OISO *IsoList;
 } OHC;
+
+/*
+ * Isochronous pipe: an ED on the isochronous list (behind the interrupt
+ * EDs of the periodic list) with a ring of isochronous TDs. The ring entry
+ * at Head is the ED's dummy tail; ITDs are linked in ring order.
+ */
+#define OISO_TDS        64
+
+typedef struct _OISO {
+    OED         Q;              /* Ed, EdPhys, Kind 3, Linked, Next */
+    ULONG      *Td[OISO_TDS];
+    ULONG       TdPhys[OISO_TDS];
+    UCHAR       First[OISO_TDS];    /* first packet of the ITD */
+    UCHAR       Count[OISO_TDS];    /* packets in the ITD */
+    ULONG       Head;
+    ULONG       Used;
+    BOOLEAN     Started;
+    USB_PIPE   *Pipe;
+    struct _OISO *IsoNext;
+} OISO;
 
 #define OHCP(hc)    ((OHC *)(hc)->Priv)
 
@@ -145,7 +173,7 @@ static void EdUnlink(OHC *o, OED *q)
         return;
     }
     q->Ed[0] |= ED_SKIP;
-    if (q->Kind != 0) {
+    if (q->Kind == 1 || q->Kind == 2) {
         ctl = Rd(o, OR_CONTROL);
         Wr(o, OR_CONTROL, ctl & ~(CTL_CLE | CTL_BLE));
     }
@@ -160,7 +188,7 @@ static void EdUnlink(OHC *o, OED *q)
     }
     q->Linked = 0;
     OsUnlock(irql);
-    if (q->Kind != 0) {
+    if (q->Kind == 1 || q->Kind == 2) {
         Wr(o, OR_CTRLCUR, 0);
         Wr(o, OR_BULKCUR, 0);
         Wr(o, OR_CONTROL, ctl);
@@ -233,7 +261,7 @@ static int OhciStart(USB_HC *Hc)
     if (o->Hcca == NULL) {
         return USB_ERR_NOMEM;
     }
-    for (i = 0; i < 3; i++) {
+    for (i = 0; i < 4; i++) {
         o->Head[i].Ed = (ULONG *)UsbDmaAlloc(32, &o->Head[i].EdPhys);
         if (o->Head[i].Ed == NULL) {
             return USB_ERR_NOMEM;
@@ -241,6 +269,8 @@ static int OhciStart(USB_HC *Hc)
         o->Head[i].Ed[0] = ED_SKIP;
         o->Head[i].Kind = (UCHAR)i;
     }
+    /* periodic list: interrupt EDs, then the isochronous EDs */
+    o->Head[0].Ed[3] = o->Head[3].EdPhys;
     for (i = 0; i < 32; i++) {
         o->Hcca[i] = o->Head[0].EdPhys;
     }
@@ -255,7 +285,7 @@ static int OhciStart(USB_HC *Hc)
     Wr(o, OR_FMINTERVAL, ((((fi - 210) * 6) / 7) << 16) | fi | ((Rd(o, OR_FMINTERVAL) & 0x80000000) ^ 0x80000000));
     Wr(o, OR_PERIODICSTART, (fi * 9) / 10);
     Wr(o, OR_LSTHRESHOLD, 0x628);
-    Wr(o, OR_CONTROL, CTL_HCFS_OPER | CTL_PLE | CTL_CLE | CTL_BLE | CTL_CBSR3);
+    Wr(o, OR_CONTROL, CTL_HCFS_OPER | CTL_PLE | CTL_IE | CTL_CLE | CTL_BLE | CTL_CBSR3);
     OsSleepMs(2);
     if ((Rd(o, OR_CONTROL) & CTL_HCFS_MASK) != CTL_HCFS_OPER) {
         UsbLog(LOG_ERR, "ohci: controller did not become operational\n");
@@ -285,6 +315,7 @@ static int OhciStart(USB_HC *Hc)
     }
     Hc->NumPorts = (UCHAR)ports;
     Hc->MaxXfer = 0x10000;
+    Hc->IsoOk = 1;
     Hc->Running = 1;
     UsbLog(LOG_INFO, "ohci: %u ports, revision %x\n", ports, Rd(o, OR_REVISION) & 0xFF);
     return USB_OK;
@@ -370,6 +401,262 @@ static void OhciPortDisable(USB_HC *Hc, int Port)
 }
 
 /* ------------------------------------------------------------------ */
+/* Isochronous                                                          */
+/* ------------------------------------------------------------------ */
+
+#define ITD_CC_NOTACC   0xF0000000
+
+static int CcStatus(ULONG cc);
+#define PSW_NOTACC      0xE000
+
+/* lock held */
+static void FrameUpdate(OHC *o)
+{
+    ULONG raw = Rd(o, OR_FMNUMBER) & 0xFFFF;
+
+    o->FrameExt += (raw - o->FrameRaw) & 0xFFFF;
+    o->FrameRaw = raw;
+}
+
+static void IsoFree(OISO *iso)
+{
+    ULONG i;
+
+    for (i = 0; i < OISO_TDS; i++) {
+        if (iso->Td[i] != NULL) {
+            UsbDmaFree(iso->Td[i], TD_SIZE);
+        }
+    }
+    if (iso->Q.Ed != NULL) {
+        UsbDmaFree(iso->Q.Ed, 32);
+    }
+    OsFree(iso);
+}
+
+static int IsoOpen(OHC *o, USB_PIPE *Pipe)
+{
+    OISO *iso = (OISO *)OsAlloc(sizeof(OISO));
+    ULONG i;
+    OS_IRQL irql;
+
+    if (iso == NULL) {
+        return USB_ERR_NOMEM;
+    }
+    iso->Q.Ed = (ULONG *)UsbDmaAlloc(32, &iso->Q.EdPhys);
+    if (iso->Q.Ed == NULL) {
+        IsoFree(iso);
+        return USB_ERR_NOMEM;
+    }
+    for (i = 0; i < OISO_TDS; i++) {
+        iso->Td[i] = (ULONG *)UsbDmaAlloc(TD_SIZE, &iso->TdPhys[i]);
+        if (iso->Td[i] == NULL) {
+            IsoFree(iso);
+            return USB_ERR_NOMEM;
+        }
+    }
+    for (i = 0; i < OISO_TDS; i++) {
+        iso->Td[i][2] = iso->TdPhys[(i + 1) % OISO_TDS];
+    }
+    iso->Pipe = Pipe;
+    iso->Q.Pipe = Pipe;
+    iso->Q.Kind = 3;
+    iso->Q.Ed[0] = Pipe->Dev->Address | ((ULONG)Pipe->Endpoint << 7) | (Pipe->DirIn ? ED_DIR_IN : ED_DIR_OUT) |
+                   ED_ISO | ((ULONG)(Pipe->MaxPacket & 0x7FF) << 16);
+    iso->Q.Ed[1] = iso->TdPhys[0];
+    iso->Q.Ed[2] = iso->TdPhys[0];
+    Pipe->HcPriv = iso;
+    irql = OsLock();
+    iso->IsoNext = o->IsoList;
+    o->IsoList = iso;
+    OsUnlock(irql);
+    EdLink(o, &iso->Q);
+    return USB_OK;
+}
+
+static void IsoCancel(OISO *iso)
+{
+    OS_IRQL irql;
+
+    iso->Q.Ed[0] |= ED_SKIP;
+    OsSleepMs(2);
+    irql = OsLock();
+    iso->Q.Ed[2] = iso->TdPhys[iso->Head];
+    iso->Q.Ed[1] = iso->TdPhys[iso->Head];
+    iso->Used = 0;
+    iso->Started = FALSE;
+    iso->Q.Ed[0] &= ~ED_SKIP;
+    OsUnlock(irql);
+}
+
+static void IsoClose(OHC *o, USB_PIPE *Pipe)
+{
+    OISO *iso = (OISO *)Pipe->HcPriv;
+    OISO **pp;
+    OS_IRQL irql;
+
+    EdUnlink(o, &iso->Q);
+    irql = OsLock();
+    for (pp = &o->IsoList; *pp != NULL; pp = &(*pp)->IsoNext) {
+        if (*pp == iso) {
+            *pp = iso->IsoNext;
+            break;
+        }
+    }
+    OsUnlock(irql);
+    Pipe->HcPriv = NULL;
+    IsoFree(iso);
+}
+
+/*
+ * Lock held. Packets go into ITDs of up to 8 frames whose data is
+ * contiguous and touches at most two pages.
+ */
+static int IsoSubmit(OHC *o, USB_XFER *X)
+{
+    USB_PIPE *p = X->Pipe;
+    OISO *iso = (OISO *)p->HcPriv;
+    ULONG per = p->IsoSlots / 8;
+    ULONG n = X->IsoCount;
+    ULONG start;
+    ULONG i, j, k, ntd = 0;
+    ULONG idx[OISO_TDS];
+
+    if (per == 0) {
+        per = 1;
+    }
+    FrameUpdate(o);
+    start = p->IsoNext;
+    if (!iso->Started || (LONG)(start - (o->FrameExt + 2)) < 0) {
+        if (iso->Started) {
+            p->IsoLate = 1;
+        }
+        start = o->FrameExt + USB_ISO_RESTART_FRAMES;
+    }
+    if ((LONG)(start + n * per - o->FrameExt) > 30000) {
+        return USB_ERR_BUSY;
+    }
+    for (i = 0; i < n; i = j) {
+        ULONG first = X->Phys + X->Iso[i].Offset;
+        ULONG last = first + X->Iso[i].Length - 1;
+        ULONG *t;
+        ULONG bp0;
+        if (X->Iso[i].Length == 0 || X->Iso[i].Length > p->MaxPacket) {
+            return USB_ERR_PARAM;
+        }
+        if (iso->Used + ntd + 2 > OISO_TDS) {
+            return USB_ERR_BUSY;
+        }
+        j = i + 1;
+        while (per == 1 && j < n && j - i < 8 && X->Iso[j].Length != 0 && X->Iso[j].Length <= p->MaxPacket &&
+               X->Iso[j].Offset == X->Iso[j - 1].Offset + X->Iso[j - 1].Length &&
+               ((first + (X->Iso[j].Offset - X->Iso[i].Offset) + X->Iso[j].Length - 1) >> 12) - (first >> 12) <= 1) {
+            last = first + (X->Iso[j].Offset - X->Iso[i].Offset) + X->Iso[j].Length - 1;
+            j++;
+        }
+        if ((last >> 12) - (first >> 12) > 1) {
+            return USB_ERR_PARAM;
+        }
+        k = (iso->Head + ntd) % OISO_TDS;
+        idx[ntd++] = k;
+        t = iso->Td[k];
+        bp0 = first & ~0xFFFUL;
+        t[0] = ((start + i * per) & 0xFFFF) | ((ULONG)(j - i - 1) << 24) | ITD_CC_NOTACC |
+               ((o->UseIrq && j == n) ? 0 : TD_NOINT);
+        t[1] = bp0;
+        t[2] = iso->TdPhys[(k + 1) % OISO_TDS];
+        t[3] = last;
+        for (k = 0; k < 4; k++) {
+            ULONG a = i + 2 * k, b = i + 2 * k + 1;
+            ULONG lo = (a < j) ? (PSW_NOTACC | ((X->Phys + X->Iso[a].Offset - bp0) & 0x1FFF)) : 0;
+            ULONG hi = (b < j) ? (PSW_NOTACC | ((X->Phys + X->Iso[b].Offset - bp0) & 0x1FFF)) : 0;
+            t[4 + k] = lo | (hi << 16);
+        }
+        iso->First[idx[ntd - 1]] = (UCHAR)i;
+        iso->Count[idx[ntd - 1]] = (UCHAR)(j - i);
+    }
+    for (i = 0; i < n; i++) {
+        X->Iso[i].Actual = 0;
+        X->Iso[i].Status = USB_ERR_BUSY;
+    }
+    X->Hc[0] = start;
+    X->Hc[1] = iso->Head;
+    X->Hc[2] = per;
+    X->Hc[3] = ntd;
+    X->IsoFrame = start;
+    iso->Head = (iso->Head + ntd) % OISO_TDS;
+    iso->Used += ntd;
+    iso->Started = TRUE;
+    p->IsoNext = start + n * per;
+    /* the new dummy is the ED tail: the HC may now run the new ITDs */
+    iso->Q.Ed[1] = iso->TdPhys[iso->Head];
+    return USB_OK;
+}
+
+/* lock held: completes transfers whose last frame has passed and whose ITDs the HC retired */
+static void IsoPoll(OHC *o)
+{
+    OISO *iso;
+
+    if (o->IsoList == NULL) {
+        return;
+    }
+    FrameUpdate(o);
+    for (iso = o->IsoList; iso != NULL; iso = iso->IsoNext) {
+        USB_PIPE *p = iso->Pipe;
+        USB_XFER *X;
+        while ((X = p->Cur) != NULL && X->Busy) {
+            ULONG n = X->IsoCount;
+            ULONG last = X->Hc[0] + (n - 1) * X->Hc[2];
+            ULONG ntd = X->Hc[3];
+            ULONG head = iso->Q.Ed[2] & ~0xFUL;
+            ULONG total = 0;
+            ULONG i, k, hidx = OISO_TDS;
+            if ((LONG)(o->FrameExt - (last + 1)) < 0) {
+                break;
+            }
+            for (k = 0; k < ntd; k++) {
+                if (iso->TdPhys[(X->Hc[1] + k) % OISO_TDS] == head) {
+                    hidx = k;
+                }
+            }
+            if (hidx != OISO_TDS) {
+                /* not retired yet: expired ITDs leave on the next visit */
+                if ((LONG)(o->FrameExt - (last + 8)) < 0) {
+                    break;
+                }
+                /* the ED is not being serviced: take the ITDs back */
+                iso->Q.Ed[0] |= ED_SKIP;
+                iso->Q.Ed[2] = iso->TdPhys[(X->Hc[1] + ntd) % OISO_TDS] | (iso->Q.Ed[2] & 2);
+                iso->Q.Ed[0] &= ~ED_SKIP;
+            }
+            for (k = 0; k < ntd; k++) {
+                ULONG *t = iso->Td[(X->Hc[1] + k) % OISO_TDS];
+                ULONG f = iso->First[(X->Hc[1] + k) % OISO_TDS];
+                ULONG c = iso->Count[(X->Hc[1] + k) % OISO_TDS];
+                for (i = 0; i < c; i++) {
+                    USB_ISO_PACKET *pk = &X->Iso[f + i];
+                    ULONG psw = (t[4 + i / 2] >> ((i & 1) * 16)) & 0xFFFF;
+                    ULONG cc = psw >> 12;
+                    if (cc >= 0xE) {
+                        pk->Status = USB_ERR_IO;
+                        pk->Actual = 0;
+                    } else if (cc == CC_NOERROR || cc == CC_DATAUNDERRUN) {
+                        pk->Status = USB_OK;
+                        pk->Actual = (USHORT)(p->DirIn ? (psw & 0x7FF) : pk->Length);
+                    } else {
+                        pk->Status = CcStatus(cc);
+                        pk->Actual = (USHORT)(p->DirIn ? (psw & 0x7FF) : 0);
+                    }
+                    total += pk->Actual;
+                }
+            }
+            iso->Used -= (iso->Used >= ntd) ? ntd : iso->Used;
+            UsbXferDone(X, USB_OK, total);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Pipes                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -401,7 +688,7 @@ static int OhciPipeOpen(USB_PIPE *Pipe)
     int i;
 
     if (Pipe->Type == USB_EP_ISOCH) {
-        return USB_ERR_PARAM;
+        return IsoOpen(o, Pipe);
     }
     q = (OED *)OsAlloc(sizeof(OED));
     if (q == NULL) {
@@ -436,6 +723,10 @@ static void OhciPipeClose(USB_PIPE *Pipe)
     OED *q = (OED *)Pipe->HcPriv;
 
     if (q == NULL) {
+        return;
+    }
+    if (Pipe->Type == USB_EP_ISOCH) {
+        IsoClose(o, Pipe);
         return;
     }
     EdUnlink(o, q);
@@ -477,6 +768,9 @@ static int OhciSubmit(USB_XFER *X)
 
     if (q == NULL) {
         return USB_ERR_NODEV;
+    }
+    if (p->Type == USB_EP_ISOCH) {
+        return IsoSubmit(o, X);
     }
     /* first TD is the current dummy, the rest are the other free TDs */
     q->Order[0] = q->Dummy;
@@ -628,6 +922,7 @@ static void OhciPoll(USB_HC *Hc)
             CheckEd(q);
         }
     }
+    IsoPoll(o);
 }
 
 static BOOLEAN OhciInterrupt(USB_HC *Hc)
@@ -661,6 +956,10 @@ static void OhciCancel(USB_PIPE *Pipe)
     if (q == NULL) {
         return;
     }
+    if (Pipe->Type == USB_EP_ISOCH) {
+        IsoCancel((OISO *)q);
+        return;
+    }
     q->Ed[0] |= ED_SKIP;
     OsSleepMs(2);
     irql = OsLock();
@@ -679,6 +978,10 @@ static int OhciPipeReset(USB_PIPE *Pipe)
 
     if (q == NULL) {
         return USB_ERR_NODEV;
+    }
+    if (Pipe->Type == USB_EP_ISOCH) {
+        IsoCancel((OISO *)q);
+        return USB_OK;
     }
     q->Ed[0] |= ED_SKIP;
     OsSleepMs(2);

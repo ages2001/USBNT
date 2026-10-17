@@ -4,18 +4,28 @@
  */
 
 #include "ntdrv.h"
+#ifdef USB_WDM
+#include "wdm.h"
+#endif
 
 ULONG NtScsiPortNumber;
 
 static PDEVICE_OBJECT ScsiDevice;
 static BOOLEAN Claimed[SCSI_MAX_SLOTS];
 static IO_SCSI_CAPABILITIES Caps;
+static KSPIN_LOCK ClassLock;
+static BOOLEAN ClassLockInit;
+
+#define NT_SREQ_PAGES   (0x10000 / PAGE_SIZE + 2)
 
 typedef struct _NT_SREQ {
     SCSI_REQ                Req;
     PIRP                    Irp;
     PSCSI_REQUEST_BLOCK     Srb;
     PKEVENT                 Event;
+#ifdef USB_WDM
+    ULONG                   Pfn[NT_SREQ_PAGES]; /* page frames as 32 bit numbers (x64, PAE) */
+#endif
 } NT_SREQ;
 
 static void MakeName(WCHAR *Buf, const WCHAR *Base, ULONG N)
@@ -48,6 +58,8 @@ NTSTATUS NtScsiCreate(PDRIVER_OBJECT Drv)
     NTSTATUS st;
     ULONG len;
 
+    KeInitializeSpinLock(&ClassLock);
+    ClassLockInit = TRUE;
     NtScsiPortNumber = ci->ScsiPortCount;
     MakeName(name, L"\\Device\\ScsiPort", NtScsiPortNumber);
     RtlInitUnicodeString(&uname, name);
@@ -84,9 +96,108 @@ NTSTATUS NtScsiCreate(PDRIVER_OBJECT Drv)
     Caps.AdapterScansDown = FALSE;
     Caps.AdapterUsesPio = TRUE;
 
+#ifndef USB_WDM
+    /* the disk driver makes the partition devices of a slot when it starts, and only then */
+    UsbScsiPlaceholder(OsGetConfig("MaxPartitions", 8));
+#endif
     ScsiDevice->Flags &= ~DO_DEVICE_INITIALIZING;
     UsbLog(LOG_INFO, "SCSI port %u created, %u slot(s)\n", NtScsiPortNumber, UsbScsiSlotCount);
     return STATUS_SUCCESS;
+}
+
+/* ------------------------------------------------------------------ */
+/* Media change: the class driver device objects (disk partitions) that  */
+/* talked to a slot are remembered; when the medium goes away or comes   */
+/* back every mounted one gets DO_VERIFY_VOLUME, so the file system      */
+/* re-verifies the volume (same stick: carries on; another stick or no   */
+/* stick: the old volume is dismounted) instead of serving its cache or  */
+/* reading the new medium through stale FAT/MFT data.                    */
+/* ------------------------------------------------------------------ */
+#define NT_CLASS_DEVS   26              /* partition 0 and up to 24 partitions (MaxPartitions) */
+
+typedef struct _CLASS_DEV {
+    PDEVICE_OBJECT Dev;
+    PDRIVER_OBJECT Drv;
+} CLASS_DEV;
+
+static CLASS_DEV ClassDevs[SCSI_MAX_SLOTS][NT_CLASS_DEVS];
+
+static void NoteClassDevice(ULONG Slot, PIRP Irp)
+{
+    PIO_STACK_LOCATION up;
+    PDEVICE_OBJECT d;
+    KIRQL irql;
+    int i, free = -1;
+
+    if (Slot >= SCSI_MAX_SLOTS || Irp->CurrentLocation >= Irp->StackCount) {
+        return;
+    }
+    up = IoGetCurrentIrpStackLocation(Irp) + 1;
+    d = up->DeviceObject;
+    if (d == NULL || d == ScsiDevice || d->DeviceType != FILE_DEVICE_DISK || d->DriverObject == NULL) {
+        return;
+    }
+    if (!ClassLockInit) {
+        KeInitializeSpinLock(&ClassLock);
+        ClassLockInit = TRUE;
+    }
+    KeAcquireSpinLock(&ClassLock, &irql);
+    for (i = 0; i < NT_CLASS_DEVS; i++) {
+        if (ClassDevs[Slot][i].Dev == d) {
+            free = -2;
+            break;
+        }
+        if (ClassDevs[Slot][i].Dev == NULL && free == -1) {
+            free = i;
+        }
+    }
+    if (free >= 0) {
+        ClassDevs[Slot][free].Dev = d;
+        ClassDevs[Slot][free].Drv = d->DriverObject;
+    }
+    KeReleaseSpinLock(&ClassLock, irql);
+}
+
+/* the device object still exists: it is on its driver's list */
+static BOOLEAN ClassDevAlive(CLASS_DEV *c)
+{
+    PDEVICE_OBJECT d;
+
+    for (d = c->Drv->DeviceObject; d != NULL; d = d->NextDevice) {
+        if (d == c->Dev) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+void OsScsiMediaChange(int Slot)
+{
+    KIRQL irql;
+    int i, n = 0;
+
+    if (Slot < 0 || Slot >= SCSI_MAX_SLOTS || !ClassLockInit) {
+        return;
+    }
+    KeAcquireSpinLock(&ClassLock, &irql);
+    for (i = 0; i < NT_CLASS_DEVS; i++) {
+        CLASS_DEV *c = &ClassDevs[Slot][i];
+        if (c->Dev == NULL) {
+            continue;
+        }
+        if (!ClassDevAlive(c)) {
+            c->Dev = NULL;
+            continue;
+        }
+        if (c->Dev->Vpb != NULL && (c->Dev->Vpb->Flags & VPB_MOUNTED)) {
+            c->Dev->Flags |= DO_VERIFY_VOLUME;
+            n++;
+        }
+    }
+    KeReleaseSpinLock(&ClassLock, irql);
+    if (n != 0) {
+        UsbLog(LOG_INFO, "slot %d: medium changed, %d mounted volume(s) marked for verification\n", Slot, n);
+    }
 }
 
 static NTSTATUS SrbToStatus(UCHAR SrbStatus)
@@ -105,6 +216,44 @@ static NTSTATUS SrbToStatus(UCHAR SrbStatus)
     }
 }
 
+/* failed or short commands of the disk driver and file systems go to the log
+   (it is in usbtree /dump): what the disk saw is the first thing to know when
+   a medium cannot be read.  No medium (02/3A) and the media change note
+   (06/28) are normal and left out. */
+static ULONG LoggedFailures;
+
+static void LogFailure(PSCSI_REQUEST_BLOCK Srb, SCSI_REQ *Req)
+{
+    UCHAR op = Srb->Cdb[0], key = 0, asc = 0, ascq = 0;
+    ULONG lba = 0, cnt = 0;
+    BOOLEAN failed = (Req->SrbStatus & 0x3F) != SRB_STATUS_SUCCESS;
+    BOOLEAN shortRw = !failed && (op == 0x28 || op == 0x2A || op == 0x88 || op == 0x8A || op == 0xA8 || op == 0xAA) &&
+                      Req->Transferred < Srb->DataTransferLength;
+
+    if ((!failed && !shortRw) || LoggedFailures >= 200) {
+        return;
+    }
+    if ((Req->SrbStatus & SRB_STATUS_AUTOSENSE_VALID) && Req->SenseLength >= 14) {
+        key = (UCHAR)(Req->Sense[2] & 0x0F);
+        asc = Req->Sense[12];
+        ascq = Req->Sense[13];
+    }
+    if ((key == 0x02 && asc == 0x3A) || (key == 0x06 && asc == 0x28) || op == 0x00) {
+        return;
+    }
+    if (op == 0x28 || op == 0x2A) {
+        lba = ((ULONG)Srb->Cdb[2] << 24) | ((ULONG)Srb->Cdb[3] << 16) | ((ULONG)Srb->Cdb[4] << 8) | Srb->Cdb[5];
+        cnt = ((ULONG)Srb->Cdb[7] << 8) | Srb->Cdb[8];
+    } else if (op == 0x88 || op == 0x8A) {
+        lba = ((ULONG)Srb->Cdb[6] << 24) | ((ULONG)Srb->Cdb[7] << 16) | ((ULONG)Srb->Cdb[8] << 8) | Srb->Cdb[9];
+        cnt = ((ULONG)Srb->Cdb[12] << 8) | Srb->Cdb[13];
+    }
+    LoggedFailures++;
+    UsbLog(LOG_INFO, "disk %u: command %02x lba %u count %u (%u bytes) %s: srb %02x scsi %02x sense %x/%02x/%02x, %u bytes done\n",
+           Srb->TargetId, op, lba, cnt, Srb->DataTransferLength, failed ? "failed" : "short", Req->SrbStatus,
+           Req->ScsiStatus, key, asc, ascq, Req->Transferred);
+}
+
 /* Worker context */
 static void SrbDone(SCSI_REQ *Req)
 {
@@ -118,6 +267,7 @@ static void SrbDone(SCSI_REQ *Req)
     }
     srb->SrbStatus = Req->SrbStatus & ~SRB_STATUS_AUTOSENSE_VALID;
     srb->ScsiStatus = Req->ScsiStatus;
+    LogFailure(srb, Req);
     if (Req->Direction != SCSI_DIR_NONE) {
         srb->DataTransferLength = Req->Transferred;
     }
@@ -166,7 +316,26 @@ static void SrbPages(PIRP Irp, PSCSI_REQUEST_BLOCK Srb, SCSI_REQ *Req)
         return;
     }
     ofs += MmGetMdlByteOffset(mdl);
+#ifdef USB_WDM
+    {
+        /* MDL page frames are PFN_NUMBERs (64 bit on x64); pages above 4 GB go through the bounce buffer */
+        PPFN_NUMBER pf = (PPFN_NUMBER)(mdl + 1) + ofs / PAGE_SIZE;
+        ULONG n = ((ofs % PAGE_SIZE) + Srb->DataTransferLength + PAGE_SIZE - 1) / PAGE_SIZE, i;
+        NT_SREQ *r = (NT_SREQ *)Req;
+        if (n > NT_SREQ_PAGES) {
+            return;
+        }
+        for (i = 0; i < n; i++) {
+            if ((ULONGLONG)pf[i] >= 0x100000ULL) {
+                return;
+            }
+            r->Pfn[i] = (ULONG)pf[i];
+        }
+        Req->Pfn = r->Pfn;
+    }
+#else
     Req->Pfn = (ULONG *)(mdl + 1) + ofs / PAGE_SIZE;
+#endif
     Req->PageOff = ofs % PAGE_SIZE;
 }
 
@@ -188,11 +357,12 @@ static void *SrbData(PIRP Irp, PSCSI_REQUEST_BLOCK Srb)
     return Srb->DataBuffer;
 }
 
+static NTSTATUS SrbForSlot(PDEVICE_OBJECT Dev, PIRP Irp, PSCSI_REQUEST_BLOCK srb, ULONG t);
+
 NTSTATUS NtScsiSrb(PDEVICE_OBJECT Dev, PIRP Irp)
 {
     PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(Irp);
     PSCSI_REQUEST_BLOCK srb = sp->Parameters.Scsi.Srb;
-    NT_SREQ *r;
     ULONG t;
 
     if (srb == NULL) {
@@ -204,15 +374,41 @@ NTSTATUS NtScsiSrb(PDEVICE_OBJECT Dev, PIRP Irp)
     if (srb->PathId != 0 || t >= UsbScsiSlotCount || srb->Lun != 0) {
         return CompleteSrb(Irp, srb, SRB_STATUS_SELECTION_TIMEOUT, STATUS_DEVICE_DOES_NOT_EXIST);
     }
+    return SrbForSlot(Dev, Irp, srb, t);
+}
+
+/* Windows 2000 / XP: the disk PDO of a slot (the SRB address fields are not used) */
+NTSTATUS NtScsiSrbSlot(PDEVICE_OBJECT Dev, PIRP Irp, ULONG Slot)
+{
+    PSCSI_REQUEST_BLOCK srb = IoGetCurrentIrpStackLocation(Irp)->Parameters.Scsi.Srb;
+
+    if (srb == NULL) {
+        Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (Slot >= UsbScsiSlotCount) {
+        return CompleteSrb(Irp, srb, SRB_STATUS_NO_DEVICE, STATUS_DEVICE_DOES_NOT_EXIST);
+    }
+    return SrbForSlot(Dev, Irp, srb, Slot);
+}
+
+static NTSTATUS SrbForSlot(PDEVICE_OBJECT Dev, PIRP Irp, PSCSI_REQUEST_BLOCK srb, ULONG t)
+{
+    NT_SREQ *r;
 
     switch (srb->Function) {
     case SRB_FUNCTION_EXECUTE_SCSI:
         break;
     case SRB_FUNCTION_CLAIM_DEVICE:
     case SRB_FUNCTION_ATTACH_DEVICE:
+#ifndef USB_WDM
         if (Claimed[t] && srb->Function == SRB_FUNCTION_CLAIM_DEVICE) {
             return CompleteSrb(Irp, srb, SRB_STATUS_BUSY, STATUS_DEVICE_BUSY);
         }
+#endif
+        /* Windows 2000 / XP: the PDO of the slot has one function driver at a time; a new one
+           (after REMOVE_DEVICE, which sends no RELEASE) claims it again */
         Claimed[t] = TRUE;
         srb->DataBuffer = Dev;
         return CompleteSrb(Irp, srb, SRB_STATUS_SUCCESS, STATUS_SUCCESS);
@@ -237,6 +433,7 @@ NTSTATUS NtScsiSrb(PDEVICE_OBJECT Dev, PIRP Irp)
     if (srb->CdbLength == 0 || srb->CdbLength > 16) {
         return CompleteSrb(Irp, srb, SRB_STATUS_INVALID_REQUEST, STATUS_INVALID_DEVICE_REQUEST);
     }
+    NoteClassDevice(t, Irp);
     r = (NT_SREQ *)OsAlloc(sizeof(NT_SREQ));
     if (r == NULL) {
         return CompleteSrb(Irp, srb, SRB_STATUS_ERROR, STATUS_INSUFFICIENT_RESOURCES);
@@ -309,18 +506,44 @@ typedef struct _PT_CTX {
     KEVENT Event;
 } PT_CTX;
 
+static NTSTATUS PassThroughAt(PIRP Irp, ULONG InLen, ULONG OutLen, ULONG Slot);
+
 static NTSTATUS PassThrough(PIRP Irp, ULONG InLen, ULONG OutLen)
+{
+    PSCSI_PASS_THROUGH pt = (PSCSI_PASS_THROUGH)Irp->AssociatedIrp.SystemBuffer;
+
+    if (InLen < sizeof(SCSI_PASS_THROUGH) || pt->Length != sizeof(SCSI_PASS_THROUGH)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (pt->PathId != 0 || pt->Lun != 0 || pt->TargetId >= UsbScsiSlotCount) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    return PassThroughAt(Irp, InLen, OutLen, pt->TargetId);
+}
+
+NTSTATUS NtScsiPassThroughSlot(PIRP Irp, ULONG InLen, ULONG OutLen, ULONG Slot)
+{
+    PSCSI_PASS_THROUGH pt = (PSCSI_PASS_THROUGH)Irp->AssociatedIrp.SystemBuffer;
+
+#if defined(USB_WDM) && defined(_WIN64)
+    if (IoIs32bitProcess(Irp)) {
+        return STATUS_NOT_SUPPORTED;            /* 32 bit layout (SCSI_PASS_THROUGH32): not translated */
+    }
+#endif
+    if (InLen < sizeof(SCSI_PASS_THROUGH) || pt->Length != sizeof(SCSI_PASS_THROUGH) || Slot >= UsbScsiSlotCount) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    return PassThroughAt(Irp, InLen, OutLen, Slot);
+}
+
+static NTSTATUS PassThroughAt(PIRP Irp, ULONG InLen, ULONG OutLen, ULONG Slot)
 {
     PSCSI_PASS_THROUGH pt = (PSCSI_PASS_THROUGH)Irp->AssociatedIrp.SystemBuffer;
     NT_SREQ *r;
     KEVENT ev;
     ULONG sz;
 
-    if (InLen < sizeof(SCSI_PASS_THROUGH) || pt->Length != sizeof(SCSI_PASS_THROUGH)) {
-        return STATUS_INVALID_PARAMETER;
-    }
-    if (pt->PathId != 0 || pt->Lun != 0 || pt->TargetId >= UsbScsiSlotCount || pt->CdbLength == 0 ||
-        pt->CdbLength > 16) {
+    if (pt->CdbLength == 0 || pt->CdbLength > 16) {
         return STATUS_INVALID_PARAMETER;
     }
     sz = InLen > OutLen ? InLen : OutLen;
@@ -340,7 +563,7 @@ static NTSTATUS PassThrough(PIRP Irp, ULONG InLen, ULONG OutLen)
     }
     KeInitializeEvent(&ev, NotificationEvent, FALSE);
     r->Event = &ev;
-    r->Req.Target = pt->TargetId;
+    r->Req.Target = (UCHAR)Slot;
     r->Req.CdbLength = pt->CdbLength;
     RtlMoveMemory(r->Req.Cdb, pt->Cdb, pt->CdbLength);
     r->Req.DataLength = pt->DataTransferLength;
@@ -390,6 +613,11 @@ NTSTATUS NtCtlEject(ULONG Slot)
     if (Slot >= UsbScsiSlotCount || KeGetCurrentIrql() != PASSIVE_LEVEL) {
         return STATUS_INVALID_PARAMETER;
     }
+#ifdef USB_WDM
+    if (WdmEjectSlot(Slot)) {
+        return STATUS_SUCCESS;                  /* Plug and Play takes the disk away (Safely Remove Hardware) */
+    }
+#endif
     r = (NT_SREQ *)OsAlloc(sizeof(NT_SREQ));
     if (r == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;

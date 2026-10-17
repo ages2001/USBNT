@@ -11,7 +11,7 @@ void UsbMemCpy(void *Dst, const void *Src, ULONG Len)
     UCHAR *d = (UCHAR *)Dst;
     const UCHAR *s = (const UCHAR *)Src;
 
-    if ((((ULONG)d | (ULONG)s) & 3) == 0) {
+    if ((((ULONG)(USB_UPTR)d | (ULONG)(USB_UPTR)s) & 3) == 0) {
         while (Len >= 4) {
             *(ULONG *)d = *(const ULONG *)s;
             d += 4;

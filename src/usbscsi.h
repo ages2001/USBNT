@@ -64,21 +64,40 @@ typedef struct _SCSI_SLOT_INFO {
     UCHAR       Protocol;       /* interface protocol: 0x50 BOT, 0x62 UAS, 0/1 CBI */
     UCHAR       MediaReady;
     UCHAR       WriteProtect;
-    UCHAR       Pad[3];
+    UCHAR       Fixed;          /* reported as a fixed medium (Windows 2000 / XP, RemovableAsFixed) */
+    UCHAR       Parts;          /* partitions on the medium */
+    UCHAR       Pad;
     ULONG       LastLba;        /* from the last READ CAPACITY, 0 if unknown */
     ULONG       BlockSize;
     ULONG       MaxXfer;        /* bytes per device command */
     ULONG       Identity;
+    ULONG       MediaGen;       /* changes with every new medium */
 } SCSI_SLOT_INFO;
 
 extern ULONG UsbScsiSlotCount;
+extern ULONG UsbScsiFixedMode;  /* Windows 2000 / XP: 0 removable media stay removable, 1 fixed with more
+                                   than one partition, 2 always fixed (RemovableAsFixed) */
 
 void    UsbScsiInit(void);
 void    UsbScsiQueue(SCSI_REQ *Req);
 BOOLEAN UsbScsiExecute(SCSI_REQ *Req);          /* worker context, FALSE = completes later */
 void    UsbScsiGetSlot(int Slot, SCSI_SLOT_INFO *Info);
+BOOLEAN UsbScsiSlotHost(int Slot, char *Buf, int Size, UCHAR *Kind);   /* Kind: BLK_KIND_* */
 void    UsbScsiFreeze(void);
 void    UsbScsiEject(int Slot);
 int     UsbScsiSlotPresent(int Slot);
+void    UsbScsiPlaceholder(ULONG Parts);        /* NT 3.x / 4.0: partition devices per slot (MaxPartitions) */
+
+/* partitions on a medium (MBR primary and logical, GPT; 0: no partition table).  Read puts Count
+   blocks from Lba into Buf (BufSize bytes, also used by the caller of UsbCountPartitions) */
+typedef BOOLEAN (*PART_READ)(void *Ctx, ULONG Lba, ULONG Count, UCHAR *Buf);
+UCHAR   UsbCountPartitions(PART_READ Read, void *Ctx, UCHAR *Buf, ULONG BufSize, ULONG Bs, ULONG Blocks);
+/* sector 0 has a disk signature (or is a GPT protective MBR); reads it into Buf */
+BOOLEAN UsbSignedDisk(PART_READ Read, void *Ctx, UCHAR *Buf);
+
+/* OS side: the medium of a slot went away or a (possibly different) one arrived;
+   file systems still mounted on it must re-verify the volume before trusting
+   anything they have cached */
+void    OsScsiMediaChange(int Slot);
 
 #endif

@@ -16,6 +16,47 @@
 
 #define IOCTL_USBNT_QUERY_TREE  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x903, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_USBNT_WAIT_CHANGE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x904, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_USBNT_GET_LOG     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x905, METHOD_BUFFERED, FILE_ANY_ACCESS)  /* out: log text (latest 32 KB) */
+/* 0x906, 0x907: mouse buttons for usbmon, below */
+
+/* Mouse buttons for usbmon (NT 3.x / 4.0, which have no X buttons and, before
+   NT 4.0 SP3, no low level mouse hook): button presses of the mice usbnt.sys
+   drives (USB, PS/2, I2C) that usbmon asks for go to it instead of to the
+   system.  Every release goes where its press went.  The capture ends when
+   the handle that set it is closed (usbmon ends or crashes) and when usbmon
+   does not fetch the events for a second. */
+#define IOCTL_USBNT_MOUSE_WAIT    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x906, METHOD_BUFFERED, FILE_ANY_ACCESS)  /* out: USBNT_MOUSE_EVENTS */
+#define IOCTL_USBNT_MOUSE_CAPTURE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x907, METHOD_BUFFERED, FILE_ANY_ACCESS)  /* in: ULONG USBNT_CAP_*, out (optional): ULONG flags now */
+
+#define USBNT_CAP_XBUTTONS      0x01    /* buttons 4 and 5 */
+#define USBNT_CAP_MIDDLE        0x02    /* the middle button; its press also turns USBNT_CAP_GRAB on */
+#define USBNT_CAP_GRAB          0x04    /* every button (autoscroll runs); usbmon turns it off */
+
+/* button flags of an event, the MOUSE_INPUT_DATA ButtonFlags values */
+#define USBNT_MB_LEFT_DOWN      0x0001
+#define USBNT_MB_LEFT_UP        0x0002
+#define USBNT_MB_RIGHT_DOWN     0x0004
+#define USBNT_MB_RIGHT_UP       0x0008
+#define USBNT_MB_MIDDLE_DOWN    0x0010
+#define USBNT_MB_MIDDLE_UP      0x0020
+#define USBNT_MB_4_DOWN         0x0040
+#define USBNT_MB_4_UP           0x0080
+#define USBNT_MB_5_DOWN         0x0100
+#define USBNT_MB_5_UP           0x0200
+
+#define USBNT_MOUSE_MAX_EVENTS  16
+
+typedef struct _USBNT_MOUSE_EVENT {
+    USHORT  Buttons;            /* USBNT_MB_* taken from the system */
+    USHORT  Grab;               /* 1: taken because USBNT_CAP_GRAB was on */
+    ULONG   TimeMs;
+} USBNT_MOUSE_EVENT;
+
+typedef struct _USBNT_MOUSE_EVENTS {
+    ULONG   Count;
+    ULONG   Flags;              /* USBNT_CAP_* now */
+    USBNT_MOUSE_EVENT Ev[USBNT_MOUSE_MAX_EVENTS];
+} USBNT_MOUSE_EVENTS;
 
 #define USBNT_MAX_SLOTS         8
 #define USBNT_MAX_HCS           16
@@ -53,6 +94,9 @@ typedef struct _USBNT_SLOTS {
 #define USBNT_FUNC_MOUSE        0x04
 #define USBNT_FUNC_TABLET       0x08
 #define USBNT_FUNC_STORAGE      0x10
+#define USBNT_FUNC_AUDIO        0x20    /* USB Audio 1.0 / 2.0 streaming (AUDIONT) */
+#define USBNT_FUNC_MIDI         0x40    /* USB MIDI output */
+#define USBNT_FUNC_VIDEO        0x80    /* USB Video Class camera (usbcam.exe) */
 
 typedef struct _USBNT_HC_INFO {
     UCHAR   Type;               /* USBNT_HC_* */
@@ -62,7 +106,7 @@ typedef struct _USBNT_HC_INFO {
     USHORT  VendorId;
     USHORT  DeviceId;
     UCHAR   NumPorts;
-    UCHAR   Running;
+    UCHAR   Running;            /* 0 no, 1 yes, 2 unplugged, 3 yes, hot plugged (Thunderbolt / USB4 dock) */
     UCHAR   Irq;
     UCHAR   Companion;          /* EHCI index this UHCI/OHCI serves, 0xFF = none */
     UCHAR   PortProto[USBNT_MAX_PORTS];  /* xHCI: 2 or 3 per port, 0 otherwise */
@@ -102,7 +146,7 @@ typedef struct _USBNT_SLOT_INFO {
     UCHAR   Protocol;           /* 0x50 Bulk-Only, 0x62 UAS, 0x00/0x01 CBI */
     UCHAR   MediaReady;
     UCHAR   WriteProtect;
-    UCHAR   Pad;
+    UCHAR   Partitions;         /* partitions on the medium (bit 7: reported as a fixed disk, 2000 / XP) */
     ULONG   LastLba;            /* 0 if unknown */
     ULONG   BlockSize;
     ULONG   MaxTransfer;        /* bytes per device command */
@@ -124,5 +168,141 @@ typedef struct _USBNT_TREE {
 } USBNT_TREE;
 
 #define USBNT_TREE_VERSION      1
+
+/* with an output buffer of sizeof (USBNT_TREE2) the driver also lists what is
+   not on a USB port: card reader slots (Slot is the disk slot) and HID over
+   I2C controllers and devices; Version is then USBNT_TREE_VERSION2 */
+#define USBNT_EXTRA_I2C_CTRL    1
+#define USBNT_EXTRA_I2C_HID     2
+#define USBNT_EXTRA_READER      3
+#define USBNT_EXTRA_NVME        4   /* NVMe drive (PCIe hot plug, Thunderbolt / USB4): Slot */
+#define USBNT_EXTRA_TBT         5   /* Thunderbolt / USB4 host router or connected device */
+#define USBNT_MAX_EXTRA         24
+
+typedef struct _USBNT_EXTRA_INFO {
+    UCHAR   Kind;               /* USBNT_EXTRA_* */
+    UCHAR   Slot;               /* USBNT_EXTRA_READER: disk slot */
+    UCHAR   Pad[2];
+    char    Name[48];
+    char    Detail[160];        /* lines separated by '\n' */
+} USBNT_EXTRA_INFO;
+
+typedef struct _USBNT_TREE2 {
+    USBNT_TREE       Base;
+    ULONG            ExtraCount;
+    USBNT_EXTRA_INFO Extra[USBNT_MAX_EXTRA];
+} USBNT_TREE2;
+
+#define USBNT_TREE_VERSION2     2
+
+/* ------------------------------------------------------------------ */
+/* USB Video Class cameras (usbvideo.c), used by usbcam.exe            */
+/* ------------------------------------------------------------------ */
+#define IOCTL_USBNT_VIDEO_LIST    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x910, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_USBNT_VIDEO_START   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x911, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_USBNT_VIDEO_STOP    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x912, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_USBNT_VIDEO_FRAME   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x913, METHOD_OUT_DIRECT, FILE_ANY_ACCESS)
+#define IOCTL_USBNT_VIDEO_CONTROL CTL_CODE(FILE_DEVICE_UNKNOWN, 0x914, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#define USBNT_MAX_CAMS          4
+#define USBNT_VID_FORMATS       8
+#define USBNT_VID_FRAMES        12
+#define USBNT_VID_INTERVALS     8
+
+/* four character codes (little endian, as in AVI / BITMAPINFOHEADER) */
+#define USBNT_FOURCC(a, b, c, d) ((ULONG)(UCHAR)(a) | ((ULONG)(UCHAR)(b) << 8) | ((ULONG)(UCHAR)(c) << 16) | \
+                                  ((ULONG)(UCHAR)(d) << 24))
+#define USBNT_FCC_YUY2          USBNT_FOURCC('Y', 'U', 'Y', '2')
+#define USBNT_FCC_UYVY          USBNT_FOURCC('U', 'Y', 'V', 'Y')
+#define USBNT_FCC_NV12          USBNT_FOURCC('N', 'V', '1', '2')
+#define USBNT_FCC_I420          USBNT_FOURCC('I', '4', '2', '0')
+#define USBNT_FCC_MJPG          USBNT_FOURCC('M', 'J', 'P', 'G')
+#define USBNT_FCC_RGB24         USBNT_FOURCC('R', 'G', 'B', '3')   /* bottom-up BGR, as a DIB */
+#define USBNT_FCC_GREY          USBNT_FOURCC('Y', '8', '0', '0')
+
+typedef struct _USBNT_VID_FRAME {
+    USHORT  Width;
+    USHORT  Height;
+    ULONG   MaxFrameSize;           /* bytes */
+    ULONG   NumIntervals;
+    ULONG   Interval[USBNT_VID_INTERVALS];  /* frame intervals in 100 ns units, shortest first */
+} USBNT_VID_FRAME;
+
+typedef struct _USBNT_VID_FORMAT {
+    ULONG   FourCC;                 /* USBNT_FCC_* */
+    UCHAR   BitsPerPixel;           /* 0 for compressed formats */
+    UCHAR   NumFrames;
+    UCHAR   Pad[2];
+    USBNT_VID_FRAME Frame[USBNT_VID_FRAMES];
+} USBNT_VID_FORMAT;
+
+#define USBNT_VCTL_BRIGHTNESS   0x02    /* UVC processing unit selectors */
+#define USBNT_VCTL_CONTRAST     0x03
+#define USBNT_VCTL_HUE          0x06
+#define USBNT_VCTL_SATURATION   0x07
+#define USBNT_VCTL_SHARPNESS    0x08
+#define USBNT_VCTL_GAMMA        0x09
+#define USBNT_VCTL_WB_TEMP      0x0A
+#define USBNT_VCTL_GAIN         0x04
+#define USBNT_VCTL_POWERLINE    0x05
+
+typedef struct _USBNT_CAMERA {
+    ULONG   Id;                     /* 0 = unused entry */
+    UCHAR   DevIndex;               /* USBNT_DEV_INFO index */
+    UCHAR   NumFormats;
+    UCHAR   Streaming;
+    UCHAR   UvcMinor;               /* bcdUVC: 0x10 = 1.0, 0x11 = 1.1, 0x15 = 1.5 */
+    ULONG   Controls;               /* bit n = processing unit selector n available */
+    char    Name[48];
+    USBNT_VID_FORMAT Format[USBNT_VID_FORMATS];
+} USBNT_CAMERA;
+
+typedef struct _USBNT_CAMERAS {
+    ULONG   Version;                /* USBNT_VIDEO_VERSION */
+    ULONG   Count;
+    USBNT_CAMERA Cam[USBNT_MAX_CAMS];
+} USBNT_CAMERAS;
+
+#define USBNT_VIDEO_VERSION     1
+
+typedef struct _USBNT_VID_START {   /* in */
+    ULONG   Id;
+    ULONG   Format;                 /* index into USBNT_CAMERA.Format */
+    ULONG   Frame;                  /* index into .Frame */
+    ULONG   Interval;               /* 100 ns, 0 = fastest */
+} USBNT_VID_START;
+
+typedef struct _USBNT_VID_STATUS {  /* out of START */
+    LONG    Result;                 /* 0 = streaming */
+    ULONG   FourCC;
+    USHORT  Width;
+    USHORT  Height;
+    ULONG   MaxFrameSize;
+    ULONG   Interval;
+} USBNT_VID_STATUS;
+
+typedef struct _USBNT_VID_GET {     /* in of FRAME: wait for a frame newer than LastSequence */
+    ULONG   Id;
+    ULONG   LastSequence;
+    ULONG   TimeoutMs;
+} USBNT_VID_GET;
+
+typedef struct _USBNT_VID_FRAME_HDR { /* start of the FRAME output buffer, image data follows */
+    ULONG   Sequence;
+    ULONG   Bytes;                  /* image bytes after the header */
+    ULONG   FourCC;
+    USHORT  Width;
+    USHORT  Height;
+    ULONG   TimeMs;
+    ULONG   Flags;                  /* bit 0: the frame had errors */
+} USBNT_VID_FRAME_HDR;
+
+typedef struct _USBNT_VID_CONTROL { /* in and out */
+    ULONG   Id;
+    ULONG   Selector;               /* USBNT_VCTL_* */
+    ULONG   Set;                    /* 1 = set Value */
+    LONG    Value;
+    LONG    Min, Max, Def, Res;     /* out */
+} USBNT_VID_CONTROL;
 
 #endif

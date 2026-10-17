@@ -1,0 +1,4 @@
+DllInitialize
+DllUnload
+HidNotifyPresence
+HidRegisterMinidriver

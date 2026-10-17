@@ -1,16 +1,16 @@
 /*
- * usbeject.c - prepares a USB disk for removal on Windows NT 3.1 - 4.0.
+ * usbeject.c - prepares a USB disk, a memory card or a hot plugged NVMe drive
+ *              for removal on Windows NT 3.1 - 4.0.
  *
- * usbeject D:        flush, lock and dismount D:, then release the USB disk
+ * usbeject D:        flush, lock and dismount D: and the other partitions
+ *                    of its disk, then release the USB disk
  * usbeject D: /f     dismount even if files are still open
  * usbeject /slot N   release USB disk slot N without touching a volume
  * usbeject /list     show the USB disk slots
  */
 
-#include <windows.h>
-#include <winioctl.h>
-#include <ntddscsi.h>
-#include "../src/usbntioc.h"
+#include "devmap.h"
+#include "pnpeject.h"
 
 #ifndef FSCTL_LOCK_VOLUME
 #define FSCTL_LOCK_VOLUME       CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 6, METHOD_BUFFERED, FILE_ANY_ACCESS)
@@ -87,7 +87,7 @@ static void List(HANDLE Dev)
         Print("Cannot query the USB driver.\r\n");
         return;
     }
-    Print("USB disk slots on SCSI port %lu:\r\n", s.PortNumber);
+    Print("USBNT disk slots (USB disks, cards, NVMe drives) on SCSI port %lu:\r\n", s.PortNumber);
     for (i = 0; i < s.SlotCount && i < USBNT_MAX_SLOTS; i++) {
         char v[9], p[17];
         Trim(v, s.Slot[i].Vendor, 8);
@@ -103,13 +103,56 @@ static void List(HANDLE Dev)
 static BOOL EjectSlot(HANDLE Dev, DWORD Slot)
 {
     DWORD got = 0;
+    char veto[300];
+
+    switch (PnpEjectSlot(Slot, veto, sizeof(veto))) {
+    case 1:
+        Print("The disk in slot %lu can now be removed safely.\r\n", Slot);
+        return TRUE;
+    case 0:
+        Print("Windows cannot stop the disk in slot %lu now: %s.\r\n", Slot, veto);
+        return FALSE;
+    default:
+        break;                                  /* NT 3.1 - 4.0: usbnt.sys does it */
+    }
 
     if (!DeviceIoControl(Dev, IOCTL_USBNT_EJECT, &Slot, sizeof(Slot), NULL, 0, &got, NULL)) {
         Print("The driver refused to release slot %lu (error %lu).\r\n", Slot, GetLastError());
         return FALSE;
     }
-    Print("The USB disk in slot %lu can now be removed safely.\r\n", Slot);
+    Print("The disk in slot %lu can now be removed safely.\r\n", Slot);
     return TRUE;
+}
+
+/* one drive (not a partition of a disk slot: a CD-ROM) flushed, locked and dismounted; returns
+   0 or, if it is in use and not Force, its letter */
+static char LockOne(const char *Path, char Letter, BOOL Force, DEV_LOCKED *L)
+{
+    HANDLE vol = CreateFileA(Path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                             OPEN_EXISTING, 0, NULL);
+    DWORD got = 0;
+    int i;
+
+    L->Count = 0;
+    if (vol == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    for (i = 0; i < 20; i++) {
+        FlushFileBuffers(vol);
+        if (DeviceIoControl(vol, FSCTL_LOCK_VOLUME, NULL, 0, NULL, 0, &got, NULL)) {
+            break;
+        }
+        Sleep(500);
+    }
+    if (i == 20 && !Force) {
+        CloseHandle(vol);
+        return Letter;
+    }
+    DeviceIoControl(vol, FSCTL_DISMOUNT_VOLUME, NULL, 0, NULL, 0, &got, NULL);
+    L->Vol[0] = vol;
+    L->Letter[0] = Letter;
+    L->Count = 1;
+    return 0;
 }
 
 static int EjectDrive(HANDLE Dev, char Letter, BOOL Force)
@@ -136,7 +179,7 @@ static int EjectDrive(HANDLE Dev, char Letter, BOOL Force)
     }
     if (DeviceIoControl(vol, IOCTL_SCSI_GET_ADDRESS, NULL, 0, &addr, sizeof(addr), &got, NULL)) {
         if (addr.PortNumber != s.PortNumber) {
-            Print("Drive %c: is not a USB disk.\r\n", Letter);
+            Print("Drive %c: is not a USBNT disk (USB disk, card or NVMe drive).\r\n", Letter);
             CloseHandle(vol);
             return 1;
         }
@@ -154,26 +197,67 @@ static int EjectDrive(HANDLE Dev, char Letter, BOOL Force)
             return 1;
         }
     }
-    /* the cache manager may keep recently used files open for a few seconds */
-    for (i = 0; i < 20; i++) {
+    if ((GetVersion() & 0x80000000) == 0 && (GetVersion() & 0xFF) >= 5) {
+        /* Windows 2000 / XP: Plug and Play closes the volume (an open handle of ours would stop it) */
+        char veto[300];
+        int r;
         FlushFileBuffers(vol);
-        if (DeviceIoControl(vol, FSCTL_LOCK_VOLUME, NULL, 0, NULL, 0, &got, NULL)) {
-            break;
+        CloseHandle(vol);
+        r = PnpEjectSlot(slot, veto, sizeof(veto));
+        if (r == 0 && Force) {
+            Print("Drive %c: is in use (%s), dismounting anyway.\r\n", Letter, veto);
+            vol = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                              OPEN_EXISTING, 0, NULL);
+            if (vol != INVALID_HANDLE_VALUE) {
+                DeviceIoControl(vol, FSCTL_LOCK_VOLUME, NULL, 0, NULL, 0, &got, NULL);
+                DeviceIoControl(vol, FSCTL_DISMOUNT_VOLUME, NULL, 0, NULL, 0, &got, NULL);
+                CloseHandle(vol);
+            }
+            r = PnpEjectSlot(slot, veto, sizeof(veto));
         }
-        Sleep(500);
-    }
-    if (i == 20) {
-        if (!Force) {
-            Print("Drive %c: is in use; close all files and windows on it and try again,\r\n"
-                  "or use usbeject %c: /f to dismount it anyway.\r\n", Letter, Letter);
-            CloseHandle(vol);
+        if (r == 1) {
+            Print("Drive %c: (slot %lu) can now be removed safely.\r\n", Letter, slot);
+            return 0;
+        }
+        if (r == 0) {
+            Print("Windows cannot stop drive %c: now: %s.\r\n"
+                  "Close the files and windows on it and try again, or use usbeject %c: /f.\r\n", Letter, veto,
+                  Letter);
             return 1;
         }
-        Print("Drive %c: is in use, dismounting anyway.\r\n", Letter);
+        return EjectSlot(Dev, slot) ? 0 : 1;
     }
-    DeviceIoControl(vol, FSCTL_DISMOUNT_VOLUME, NULL, 0, NULL, 0, &got, NULL);
-    i = EjectSlot(Dev, slot) ? 0 : 1;
     CloseHandle(vol);
+    {
+        /* every partition of the disk (a CD-ROM: just the drive): flushed, locked, dismounted */
+        static DEV_SLOT_MAP map[USBNT_MAX_SLOTS];
+        DEV_LOCKED locked;
+        char letters[27], busy;
+        int n = 0;
+        DevMapSlots(s.PortNumber, map, USBNT_MAX_SLOTS);
+        if (slot < USBNT_MAX_SLOTS && map[slot].Disk >= 0) {
+            n = DevMapSlotLetters(&map[slot], letters, NULL, 26);
+        }
+        if (n > 1) {
+            Print("Drive %c: is one of %d partitions of the disk in slot %lu (%s).\r\n", Letter, n, slot, letters);
+        }
+        busy = n ? DevMapLockSlot(&map[slot], FALSE, 20, &locked) : LockOne(path, Letter, FALSE, &locked);
+        if (busy != 0) {
+            if (!Force) {
+                Print("Drive %c: is in use; close all files and windows on it and try again,\r\n"
+                      "or use usbeject %c: /f to dismount it anyway.\r\n", busy, Letter);
+                return 1;
+            }
+            Print("Drive %c: is in use, dismounting anyway.\r\n", busy);
+            if (n) {
+                DevMapLockSlot(&map[slot], TRUE, 1, &locked);
+            } else {
+                LockOne(path, Letter, TRUE, &locked);
+            }
+        }
+        i = EjectSlot(Dev, slot) ? 0 : 1;
+        DevMapUnlock(&locked);
+    }
     return (int)i;
 }
 

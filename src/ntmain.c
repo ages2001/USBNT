@@ -67,6 +67,8 @@ static NTSTATUS NTAPI DispatchInternal(PDEVICE_OBJECT Dev, PIRP Irp)
     case EXT_KBD:
     case EXT_MOUSE:
         return NtInputIoctl(Dev, Irp);
+    case EXT_AUDIO:
+        return NtAudioInternal(Dev, Irp);
     default:
         return Complete(Irp, STATUS_INVALID_DEVICE_REQUEST);
     }
@@ -102,6 +104,7 @@ static VOID NTAPI PollDpcRoutine(PKDPC Dpc, PVOID Ctx, PVOID A1, PVOID A2)
     (void)A2;
     DpcCount++;
     UsbTick();
+    NtPs2Poll();
     if (!Stopping) {
         ArmTimer();
     }
@@ -175,12 +178,16 @@ static VOID NTAPI WorkerThread(PVOID Ctx)
     BOOLEAN reported = FALSE;
 
     (void)Ctx;
+    NtWorkerThread = KeGetCurrentThread();
     KeSetPriorityThread(KeGetCurrentThread(), LOW_REALTIME_PRIORITY);
-    t.LowPart = (ULONG)(-(LONG)(200 * 10000));
-    t.HighPart = -1;
     for (;;) {
+        ULONG ms = (UsbPollWantMs != 0 && UsbPollWantMs < 200) ? UsbPollWantMs : 200;
+        t.LowPart = (ULONG)(-(LONG)(ms * 10000));
+        t.HighPart = -1;
         KeWaitForSingleObject(&NtWorkerEvent, Executive, KernelMode, FALSE, &t);
         UsbWorkerIteration();
+        NtPs2Service();
+        NtInputService();
         if (!reported && OsTimeMs() - start > 20000) {
             int i;
             reported = TRUE;
@@ -216,14 +223,32 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT Drv, PUNICODE_STRING RegistryPath)
     Drv->MajorFunction[IRP_MJ_INTERNAL_DEVICE_CONTROL] = DispatchInternal;
     Drv->MajorFunction[IRP_MJ_SHUTDOWN] = DispatchShutdown;
 
+    UsbPciRelocateAll();                        /* every BAR above 4 GB goes below 4 GB */
     UsbScsiInit();
     KeInitializeDpc(&PollDpc, PollDpcRoutine, NULL);
     KeInitializeDpc(&IsrDpc, IsrDpcRoutine, NULL);
     KeInitializeTimer(&PollTimer);
 
     if (UsbInit() != USB_OK) {
+        /* no USB at all: still the PS/2 keyboard and mouse driver */
         UsbLog(LOG_ERR, "no USB host controller found\n");
-        return STATUS_NO_SUCH_DEVICE;
+        if (!NtPs2Wanted()) {
+            return STATUS_NO_SUCH_DEVICE;       /* nothing created: the driver can go */
+        }
+        NtInputCreate(Drv);
+        NtPs2Init();
+        if (!NtPs2Keyboard() && !NtPs2Mouse()) {
+            NtInputDestroy();
+            return STATUS_NO_SUCH_DEVICE;
+        }
+        KeInitializeTimer(&PollTimer);
+        ArmTimer();
+        st = PsCreateSystemThread(&thread, 0, NULL, NULL, NULL, WorkerThread, NULL);
+        if (NT_SUCCESS(st)) {
+            ZwClose(thread);
+        }
+        UsbLog(LOG_INFO, "initialization complete (PS/2 only)\n");
+        return STATUS_SUCCESS;
     }
 
     if (!OsGetConfig("DisableStorage", 0)) {
@@ -233,6 +258,10 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT Drv, PUNICODE_STRING RegistryPath)
         }
     }
     NtInputCreate(Drv);
+    NtPs2Init();
+    if (!OsGetConfig("DisableAudio", 0)) {
+        NtAudioCreate(Drv);
+    }
 
     if (OsGetConfig("UseInterrupts", 0)) {
         ConnectInterrupts();

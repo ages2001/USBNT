@@ -4,6 +4,10 @@
  */
 
 #include "ntdrv.h"
+#include "usbvideo.h"
+#include "usbblk.h"
+#include "tbt.h"
+#include "smbtp.h"
 
 typedef VOID (NTAPI *CLASS_SERVICE)(PVOID ClassDeviceObject, PVOID Start, PVOID End, PVOID Consumed);
 
@@ -13,10 +17,19 @@ typedef struct _PORT_STATE {
     CLASS_SERVICE   Service;
     LONG            Enabled;
     ULONG           Number;
+    PDEVICE_OBJECT  Owner;              /* Windows 2000 / XP: our device the class driver connected on */
 } PORT_STATE;
 
 static PORT_STATE Kbd;
 static PORT_STATE Mou;
+#define LENT_TRIES      40              /* searches for it, one per key at most once a second */
+static PORT_STATE Lent;                 /* the class driver of another keyboard port (below) */
+static volatile LONG LentWanted;
+static ULONG LentTries;
+static ULONG LentLastTry;
+static BOOLEAN SetupChecked;
+static BOOLEAN InTextSetup;
+static PDRIVER_OBJECT InputDriver;
 static KSPIN_LOCK InputLock;
 static KEYBOARD_TYPEMATIC_PARAMETERS Typematic = { 0, 30, 500 };
 static KEYBOARD_INDICATOR_PARAMETERS Indicators = { 0, 0 };
@@ -31,6 +44,15 @@ static ULONG WheelMode;
 #define WHEEL_AUTO      0
 #define WHEEL_FLAG_ONLY 1
 #define WHEEL_CHANNEL   2
+
+/* button channel to usbmon (IOCTL_USBNT_MOUSE_*), under the cancel spin lock */
+static ULONG MouCap;                    /* USBNT_CAP_* */
+static PFILE_OBJECT MouCapOwner;        /* the handle that set it */
+static USHORT MouRouted;                /* *_DOWN flags of the buttons whose press went to usbmon */
+static PIRP MouIrp;
+static USBNT_MOUSE_EVENT MouQ[USBNT_MOUSE_MAX_EVENTS];
+static ULONG MouQn;
+static ULONG MouQTime;                  /* when the oldest queued event came */
 
 static void MakeName(WCHAR *Buf, const WCHAR *Base, ULONG N)
 {
@@ -51,6 +73,7 @@ static void MakeName(WCHAR *Buf, const WCHAR *Base, ULONG N)
     Buf[i] = 0;
 }
 
+#ifndef USB_WDM
 static NTSTATUS CreatePort(PDRIVER_OBJECT Drv, PORT_STATE *P, ULONG Kind, const WCHAR *Base,
                            const WCHAR *MapKey, DEVICE_TYPE Type)
 {
@@ -87,6 +110,74 @@ static NTSTATUS CreatePort(PDRIVER_OBJECT Drv, PORT_STATE *P, ULONG Kind, const 
     return STATUS_SUCCESS;
 }
 
+/* kbdclass and mouclass must serve more than one port (the PS/2 one and ours) into
+   KeyboardClass0 / PointerClass0, the devices the window system reads.  usbinst sets
+   it; a system that text-mode setup installed USBNT on (TXTSETUP.OEM) has never seen
+   usbinst, so the driver sets it itself.  Both class drivers start after usbnt.sys
+   (groups Keyboard Class / Pointer Class), so it counts from this boot on. */
+static void ClassParams(void)
+{
+    static const WCHAR *keys[] = { L"Kbdclass\\Parameters", L"Mouclass\\Parameters" };
+    static const WCHAR *full[] = { L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\Kbdclass\\Parameters",
+                                   L"\\Registry\\Machine\\System\\CurrentControlSet\\Services\\Mouclass\\Parameters" };
+    ULONG one = 1, v;
+    int i;
+
+    for (i = 0; i < 2; i++) {
+        v = 0;
+        if (NtQueryDword(full[i], L"ConnectMultiplePorts", &v) && v == 1) {
+            continue;
+        }
+        RtlCreateRegistryKey(RTL_REGISTRY_SERVICES, (PWSTR)keys[i]);
+        if (NT_SUCCESS(RtlWriteRegistryValue(RTL_REGISTRY_SERVICES, (PWSTR)keys[i], L"ConnectMultiplePorts",
+                                             REG_DWORD, &one, sizeof(one)))) {
+            UsbLog(LOG_INFO, "%s: ConnectMultiplePorts set to 1 (was %u)\n", i ? "mouclass" : "kbdclass", v);
+        }
+    }
+}
+#endif
+
+#ifdef USB_WDM
+/* Windows 2000 / XP: kbdclass / mouclass leave (the keyboard / mouse device Dev of the bus goes
+   away).  Only the device the class driver is connected on counts: when Plug and Play rebuilds
+   the device node's stack (the INF is installed, the class changes), the new stack's class
+   driver may connect before the old stack is removed - that removal must not cut it off. */
+void NtInputDisconnect(ULONG Kind, PDEVICE_OBJECT Dev)
+{
+    PORT_STATE *p = (Kind == EXT_KBD) ? &Kbd : &Mou;
+    KIRQL old;
+    BOOLEAN done = FALSE;
+
+    KeAcquireSpinLock(&InputLock, &old);
+    if (p->Owner == Dev || p->Owner == NULL) {
+        p->Service = NULL;
+        p->ClassDevice = NULL;
+        p->Enabled = 0;
+        p->Owner = NULL;
+        done = TRUE;
+    }
+    KeReleaseSpinLock(&InputLock, old);
+    UsbLog(LOG_DBG, "%s class driver %s\n", (Kind == EXT_KBD) ? "keyboard" : "pointer",
+           done ? "disconnected" : "of an old device stack gone");
+}
+
+/* Windows 2000 / XP: kbdclass / mouclass open (enable) or close (disable) the port */
+void NtInputEnable(ULONG Kind, BOOLEAN Enable, PDEVICE_OBJECT Dev)
+{
+    PORT_STATE *p = (Kind == EXT_KBD) ? &Kbd : &Mou;
+
+    if (p->Owner != NULL && p->Owner != Dev) {
+        return;                                 /* an old stack's device */
+    }
+    if (Enable) {
+        InterlockedIncrement(&p->Enabled);
+    } else if (p->Enabled > 0) {
+        InterlockedDecrement(&p->Enabled);
+    }
+    UsbLog(LOG_DBG, "%s port %s\n", (Kind == EXT_KBD) ? "keyboard" : "pointer", Enable ? "opened" : "closed");
+}
+#endif
+
 NTSTATUS NtInputCreate(PDRIVER_OBJECT Drv)
 {
     UNICODE_STRING uname;
@@ -96,13 +187,18 @@ NTSTATUS NtInputCreate(PDRIVER_OBJECT Drv)
 
     KeInitializeSpinLock(&InputLock);
     WheelMode = OsGetConfig("WheelMode", WHEEL_AUTO);
+    InputDriver = Drv;
 
+#ifndef USB_WDM
+    ClassParams();
+    /* Windows 2000 / XP: the keyboard and the mouse are devices of the USBNT bus (wdmbus.c) */
     if (!OsGetConfig("DisableKeyboard", 0)) {
         CreatePort(Drv, &Kbd, EXT_KBD, L"\\Device\\KeyboardPort", L"KEYBOARDPORT", FILE_DEVICE_8042_PORT);
     }
     if (!OsGetConfig("DisableMouse", 0)) {
         CreatePort(Drv, &Mou, EXT_MOUSE, L"\\Device\\PointerPort", L"POINTERPORT", FILE_DEVICE_8042_PORT);
     }
+#endif
 
     RtlInitUnicodeString(&uname, USBNT_DEVICE_NAME);
     st = IoCreateDevice(Drv, sizeof(NT_EXT), &uname, FILE_DEVICE_UNKNOWN, 0, FALSE, &CtlDevice);
@@ -118,6 +214,32 @@ NTSTATUS NtInputCreate(PDRIVER_OBJECT Drv)
     IoCreateSymbolicLink(&ulink, &uname);
     UsbLog(LOG_INFO, "keyboard port %u, pointer port %u\n", Kbd.Number, Mou.Number);
     return STATUS_SUCCESS;
+}
+
+/* undoes NtInputCreate when the driver does not stay loaded: nothing may keep
+   pointing at the driver's code once the system unloads it */
+void NtInputDestroy(void)
+{
+    UNICODE_STRING ulink;
+    WCHAR name[64];
+    if (Kbd.Device != NULL) {
+        MakeName(name, L"\\Device\\KeyboardPort", Kbd.Number);
+        RtlDeleteRegistryValue(RTL_REGISTRY_DEVICEMAP, L"KEYBOARDPORT", name);
+        IoDeleteDevice(Kbd.Device);
+        Kbd.Device = NULL;
+    }
+    if (Mou.Device != NULL) {
+        MakeName(name, L"\\Device\\PointerPort", Mou.Number);
+        RtlDeleteRegistryValue(RTL_REGISTRY_DEVICEMAP, L"POINTERPORT", name);
+        IoDeleteDevice(Mou.Device);
+        Mou.Device = NULL;
+    }
+    if (CtlDevice != NULL) {
+        RtlInitUnicodeString(&ulink, USBNT_DOS_NAME);
+        IoDeleteSymbolicLink(&ulink);
+        IoDeleteDevice(CtlDevice);
+        CtlDevice = NULL;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -162,7 +284,212 @@ void OsKbdInput(const USB_KEY_EVENT *Events, ULONG Count)
         data[i].Reserved = 0;
         data[i].ExtraInformation = 0;
     }
+    /* text-mode setup reads the keyboard it started with: the lent class device goes first there */
+    if (Lent.Service != NULL && (InTextSetup || Kbd.Service == NULL)) {
+        Deliver(&Lent, &data[0], &data[Count]);
+        return;
+    }
+    if (Kbd.Service == NULL || !SetupChecked) {
+        if (Lent.Service == NULL && !LentWanted && LentTries < LENT_TRIES) {
+            LentWanted = 1;                     /* the worker looks for a class driver (NtInputService) */
+            OsWakeWorker();
+        }
+    }
     Deliver(&Kbd, &data[0], &data[Count]);
+}
+
+/* ------------------------------------------------------------------ */
+/* USB keys for the class driver of another keyboard                    */
+/* ------------------------------------------------------------------ */
+/*
+ * Text-mode setup of NT 3.x / 4.0 loads usbnt.sys from the driver disk
+ * (TXTSETUP.OEM) long after kbdclass, which connected to the ports there
+ * were then and to no later one.  Taking the USB controllers from the BIOS
+ * also ends its PS/2 emulation, the keyboard setup was using.  So when a USB
+ * key comes and no class driver listens to our keyboard port, the keys go to
+ * the class device of the PS/2 keyboard (i8042prt) - setup reads that one:
+ * its connect data (class device object, class service callback, as kbdclass
+ * gave them in IOCTL_INTERNAL_KEYBOARD_CONNECT) is in the port's device
+ * extension.  It is recognised by what it points to: a keyboard class device
+ * of another driver, and a callback inside that driver's image.  Windows 2000
+ * / XP text-mode setup: the same when kbdclass does not come onto USBNT's
+ * keyboard device (and there kbdhid's keyboards are looked at too).
+ */
+typedef NTSTATUS (NTAPI *OB_REF_NAME)(PUNICODE_STRING Name, ULONG Attributes, PACCESS_STATE Access,
+                                      ACCESS_MASK Desired, POBJECT_TYPE Type, KPROCESSOR_MODE Mode,
+                                      PVOID Context, PVOID *Object);
+
+/* \Driver\name, referenced (NT 4.0 and later: NT 3.x has no ObReferenceObjectByName) */
+PDRIVER_OBJECT NtRefDriver(const WCHAR *Name)
+{
+    OB_REF_NAME ref = (OB_REF_NAME)NtKernelExport("ObReferenceObjectByName");
+    POBJECT_TYPE *type = (POBJECT_TYPE *)NtKernelExport("IoDriverObjectType");
+    UNICODE_STRING u;
+    PVOID obj = NULL;
+
+    if (ref == NULL || type == NULL || *type == NULL) {
+        return NULL;
+    }
+    RtlInitUnicodeString(&u, Name);
+    if (!NT_SUCCESS(ref(&u, OBJ_CASE_INSENSITIVE, NULL, 0, *type, KernelMode, NULL, &obj))) {
+        return NULL;
+    }
+    return (PDRIVER_OBJECT)obj;
+}
+
+static BOOLEAN KernelPtr(const void *P, ULONG Size)
+{
+    return (BOOLEAN)(P != NULL && (LONG_PTR)P < 0 && ((ULONG_PTR)P & (sizeof(PVOID) - 1)) == 0 &&
+                     MmIsAddressValid((PVOID)P) && MmIsAddressValid((PUCHAR)P + Size - 1));
+}
+
+/* the loaded image (MZ / PE header) that contains A, and its size */
+static PUCHAR ImageOf(const void *A, ULONG *Size)
+{
+    PUCHAR p = (PUCHAR)((ULONG_PTR)A & ~(ULONG_PTR)0xFFF);
+    int i;
+
+    for (i = 0; i < 512 && (LONG_PTR)p < 0 && MmIsAddressValid(p); i++, p -= 0x1000) {
+        ULONG e = *(ULONG *)(p + 0x3C);
+        if (p[0] == 'M' && p[1] == 'Z' && e >= 0x40 && e < 0x1000 - 0x58 && *(ULONG *)(p + e) == 0x00004550) {
+            *Size = *(ULONG *)(p + e + 0x50);   /* OptionalHeader.SizeOfImage, PE32 and PE32+ */
+            return p;
+        }
+    }
+    return NULL;
+}
+
+/* Class, Service: a CONNECT_DATA a keyboard class driver gave port device Port */
+static BOOLEAN ClassConnect(PDEVICE_OBJECT Port, PDEVICE_OBJECT Class, PVOID Service)
+{
+    PDRIVER_OBJECT drv;
+    PUCHAR base, rd;
+    ULONG size = 0;
+
+    if (Class == Port || !KernelPtr(Class, sizeof(DEVICE_OBJECT)) || Class->Type != IO_TYPE_DEVICE ||
+        Class->DeviceType != FILE_DEVICE_KEYBOARD) {
+        return FALSE;
+    }
+    drv = Class->DriverObject;
+    if (!KernelPtr(drv, sizeof(DRIVER_OBJECT)) || drv->Type != IO_TYPE_DRIVER || drv == Port->DriverObject ||
+        drv == InputDriver || (LONG_PTR)Service >= 0 || !MmIsAddressValid(Service)) {
+        return FALSE;
+    }
+    base = ImageOf(Service, &size);
+    rd = (PUCHAR)drv->MajorFunction[IRP_MJ_READ];
+    return (BOOLEAN)(base != NULL && rd >= base && rd < base + size && (PUCHAR)Service < base + size);
+}
+
+static BOOLEAN ScanPort(PDEVICE_OBJECT D, const char *What)
+{
+    PUCHAR ext, end;
+    PVOID *p;
+
+    if (D == NULL || D->DriverObject == InputDriver || D->DeviceExtension == NULL ||
+        D->Size <= sizeof(DEVICE_OBJECT)) {
+        return FALSE;
+    }
+    ext = (PUCHAR)D->DeviceExtension;
+    end = (PUCHAR)D + D->Size;                  /* Size: the device object and its extension */
+    if (ext + (D->Size - sizeof(DEVICE_OBJECT)) < end) {
+        end = ext + (D->Size - sizeof(DEVICE_OBJECT));
+    }
+    if (ext < (PUCHAR)D || end > ext + 0x2000) {
+        return FALSE;
+    }
+    for (p = (PVOID *)ext; (PUCHAR)(p + 2) <= end; p++) {
+        if (ClassConnect(D, (PDEVICE_OBJECT)p[0], p[1])) {
+            KIRQL old;
+            KeAcquireSpinLock(&InputLock, &old);
+            Lent.ClassDevice = (PDEVICE_OBJECT)p[0];
+            Lent.Service = (CLASS_SERVICE)p[1];
+            Lent.Enabled = 1;
+            KeReleaseSpinLock(&InputLock, old);
+            UsbLog(LOG_INFO, "keyboard: no class driver on our port, USB keys go to the class driver of %s%s\n",
+                   What, InTextSetup ? " (text-mode setup)" : "");
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static BOOLEAN FindLent(void)
+{
+    static const WCHAR *drivers[] = { L"\\Driver\\i8042prt", L"\\Driver\\kbdhid", NULL };
+    static const char *labels[] = { "i8042prt", "kbdhid" };
+    static char port[] = "\\Device\\KeyboardPort0";
+    PDEVICE_OBJECT d;
+    WCHAR name[40];
+    int i;
+
+    for (i = 0; drivers[i] != NULL; i++) {
+        PDRIVER_OBJECT drv = NtRefDriver(drivers[i]);
+        BOOLEAN found = FALSE;
+        if (drv == NULL) {
+            continue;
+        }
+        for (d = drv->DeviceObject; d != NULL && !found; d = d->NextDevice) {
+            found = ScanPort(d, labels[i]);
+        }
+        ObDereferenceObject(drv);
+        if (found) {
+            return TRUE;
+        }
+    }
+    /* NT 3.x: the keyboard ports by name */
+    for (i = 0; i < 8; i++) {
+        UNICODE_STRING u;
+        PFILE_OBJECT fo = NULL;
+        BOOLEAN found = FALSE;
+        MakeName(name, L"\\Device\\KeyboardPort", (ULONG)i);
+        RtlInitUnicodeString(&u, name);
+        if (!NT_SUCCESS(IoGetDeviceObjectPointer(&u, FILE_READ_ATTRIBUTES, &fo, &d))) {
+            continue;
+        }
+        port[sizeof(port) - 2] = (char)('0' + i);
+        if (d->DriverObject != InputDriver) {
+            PDEVICE_OBJECT e;
+            for (e = d->DriverObject->DeviceObject; e != NULL && !found; e = e->NextDevice) {
+                found = ScanPort(e, port);
+            }
+        }
+        ObDereferenceObject(fo);
+        if (found) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* worker (PASSIVE_LEVEL): a USB key came and no class driver took it */
+void NtInputService(void)
+{
+    ULONG now = OsTimeMs();
+
+    if (!LentWanted || Lent.Service != NULL) {
+        return;
+    }
+    if (!SetupChecked) {
+        PDRIVER_OBJECT s = NtRefDriver(L"\\Driver\\setupdd");
+        SetupChecked = TRUE;
+        if (s != NULL) {
+            InTextSetup = TRUE;
+            ObDereferenceObject(s);
+        }
+    }
+    if (Kbd.Service != NULL && !InTextSetup) {
+        LentWanted = 0;                         /* kbdclass is on our port: the normal case */
+        return;
+    }
+    if (LentTries != 0 && now - LentLastTry < 1000) {
+        return;
+    }
+    LentTries++;
+    LentLastTry = now;
+    if (!FindLent() && LentTries == LENT_TRIES) {
+        UsbLog(LOG_INFO, "keyboard: no class driver for the USB keys found\n");
+    }
+    LentWanted = 0;
 }
 
 static void WheelChannel(LONG Delta)
@@ -193,12 +520,106 @@ static void WheelChannel(LONG Delta)
     }
 }
 
+static void MouCapReset(void)
+{
+    MouCap = 0;
+    MouCapOwner = NULL;
+    MouRouted = 0;
+    MouQn = 0;
+}
+
+/* completes the waiting IOCTL_USBNT_MOUSE_WAIT with the queued events; called
+   with the cancel spin lock held, returns the IRP to complete after releasing it */
+static PIRP MouTake(void)
+{
+    PIRP irp = MouIrp;
+    USBNT_MOUSE_EVENTS *o;
+
+    if (irp == NULL || MouQn == 0) {
+        return NULL;
+    }
+    MouIrp = NULL;
+    IoSetCancelRoutine(irp, NULL);
+    o = (USBNT_MOUSE_EVENTS *)irp->AssociatedIrp.SystemBuffer;
+    RtlZeroMemory(o, sizeof(*o));
+    o->Count = MouQn;
+    o->Flags = MouCap;
+    RtlMoveMemory(o->Ev, MouQ, MouQn * sizeof(USBNT_MOUSE_EVENT));
+    MouQn = 0;
+    irp->IoStatus.Status = STATUS_SUCCESS;
+    irp->IoStatus.Information = sizeof(USBNT_MOUSE_EVENTS);
+    return irp;
+}
+
+/* takes the button flags usbmon asked for out of an event; returns them */
+static USHORT MouRoute(USHORT Flags)
+{
+    static const USHORT down[5] = { UMOU_LEFT_DOWN, UMOU_RIGHT_DOWN, UMOU_MIDDLE_DOWN, UMOU_B4_DOWN, UMOU_B5_DOWN };
+    KIRQL irql;
+    PIRP irp;
+    USHORT taken = 0;
+    USHORT grab = 0;
+    ULONG now;
+    int i;
+
+    if (!(Flags & 0x03FF) || (MouCap == 0 && MouRouted == 0)) {
+        return 0;
+    }
+    now = OsTimeMs();
+    IoAcquireCancelSpinLock(&irql);
+    if (MouQn != 0 && MouIrp == NULL && (now - MouQTime > 1000 || MouQn == USBNT_MOUSE_MAX_EVENTS)) {
+        /* usbmon does not fetch its events (hangs): the buttons are the system's again */
+        UsbLog(LOG_ERR, "mouse: usbmon does not answer, button capture ended\n");
+        MouCapReset();
+    }
+    for (i = 0; i < 5; i++) {
+        USHORT d = down[i];
+        USHORT u = (USHORT)(d << 1);
+        if (Flags & d) {
+            BOOLEAN take = (BOOLEAN)((MouCap & USBNT_CAP_GRAB) || (i == 2 && (MouCap & USBNT_CAP_MIDDLE)) ||
+                                     (i >= 3 && (MouCap & USBNT_CAP_XBUTTONS)));
+            if (take) {
+                if (MouCap & USBNT_CAP_GRAB) {
+                    grab = 1;
+                }
+                if (i == 2 && (MouCap & USBNT_CAP_MIDDLE)) {
+                    MouCap |= USBNT_CAP_GRAB;           /* autoscroll starts: all buttons until usbmon ends it */
+                }
+                MouRouted |= d;
+                taken |= d;
+            } else {
+                MouRouted &= ~d;
+            }
+        }
+        if ((Flags & u) && (MouRouted & d)) {
+            MouRouted &= ~d;
+            taken |= u;
+        }
+    }
+    if (taken != 0) {
+        if (MouQn == 0) {
+            MouQTime = now;
+        }
+        MouQ[MouQn].Buttons = taken;
+        MouQ[MouQn].Grab = grab;
+        MouQ[MouQn].TimeMs = now;
+        MouQn++;
+    }
+    irp = MouTake();
+    IoReleaseCancelSpinLock(irql);
+    if (irp != NULL) {
+        IoCompleteRequest(irp, IO_MOUSE_INCREMENT);
+    }
+    return taken;
+}
+
 void OsMouseInput(const USB_MOUSE_EVENT *E)
 {
     MOUSE_INPUT_DATA d;
     USHORT flags = E->ButtonFlags;
     BOOLEAN channel = FALSE;
 
+    flags &= ~MouRoute(flags);
     RtlZeroMemory(&d, sizeof(d));
     if (flags & UMOU_WHEEL) {
         if (WheelMode == WHEEL_CHANNEL) {
@@ -236,12 +657,25 @@ static NTSTATUS Connect(PORT_STATE *P, PIO_STACK_LOCATION sp)
     if (sp->Parameters.DeviceIoControl.InputBufferLength < sizeof(CONNECT_DATA) || cd == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
+#ifdef USB_WDM
+    /* a new stack of the device node (Plug and Play rebuilt it): its class driver takes over */
+    if (P->Service != NULL && P->Owner == sp->DeviceObject) {
+        return STATUS_SHARING_VIOLATION;
+    }
+#else
     if (P->Service != NULL) {
         return STATUS_SHARING_VIOLATION;
     }
+#endif
     KeAcquireSpinLock(&InputLock, &old);
     P->ClassDevice = cd->ClassDeviceObject;
     P->Service = (CLASS_SERVICE)cd->ClassService;
+#ifdef USB_WDM
+    if (P->Owner != sp->DeviceObject) {
+        P->Enabled = 0;                         /* opens of the old stack's class device do not count */
+    }
+    P->Owner = sp->DeviceObject;
+#endif
     KeReleaseSpinLock(&InputLock, old);
     UsbLog(LOG_INFO, "%s class driver connected\n", (P == &Kbd) ? "keyboard" : "pointer");
     return STATUS_SUCCESS;
@@ -258,7 +692,12 @@ static NTSTATUS KbdIoctl(PIRP Irp, PIO_STACK_LOCATION sp)
     case IOCTL_INTERNAL_KEYBOARD_CONNECT:
         return Connect(&Kbd, sp);
     case IOCTL_INTERNAL_KEYBOARD_DISCONNECT:
+#ifdef USB_WDM
+        NtInputDisconnect(EXT_KBD, sp->DeviceObject);
+        return STATUS_SUCCESS;
+#else
         return STATUS_NOT_IMPLEMENTED;
+#endif
     case IOCTL_INTERNAL_KEYBOARD_ENABLE:
         InterlockedIncrement(&Kbd.Enabled);
         return STATUS_SUCCESS;
@@ -302,6 +741,7 @@ static NTSTATUS KbdIoctl(PIRP Irp, PIO_STACK_LOCATION sp)
         }
         Typematic = *(PKEYBOARD_TYPEMATIC_PARAMETERS)buf;
         HidSetTypematic(Typematic.Delay, Typematic.Rate);
+        NtPs2SetTypematic(Typematic.Delay, Typematic.Rate);
         return STATUS_SUCCESS;
     case IOCTL_KEYBOARD_QUERY_INDICATORS:
         if (outLen < sizeof(KEYBOARD_INDICATOR_PARAMETERS)) {
@@ -316,6 +756,7 @@ static NTSTATUS KbdIoctl(PIRP Irp, PIO_STACK_LOCATION sp)
         }
         Indicators = *(PKEYBOARD_INDICATOR_PARAMETERS)buf;
         HidSetLeds(Indicators.LedFlags);
+        NtPs2SetLeds(Indicators.LedFlags);
         return STATUS_SUCCESS;
     case IOCTL_KEYBOARD_QUERY_INDICATOR_TRANSLATION: {
         ULONG need = FIELD_OFFSET(KEYBOARD_INDICATOR_TRANSLATION, IndicatorList) + 3 * sizeof(INDICATOR_LIST);
@@ -347,7 +788,12 @@ static NTSTATUS MouIoctl(PIRP Irp, PIO_STACK_LOCATION sp)
     case IOCTL_INTERNAL_MOUSE_CONNECT:
         return Connect(&Mou, sp);
     case IOCTL_INTERNAL_MOUSE_DISCONNECT:
+#ifdef USB_WDM
+        NtInputDisconnect(EXT_MOUSE, sp->DeviceObject);
+        return STATUS_SUCCESS;
+#else
         return STATUS_NOT_IMPLEMENTED;
+#endif
     case IOCTL_INTERNAL_MOUSE_ENABLE:
         InterlockedIncrement(&Mou.Enabled);
         return STATUS_SUCCESS;
@@ -361,9 +807,9 @@ static NTSTATUS MouIoctl(PIRP Irp, PIO_STACK_LOCATION sp)
         if (outLen < sizeof(MOUSE_ATTRIBUTES)) {
             return STATUS_BUFFER_TOO_SMALL;
         }
-        a->MouseIdentifier = (USHORT)((HidMouseHasWheel() && WheelMode != WHEEL_CHANNEL) ?
+        a->MouseIdentifier = (USHORT)(((HidMouseHasWheel() || NtPs2MouseWheel()) && WheelMode != WHEEL_CHANNEL) ?
                                       WHEELMOUSE_I8042_HARDWARE : MOUSE_I8042_HARDWARE);
-        a->NumberOfButtons = 3;
+        a->NumberOfButtons = (USHORT)(NtPs2MouseButtons() > 3 || HidMouseButtons() > 3 ? 5 : 3);
         a->SampleRate = 100;
         a->InputDataQueueLength = 100 * sizeof(MOUSE_INPUT_DATA);
         Irp->IoStatus.Information = sizeof(MOUSE_ATTRIBUTES);
@@ -381,6 +827,8 @@ NTSTATUS NtInputIoctl(PDEVICE_OBJECT Dev, PIRP Irp)
     NTSTATUS st;
 
     Irp->IoStatus.Information = 0;
+    UsbLog(LOG_DBG, "%s port ioctl %x\n", ext->Kind == EXT_KBD ? "keyboard" : "pointer",
+           sp->Parameters.DeviceIoControl.IoControlCode);
     st = (ext->Kind == EXT_KBD) ? KbdIoctl(Irp, sp) : MouIoctl(Irp, sp);
     Irp->IoStatus.Status = st;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -396,6 +844,9 @@ static VOID NTAPI WheelCancel(PDEVICE_OBJECT Dev, PIRP Irp)
     (void)Dev;
     if (WheelIrp == Irp) {
         WheelIrp = NULL;
+    }
+    if (MouIrp == Irp) {
+        MouIrp = NULL;
     }
     IoReleaseCancelSpinLock(Irp->CancelIrql);
     Irp->IoStatus.Status = STATUS_CANCELLED;
@@ -477,7 +928,7 @@ static void FillTree(USBNT_TREE *t)
         h->VendorId = hc->VendorId;
         h->DeviceId = hc->DeviceId;
         h->NumPorts = hc->NumPorts;
-        h->Running = hc->Running;
+        h->Running = (UCHAR)(hc->Removed ? 2 : (hc->Running && hc->Hot) ? 3 : hc->Running);
         h->Irq = hc->IrqLine;
         h->Companion = (UCHAR)(hc->Ehci != NULL ? hc->Ehci->Index : 0xFF);
         if (hc->Type == HC_XHCI && hc->Running) {
@@ -531,6 +982,7 @@ static void FillTree(USBNT_TREE *t)
         o->Protocol = si.Protocol;
         o->MediaReady = si.MediaReady;
         o->WriteProtect = si.WriteProtect;
+        o->Partitions = (UCHAR)((si.Parts > 127 ? 127 : si.Parts) | (si.Fixed ? 0x80 : 0));
         o->LastLba = si.LastLba;
         o->BlockSize = si.BlockSize;
         o->MaxTransfer = si.MaxXfer;
@@ -539,6 +991,48 @@ static void FillTree(USBNT_TREE *t)
         RtlMoveMemory(o->Revision, si.Inquiry + 32, 4);
         o->Identity = si.Identity;
     }
+}
+
+static void FillExtra(USBNT_TREE2 *t)
+{
+    ULONG n = 0;
+    int i;
+
+    RtlZeroMemory(&t->ExtraCount, sizeof(*t) - sizeof(t->Base));
+    t->Base.Version = USBNT_TREE_VERSION2;
+    for (i = 0; i < (int)UsbScsiSlotCount && n < USBNT_MAX_EXTRA; i++) {
+        USBNT_EXTRA_INFO *e = &t->Extra[n];
+        UCHAR kind = 0;
+        if (UsbScsiSlotHost(i, e->Name, sizeof(e->Name), &kind)) {
+            e->Kind = kind == BLK_KIND_NVME ? USBNT_EXTRA_NVME : USBNT_EXTRA_READER;
+            e->Slot = (UCHAR)i;
+            n++;
+        }
+    }
+    for (i = 0; n < USBNT_MAX_EXTRA; i++) {
+        USBNT_EXTRA_INFO *e = &t->Extra[n];
+        if (!TbtInfo(i, e->Name, sizeof(e->Name), e->Detail, sizeof(e->Detail))) {
+            break;
+        }
+        e->Kind = USBNT_EXTRA_TBT;
+        n++;
+    }
+    for (i = 0; n < USBNT_MAX_EXTRA; i++) {
+        USBNT_EXTRA_INFO *e = &t->Extra[n];
+        if (!I2cHidInfo(i, &e->Kind, e->Name, sizeof(e->Name), e->Detail, sizeof(e->Detail))) {
+            break;
+        }
+        n++;
+    }
+    /* SMBus host controllers and touch pads: listed with the I2C ones */
+    for (i = 0; n < USBNT_MAX_EXTRA; i++) {
+        USBNT_EXTRA_INFO *e = &t->Extra[n];
+        if (!SmbusInfo(i, &e->Kind, e->Name, sizeof(e->Name), e->Detail, sizeof(e->Detail))) {
+            break;
+        }
+        n++;
+    }
+    t->ExtraCount = n;
 }
 
 void NtCtlCreateClose(PDEVICE_OBJECT Dev, PIRP Irp, BOOLEAN Create)
@@ -565,7 +1059,7 @@ void NtCtlCleanup(PDEVICE_OBJECT Dev, PIRP Irp)
     KIRQL irql;
     PIRP pend = NULL;
 
-    PIRP chg[MAX_CHANGE_WAITERS];
+    PIRP chg[MAX_CHANGE_WAITERS + 1];
     int n = 0;
     int i;
 
@@ -575,6 +1069,14 @@ void NtCtlCleanup(PDEVICE_OBJECT Dev, PIRP Irp)
         pend = WheelIrp;
         WheelIrp = NULL;
         IoSetCancelRoutine(pend, NULL);
+    }
+    if (MouIrp != NULL && IoGetCurrentIrpStackLocation(MouIrp)->FileObject == sp->FileObject) {
+        IoSetCancelRoutine(MouIrp, NULL);
+        chg[n++] = MouIrp;
+        MouIrp = NULL;
+    }
+    if (MouCapOwner != NULL && MouCapOwner == sp->FileObject) {
+        MouCapReset();                      /* usbmon ended (or crashed): the buttons are the system's */
     }
     for (i = 0; i < MAX_CHANGE_WAITERS; i++) {
         if (ChangeIrp[i] != NULL && IoGetCurrentIrpStackLocation(ChangeIrp[i])->FileObject == sp->FileObject) {
@@ -632,6 +1134,52 @@ NTSTATUS NtCtlIoctl(PDEVICE_OBJECT Dev, PIRP Irp)
         WheelIrp = Irp;
         IoReleaseCancelSpinLock(irql);
         return STATUS_PENDING;
+    case IOCTL_USBNT_MOUSE_WAIT: {
+        PIRP irp;
+        if (outLen < sizeof(USBNT_MOUSE_EVENTS)) {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        IoAcquireCancelSpinLock(&irql);
+        if (MouIrp != NULL || Irp->Cancel) {
+            IoReleaseCancelSpinLock(irql);
+            st = Irp->Cancel ? STATUS_CANCELLED : STATUS_DEVICE_BUSY;
+            break;
+        }
+        IoMarkIrpPending(Irp);
+        IoSetCancelRoutine(Irp, WheelCancel);
+        MouIrp = Irp;
+        irp = MouTake();                    /* events already queued: at once */
+        IoReleaseCancelSpinLock(irql);
+        if (irp != NULL) {
+            IoCompleteRequest(irp, IO_MOUSE_INCREMENT);
+        }
+        return STATUS_PENDING;
+    }
+    case IOCTL_USBNT_MOUSE_CAPTURE: {
+        ULONG want;
+        if (inLen < sizeof(ULONG)) {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        want = *(ULONG *)Irp->AssociatedIrp.SystemBuffer & (USBNT_CAP_XBUTTONS | USBNT_CAP_MIDDLE | USBNT_CAP_GRAB);
+        IoAcquireCancelSpinLock(&irql);
+        if (MouCap != want) {
+            UsbLog(LOG_DBG, "mouse: usbmon takes buttons %x\n", want);
+        }
+        MouCap = want;
+        MouCapOwner = want != 0 ? sp->FileObject : NULL;
+        if (want == 0) {
+            MouQn = 0;
+        }
+        IoReleaseCancelSpinLock(irql);
+        if (outLen >= sizeof(ULONG)) {
+            *(ULONG *)Irp->AssociatedIrp.SystemBuffer = want;
+            Irp->IoStatus.Information = sizeof(ULONG);
+        }
+        st = STATUS_SUCCESS;
+        break;
+    }
     case IOCTL_USBNT_QUERY_TREE:
         if (outLen < sizeof(USBNT_TREE)) {
             st = STATUS_BUFFER_TOO_SMALL;
@@ -639,6 +1187,89 @@ NTSTATUS NtCtlIoctl(PDEVICE_OBJECT Dev, PIRP Irp)
         }
         FillTree((USBNT_TREE *)Irp->AssociatedIrp.SystemBuffer);
         Irp->IoStatus.Information = sizeof(USBNT_TREE);
+        if (outLen >= sizeof(USBNT_TREE2)) {
+            FillExtra((USBNT_TREE2 *)Irp->AssociatedIrp.SystemBuffer);
+            Irp->IoStatus.Information = sizeof(USBNT_TREE2);
+        }
+        st = STATUS_SUCCESS;
+        break;
+    case IOCTL_USBNT_VIDEO_LIST:
+        if (outLen < sizeof(USBNT_CAMERAS)) {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        UvcList((USBNT_CAMERAS *)Irp->AssociatedIrp.SystemBuffer);
+        Irp->IoStatus.Information = sizeof(USBNT_CAMERAS);
+        st = STATUS_SUCCESS;
+        break;
+    case IOCTL_USBNT_VIDEO_START: {
+        USBNT_VID_START in;
+        if (inLen < sizeof(in) || outLen < sizeof(USBNT_VID_STATUS)) {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        in = *(USBNT_VID_START *)Irp->AssociatedIrp.SystemBuffer;
+        {
+            /* a failure is reported in Result (USB_ERR_NOMEM: the picture size
+               needs more memory than there is) */
+            USBNT_VID_STATUS *o = (USBNT_VID_STATUS *)Irp->AssociatedIrp.SystemBuffer;
+            int r = UvcStart(&in, o);
+            if (r != USB_OK) {
+                UsbMemSet(o, 0, sizeof(*o));
+                o->Result = r;
+            }
+        }
+        st = STATUS_SUCCESS;
+        Irp->IoStatus.Information = sizeof(USBNT_VID_STATUS);
+        break;
+    }
+    case IOCTL_USBNT_VIDEO_STOP:
+        if (inLen < sizeof(ULONG)) {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        UvcStop(*(ULONG *)Irp->AssociatedIrp.SystemBuffer);
+        st = STATUS_SUCCESS;
+        break;
+    case IOCTL_USBNT_VIDEO_CONTROL:
+        if (inLen < sizeof(USBNT_VID_CONTROL) || outLen < sizeof(USBNT_VID_CONTROL)) {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        st = UvcControl((USBNT_VID_CONTROL *)Irp->AssociatedIrp.SystemBuffer) == USB_OK ? STATUS_SUCCESS
+                                                                                        : STATUS_NOT_SUPPORTED;
+        Irp->IoStatus.Information = sizeof(USBNT_VID_CONTROL);
+        break;
+    case IOCTL_USBNT_VIDEO_FRAME: {
+        USBNT_VID_GET get;
+        UCHAR *out;
+        LONG n;
+        if (inLen < sizeof(get) || Irp->MdlAddress == NULL || outLen < sizeof(USBNT_VID_FRAME_HDR)) {
+            st = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        get = *(USBNT_VID_GET *)Irp->AssociatedIrp.SystemBuffer;
+        if (get.TimeoutMs > 10000) {
+            get.TimeoutMs = 10000;
+        }
+        out = (UCHAR *)MmGetSystemAddressForMdl(Irp->MdlAddress);
+        if (out == NULL) {
+            st = STATUS_INSUFFICIENT_RESOURCES;
+            break;
+        }
+        n = UvcGetFrame(&get, out, outLen);
+        if (n > 0) {
+            Irp->IoStatus.Information = (ULONG)n;
+            st = STATUS_SUCCESS;
+        } else if (n == 0) {
+            st = STATUS_TIMEOUT;
+        } else {
+            st = n == USB_ERR_NODEV ? STATUS_DEVICE_DOES_NOT_EXIST : STATUS_INVALID_DEVICE_STATE;
+        }
+        break;
+    }
+    case IOCTL_USBNT_GET_LOG:
+        Irp->IoStatus.Information = OsLogRead((char *)Irp->AssociatedIrp.SystemBuffer, outLen);
         st = STATUS_SUCCESS;
         break;
     case IOCTL_USBNT_WAIT_CHANGE: {

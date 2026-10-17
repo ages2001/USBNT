@@ -55,13 +55,14 @@
 #define TD_LS           0x04000000
 #define TD_CERR3        0x18000000
 #define TD_SPD          0x20000000
+#define TD_IOS          0x02000000
 
 #define PID_SETUP       0x2D
 #define PID_IN          0x69
 #define PID_OUT         0xE1
 
 #define UHCI_MAX_XFER   4096
-#define TD_SIZE         32
+#define TD_SIZE         64              /* 16 hardware bytes, software words, a pointer at 32 */
 
 typedef struct _UQH {
     ULONG      *Qh;
@@ -79,6 +80,23 @@ typedef struct _UQH {
     struct _UQH *Next;
 } UQH;
 
+/*
+ * Isochronous pipe: transfer descriptors from a ring, linked straight into
+ * the frame list ahead of the skeleton. Words 4..7 of every 32 byte TD are
+ * software state: next iso TD of the same frame, frame number.
+ */
+#define UISO_TDS        512
+
+typedef struct _UISO {
+    USB_PIPE   *Pipe;
+    ULONG      *Td[UISO_TDS];
+    ULONG       TdPhys[UISO_TDS];
+    ULONG       Head;           /* next TD to use */
+    ULONG       Used;           /* TDs owned by queued transfers */
+    BOOLEAN     Started;
+    struct _UISO *Next;
+} UISO;
+
 typedef struct _UHC {
     USB_HC     *Hc;
     ULONG       Io;
@@ -86,9 +104,15 @@ typedef struct _UHC {
     ULONG       FramesPhys;
     UQH         Skel[3];        /* interrupt, control, bulk */
     BOOLEAN     UseIrq;
+    ULONG     **IsoFirst;       /* first iso TD of every frame list slot */
+    ULONG       FrameExt;       /* 32 bit frame counter */
+    ULONG       FrameRaw;
+    UISO       *IsoList;
 } UHC;
 
 #define UHCP(hc)    ((UHC *)(hc)->Priv)
+
+static int TdStatus(ULONG ctl);
 
 static USHORT Rd16(UHC *u, ULONG r) { return OsIn16(u->Io + r); }
 static void Wr16(UHC *u, ULONG r, USHORT v) { OsOut16(u->Io + r, v); }
@@ -172,7 +196,8 @@ static int UhciStart(USB_HC *Hc)
     }
 
     u->Frames = (ULONG *)UsbDmaAlloc(4096, &u->FramesPhys);
-    if (u->Frames == NULL) {
+    u->IsoFirst = (ULONG **)OsAlloc(1024 * sizeof(ULONG *));
+    if (u->Frames == NULL || u->IsoFirst == NULL) {
         return USB_ERR_NOMEM;
     }
     for (i = 0; i < 3; i++) {
@@ -219,6 +244,8 @@ static int UhciStart(USB_HC *Hc)
         Hc->NumPorts = 2;
     }
     Hc->MaxXfer = UHCI_MAX_XFER;
+    Hc->IsoOk = 1;
+    u->FrameRaw = Rd16(u, UR_FRNUM) & 0x7FF;
     Hc->Running = 1;
     UsbLog(LOG_INFO, "uhci: %u ports at io %x\n", Hc->NumPorts, u->Io);
     return USB_OK;
@@ -303,6 +330,231 @@ static void UhciPortDisable(USB_HC *Hc, int Port)
 }
 
 /* ------------------------------------------------------------------ */
+/* Isochronous                                                          */
+/* ------------------------------------------------------------------ */
+
+#define TD_SWNEXT(t)    (*(ULONG **)&(t)[8])
+#define TD_FRAME(t)     ((t)[5])
+
+/* lock held */
+static void FrameUpdate(UHC *u)
+{
+    ULONG raw = Rd16(u, UR_FRNUM) & 0x7FF;
+
+    u->FrameExt += (raw - u->FrameRaw) & 0x7FF;
+    u->FrameRaw = raw;
+}
+
+static void IsoLink(UHC *u, ULONG *t, ULONG Phys, ULONG Frame)
+{
+    ULONG fi = Frame & 1023;
+
+    TD_FRAME(t) = Frame;
+    t[0] = u->Frames[fi];
+    TD_SWNEXT(t) = u->IsoFirst[fi];
+    u->IsoFirst[fi] = t;
+    u->Frames[fi] = Phys;
+}
+
+static void IsoUnlink(UHC *u, ULONG *t)
+{
+    ULONG fi = TD_FRAME(t) & 1023;
+    ULONG *prev = u->IsoFirst[fi];
+
+    if (prev == t) {
+        u->Frames[fi] = t[0];
+        u->IsoFirst[fi] = TD_SWNEXT(t);
+        return;
+    }
+    while (prev != NULL && TD_SWNEXT(prev) != t) {
+        prev = TD_SWNEXT(prev);
+    }
+    if (prev != NULL) {
+        prev[0] = t[0];
+        TD_SWNEXT(prev) = TD_SWNEXT(t);
+    }
+}
+
+static void IsoFree(UISO *iso)
+{
+    ULONG i;
+
+    for (i = 0; i < UISO_TDS; i++) {
+        if (iso->Td[i] != NULL) {
+            UsbDmaFree(iso->Td[i], TD_SIZE);
+        }
+    }
+    OsFree(iso);
+}
+
+static int IsoOpen(UHC *u, USB_PIPE *Pipe)
+{
+    UISO *iso = (UISO *)OsAlloc(sizeof(UISO));
+    ULONG i;
+    OS_IRQL irql;
+
+    if (iso == NULL) {
+        return USB_ERR_NOMEM;
+    }
+    for (i = 0; i < UISO_TDS; i++) {
+        iso->Td[i] = (ULONG *)UsbDmaAlloc(TD_SIZE, &iso->TdPhys[i]);
+        if (iso->Td[i] == NULL) {
+            IsoFree(iso);
+            return USB_ERR_NOMEM;
+        }
+    }
+    iso->Pipe = Pipe;
+    Pipe->HcPriv = iso;
+    irql = OsLock();
+    iso->Next = u->IsoList;
+    u->IsoList = iso;
+    OsUnlock(irql);
+    return USB_OK;
+}
+
+static void IsoCancel(UHC *u, UISO *iso)
+{
+    OS_IRQL irql;
+    ULONG i;
+
+    if (iso == NULL) {
+        return;
+    }
+    irql = OsLock();
+    for (i = 0; i < iso->Used; i++) {
+        ULONG *t = iso->Td[(iso->Head + UISO_TDS - iso->Used + i) % UISO_TDS];
+        t[1] &= ~TD_ACTIVE;
+        IsoUnlink(u, t);
+    }
+    iso->Used = 0;
+    iso->Started = FALSE;
+    OsUnlock(irql);
+    OsSleepMs(2);
+}
+
+static void IsoClose(UHC *u, USB_PIPE *Pipe)
+{
+    UISO *iso = (UISO *)Pipe->HcPriv;
+    UISO **pp;
+    OS_IRQL irql;
+
+    IsoCancel(u, iso);
+    irql = OsLock();
+    for (pp = &u->IsoList; *pp != NULL; pp = &(*pp)->Next) {
+        if (*pp == iso) {
+            *pp = iso->Next;
+            break;
+        }
+    }
+    OsUnlock(irql);
+    Pipe->HcPriv = NULL;
+    IsoFree(iso);
+}
+
+/* lock held */
+static int IsoSubmit(UHC *u, USB_XFER *X)
+{
+    USB_PIPE *p = X->Pipe;
+    UISO *iso = (UISO *)p->HcPriv;
+    ULONG per = p->IsoSlots / 8;
+    ULONG n = X->IsoCount;
+    ULONG start;
+    ULONG i;
+
+    if (per == 0) {
+        per = 1;
+    }
+    if (iso->Used + n > UISO_TDS) {
+        return USB_ERR_BUSY;
+    }
+    FrameUpdate(u);
+    start = p->IsoNext;
+    if (!iso->Started || (LONG)(start - (u->FrameExt + 2)) < 0) {
+        if (iso->Started) {
+            p->IsoLate = 1;
+        }
+        start = u->FrameExt + USB_ISO_RESTART_FRAMES;
+    }
+    if ((LONG)(start + n * per - u->FrameExt) > 900) {
+        return USB_ERR_BUSY;
+    }
+    for (i = 0; i < n; i++) {
+        ULONG k = (iso->Head + i) % UISO_TDS;
+        ULONG *t = iso->Td[k];
+        USB_ISO_PACKET *pk = &X->Iso[i];
+        ULONG len = pk->Length;
+        ULONG ctl = TD_ACTIVE | TD_IOS | 0x7FF;
+
+        if (len > p->MaxPacket) {
+            len = p->MaxPacket;
+        }
+        if (u->UseIrq && i + 1 == n) {
+            ctl |= TD_IOC;
+        }
+        t[1] = ctl;
+        t[2] = (p->DirIn ? PID_IN : PID_OUT) | ((ULONG)p->Dev->Address << 8) | ((ULONG)p->Endpoint << 15) |
+               (((len - 1) & 0x7FF) << 21);
+        t[3] = len ? X->Phys + pk->Offset : 0;
+        t[7] = i;
+        pk->Actual = 0;
+        pk->Status = USB_ERR_BUSY;
+        IsoLink(u, t, iso->TdPhys[k], start + i * per);
+    }
+    X->Hc[0] = start;
+    X->Hc[1] = iso->Head;
+    X->Hc[2] = per;
+    X->IsoFrame = start;
+    iso->Head = (iso->Head + n) % UISO_TDS;
+    iso->Used += n;
+    iso->Started = TRUE;
+    p->IsoNext = start + n * per;
+    return USB_OK;
+}
+
+/* lock held: completes transfers whose last frame has passed */
+static void IsoPoll(UHC *u)
+{
+    UISO *iso;
+
+    if (u->IsoList == NULL) {
+        return;
+    }
+    FrameUpdate(u);
+    for (iso = u->IsoList; iso != NULL; iso = iso->Next) {
+        USB_PIPE *p = iso->Pipe;
+        USB_XFER *X;
+        while ((X = p->Cur) != NULL && X->Busy) {
+            ULONG n = X->IsoCount;
+            ULONG last = X->Hc[0] + (n - 1) * X->Hc[2];
+            ULONG total = 0;
+            ULONG i;
+            if ((LONG)(u->FrameExt - (last + 1)) < 0) {
+                break;
+            }
+            for (i = 0; i < n; i++) {
+                ULONG *t = iso->Td[(X->Hc[1] + i) % UISO_TDS];
+                ULONG ctl = t[1];
+                USB_ISO_PACKET *pk = &X->Iso[i];
+                if (ctl & TD_ACTIVE) {
+                    t[1] = ctl & ~TD_ACTIVE;
+                    pk->Status = USB_ERR_IO;
+                } else if (ctl & TD_ERRMASK) {
+                    pk->Status = TdStatus(ctl);
+                    pk->Actual = (USHORT)(((ctl & 0x7FF) + 1) & 0x7FF);
+                } else {
+                    pk->Status = USB_OK;
+                    pk->Actual = (USHORT)(((ctl & 0x7FF) + 1) & 0x7FF);
+                }
+                total += pk->Actual;
+                IsoUnlink(u, t);
+            }
+            iso->Used -= (iso->Used >= n) ? n : iso->Used;
+            UsbXferDone(X, USB_OK, total);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Pipes                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -335,7 +587,7 @@ static int UhciPipeOpen(USB_PIPE *Pipe)
     ULONG i;
 
     if (Pipe->Type == USB_EP_ISOCH) {
-        return USB_ERR_PARAM;
+        return IsoOpen(u, Pipe);
     }
     if (mp > 64) {
         mp = 64;
@@ -382,6 +634,10 @@ static void UhciPipeClose(USB_PIPE *Pipe)
     if (q == NULL) {
         return;
     }
+    if (Pipe->Type == USB_EP_ISOCH) {
+        IsoClose(u, Pipe);
+        return;
+    }
     QhUnlink(u, q);
     Pipe->HcPriv = NULL;
     QhFree(q);
@@ -419,6 +675,9 @@ static int UhciSubmit(USB_XFER *X)
 
     if (q == NULL) {
         return USB_ERR_NODEV;
+    }
+    if (p->Type == USB_EP_ISOCH) {
+        return IsoSubmit(u, X);
     }
     if (p->Type == USB_EP_CONTROL) {
         ULONG done = 0;
@@ -549,6 +808,7 @@ static void UhciPoll(USB_HC *Hc)
             CheckQh(q);
         }
     }
+    IsoPoll(u);
     if (!u->UseIrq) {
         USHORT sts = Rd16(u, UR_USBSTS);
         if (sts & 0x1F) {
@@ -585,6 +845,10 @@ static void UhciCancel(USB_PIPE *Pipe)
     if (q == NULL) {
         return;
     }
+    if (Pipe->Type == USB_EP_ISOCH) {
+        IsoCancel(UHCP(Pipe->Dev->Hc), (UISO *)Pipe->HcPriv);
+        return;
+    }
     irql = OsLock();
     q->Qh[1] = LINK_T;
     OsUnlock(irql);
@@ -602,6 +866,9 @@ static int UhciPipeReset(USB_PIPE *Pipe)
 {
     UQH *q = (UQH *)Pipe->HcPriv;
 
+    if (Pipe->Type == USB_EP_ISOCH) {
+        return USB_OK;
+    }
     if (q != NULL) {
         q->Qh[1] = LINK_T;
     }

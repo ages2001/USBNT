@@ -1,0 +1,92 @@
+diff --git a/hw/input/ps2.c b/hw/input/ps2.c
+index c8fd23c..234212b 100644
+--- a/hw/input/ps2.c
++++ b/hw/input/ps2.c
+@@ -23,6 +23,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "hw/qdev-properties.h"
+ #include "qemu/log.h"
+ #include "hw/irq.h"
+ #include "hw/sysbus.h"
+@@ -318,6 +319,10 @@ static void ps2_keyboard_event(DeviceState *dev, QemuConsole *src,
+     uint16_t keycode = 0;
+     int mod;
+ 
++    if (s->absent) {
++        return;
++    }
++
+     /* do not process events while disabled to prevent stream corruption */
+     if (!s->scan_enabled) {
+         return;
+@@ -597,6 +602,10 @@ void ps2_write_keyboard(PS2KbdState *s, int val)
+ {
+     PS2State *ps2 = PS2_DEVICE(s);
+ 
++    if (s->absent) {
++        return;                 /* no keyboard on the port: nothing answers */
++    }
++
+     trace_ps2_write_keyboard(s, val);
+     ps2_cqueue_reset(ps2);
+     switch (ps2->write_cmd) {
+@@ -874,10 +883,16 @@ void ps2_mouse_fake_event(PS2MouseState *s)
+     ps2_mouse_sync(DEVICE(s));
+ }
+ 
++/* a test device in place of the mouse (hw/input/tp_ps2pad.c): returns 1 when it took the byte */
++int (*ps2_mouse_write_hook)(PS2MouseState *s, int val);
++
+ void ps2_write_mouse(PS2MouseState *s, int val)
+ {
+     PS2State *ps2 = PS2_DEVICE(s);
+ 
++    if (ps2_mouse_write_hook && ps2_mouse_write_hook(s, val)) {
++        return;
++    }
+     trace_ps2_write_mouse(s, val);
+     switch (ps2->write_cmd) {
+     default:
+@@ -1254,6 +1269,12 @@ static void ps2_mouse_realize(DeviceState *dev, Error **errp)
+     qemu_input_handler_register(dev, &ps2_mouse_handler);
+ }
+ 
++static Property ps2_kbd_props[] = {
++    /* -global ps2-kbd.absent=on: a keyboard controller without a keyboard (driver tests) */
++    DEFINE_PROP_BOOL("absent", PS2KbdState, absent, false),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
+ static void ps2_kbd_class_init(ObjectClass *klass, void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+@@ -1261,6 +1282,7 @@ static void ps2_kbd_class_init(ObjectClass *klass, void *data)
+     PS2DeviceClass *ps2dc = PS2_DEVICE_CLASS(klass);
+ 
+     dc->realize = ps2_kbd_realize;
++    device_class_set_props(dc, ps2_kbd_props);
+     resettable_class_set_parent_phases(rc, NULL, ps2_kbd_reset_hold, NULL,
+                                        &ps2dc->parent_phases);
+     dc->vmsd = &vmstate_ps2_keyboard;
+diff --git a/include/hw/input/ps2.h b/include/hw/input/ps2.h
+index cd61a63..6164c07 100644
+--- a/include/hw/input/ps2.h
++++ b/include/hw/input/ps2.h
+@@ -73,6 +73,7 @@ struct PS2KbdState {
+     int ledstate;
+     bool need_high_bit;
+     unsigned int modifiers; /* bitmask of MOD_* constants above */
++    bool absent;            /* test: the controller is there, no keyboard is plugged in */
+ };
+ 
+ #define TYPE_PS2_KBD_DEVICE "ps2-kbd"
+@@ -99,6 +100,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(PS2MouseState, PS2_MOUSE_DEVICE)
+ 
+ /* ps2.c */
+ void ps2_write_mouse(PS2MouseState *s, int val);
++extern int (*ps2_mouse_write_hook)(PS2MouseState *s, int val);
+ void ps2_write_keyboard(PS2KbdState *s, int val);
+ uint32_t ps2_read_data(PS2State *s);
+ void ps2_queue_noirq(PS2State *s, int b);
