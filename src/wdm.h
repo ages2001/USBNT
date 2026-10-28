@@ -123,6 +123,10 @@ NTSTATUS UsbdiQueryText(struct _UD_FUNC *F, PIRP Irp, DEVICE_TEXT_TYPE Type);
 NTSTATUS UsbdiPnp(struct _UD_FUNC *F, PIRP Irp, BOOLEAN Reported, BOOLEAN *Free);
 NTSTATUS UsbdiPower(struct _UD_FUNC *F, PIRP Irp);
 NTSTATUS UsbdiInternal(struct _UD_FUNC *F, PIRP Irp);
+const char *UsbClassName(UCHAR C, UCHAR S, UCHAR P);     /* "Audio Control", "Mass Storage" (usbdi.c) */
+WCHAR  *UsbClassDevice(WCHAR *P, const char *ClassName); /* "USB Mass Storage Device" (usbdi.c) */
+BOOLEAN WdmNameDriverless(PDEVICE_OBJECT Pdo, const WCHAR *Name);   /* DeviceDesc of a node without driver (wdmtree.c) */
+void    WdmNameUsbFunction(USHORT Vid, USHORT Pid, UCHAR If, const WCHAR *Name);  /* usbccgp's functions (wdmtree.c) */
 
 /* ntscsi.c */
 NTSTATUS NtScsiSrbSlot(PDEVICE_OBJECT Dev, PIRP Irp, ULONG Slot);

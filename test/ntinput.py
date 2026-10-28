@@ -3,7 +3,11 @@
 driven by usbnt, i8042prt disabled) together with two USB keyboards and two USB
 mice, all typing / clicking into one window at the same time.
 
-  ntinput.py HC [--nt4] [--keep-i8042] [--i2c]
+  ntinput.py HC [--nt4] [--keep-i8042] [--i2c] [--bat MS]
+
+Also: the shift keys let go (PS/2 left and right shift, USB left shift: "!1@2#3"), double
+clicks (PS/2 and USB mouse).  --bat MS: the PS/2 mouse's reset self test takes MS ms (QEMU
+ps2-mouse bat-delay; slow trackpoints and touch pads).
 
 --i2c adds a HID over I2C touch pad and keyboard (QEMU dw-i2c-pci + i2c-hid,
 bound to a third display head) that type and click into the same window.
@@ -68,6 +72,7 @@ def main():
     nt4 = '--nt4' in sys.argv
     keep = '--keep-i8042' in sys.argv
     i2c = '--i2c' in sys.argv
+    batms = sys.argv[sys.argv.index('--bat') + 1] if '--bat' in sys.argv else None
     if nt4:
         os.environ.setdefault('AUDIONT_IMG', '/home/claude/nt4')
     os.environ['AUDIONT_VGA'] = '-vga none -device VGA,id=vga0 -device secondary-vga,id=vga1' + \
@@ -88,6 +93,8 @@ def main():
            '-device', 'usb-kbd,bus=hc.0,display=vga0,id=k1', '-device', 'usb-mouse,bus=hc.0,display=vga0,id=m1',
            '-device', 'usb-kbd,bus=hc.0,display=vga1,id=k2', '-device', 'usb-mouse,bus=hc.0,display=vga1,id=m2',
            '-qmp', 'unix:%s,server,nowait' % qmp_path, '-serial', 'file:' + com2]
+    if batms:
+        usb += ['-global', 'ps2-mouse.bat-delay=%s' % batms]
     if i2c:
         usb += ['-device', 'dw-i2c-pci,id=i2c0', '-device', 'i2c-hid,bus=i2c0.0,address=0x2c,kind=ptp,display=vga2',
                 '-device', 'i2c-hid,bus=i2c0.0,address=0x15,kind=kbd,desc-reg=1,display=vga2']
@@ -137,8 +144,29 @@ def main():
             else:
                 q.key(src, QCODE.get(ch, ch))
         time.sleep(0.5)
+    # shift keys: pressed with a digit, let go, the digit again (the left shift's break code
+    # is 0xAA in set 1)
+    v.key('shift-1', 0.3); v.key('1', 0.3)                                                  # PS/2: "!1"
+    v.key('shift_r-2', 0.3); v.key('2', 0.3)                                                # PS/2: "@2"
+    for k, down in (('shift', True), ('3', True), ('3', False), ('shift', False)):
+        q.call('input-send-event', device='vga0',
+               events=[{'type': 'key', 'data': {'down': down, 'key': {'type': 'qcode', 'data': k}}}])
+        time.sleep(0.08)
+    time.sleep(0.2)
+    q.key('vga0', '3')                                                                      # USB: "#3"
+    time.sleep(0.5)
     for _ in range(2):
         v.cmd('mouse_button 1'); time.sleep(0.1); v.cmd('mouse_button 0'); time.sleep(0.3)   # PS/2 left
+    time.sleep(1.0)
+    for _ in range(2):
+        v.cmd('mouse_button 1'); time.sleep(0.05); v.cmd('mouse_button 0'); time.sleep(0.1)  # PS/2 double click
+    time.sleep(1.0)
+    for _ in range(2):
+        q.call('input-send-event', device='vga1', events=[{'type': 'btn', 'data': {'down': True, 'button': 'left'}}])
+        time.sleep(0.05)
+        q.call('input-send-event', device='vga1', events=[{'type': 'btn', 'data': {'down': False, 'button': 'left'}}])
+        time.sleep(0.1)                                                                     # USB double click
+    time.sleep(1.0)
     for _ in range(3):
         q.btn('vga0', 'right'); time.sleep(0.3)                                              # USB mouse 1
     for _ in range(2):
@@ -164,6 +192,8 @@ def main():
     ulog = open(com2, 'rb').read().decode('latin1') if os.path.exists(com2) else ''
     import re
     m = re.search(r'INPTEST chars=\[(.*?)\] left=(-?\d+) right=(-?\d+) middle=(-?\d+) x1=\d+ x2=\d+ wheel=(-?\d+) moves=(\d+)', ser)
+    md = re.search(r'INPTEST .* dbl=(\d+)', ser)
+    dbl = int(md.group(1)) if md else 0
     print('\n'.join(l for l in ulog.splitlines() if 'ps2' in l or 'class driver' in l or 'i2c' in l))
     print(m.group(0) if m else 'no INPTEST result')
     ok = bool(m) and done
@@ -173,7 +203,9 @@ def main():
                   ('USB keyboard 1', 'usba' in chars and 'usbc' in chars),
                   ('USB keyboard 2', 'usbb' in chars),
                   ('order kept', chars.find('psa') < chars.find('usba') < chars.find('psb') < chars.find('usbb') < chars.find('usbc')),
-                  ('PS/2 mouse buttons', left == (5 if i2c else 2)), ('USB mouse 1 buttons', right == 3), ('USB mouse 2 buttons', middle == 2),
+                  ('shift keys let go (PS/2 left, right; USB)', '!1@2#3' in chars),
+                  ('PS/2 mouse buttons', left == (9 if i2c else 6)), ('USB mouse 1 buttons', right == 3), ('USB mouse 2 buttons', middle == 2),
+                  ('double clicks (PS/2, USB)', dbl >= 2),
                   ('movement', moves >= 4)]
         if i2c:
             checks.append(('I2C keyboard', 'itc' in chars and chars.find('usbc') < chars.find('itc')))
@@ -186,7 +218,9 @@ def main():
             ok &= c
             print('%s %s' % ('ok  ' if c else 'FAIL', name))
     print('logon by hand' if logon_by_hand else 'auto logon')
-    print('RESULT input %s%s%s%s %s' % (hc, ' nt4' if nt4 else '', ' i8042prt' if keep else '', ' i2c' if i2c else '',
+    print('dbl=%d' % dbl)
+    print('RESULT input %s%s%s%s%s %s' % (hc, ' nt4' if nt4 else '', ' i8042prt' if keep else '', ' i2c' if i2c else '',
+                                        (' bat %s' % batms) if batms else '',
                                         'PASS' if ok else 'FAIL'))
 
 

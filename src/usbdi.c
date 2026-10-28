@@ -68,6 +68,9 @@ struct _UD_FUNC {
     BOOLEAN         Dead;               /* unplugged (or the port cycled) */
     BOOLEAN         Started;
     BOOLEAN         GoneReported;       /* the bus relations no longer have it */
+    BOOLEAN         NameDone;           /* the device node's name was looked at */
+    UCHAR           ChildNames;         /* composite device: times the names of usbccgp's functions were set */
+    ULONG           StartedAt;
     UCHAR           Config;             /* configuration value selected, 0 = none */
     UCHAR           Speed;
     PDEVICE_OBJECT  Pdo;
@@ -77,6 +80,7 @@ struct _UD_FUNC {
     ULONG           CfgLen;
     char            Product[48];
     char            Serial[32];
+    char            Mfg[32];
     UCHAR           Port, RootPort, HcIndex, Depth;
     UD_IFACE        Iface[32];
     UD_PIPE         Pipe[UD_PIPES];
@@ -1670,14 +1674,168 @@ NTSTATUS UsbdiQueryId(UD_FUNC *F, PIRP Irp, BUS_QUERY_ID_TYPE Type)
     return STATUS_SUCCESS;
 }
 
+/* what a USB class, subclass and protocol are (Device Manager names); NULL: nothing known */
+const char *UsbClassName(UCHAR C, UCHAR S, UCHAR P)
+{
+    switch (C) {
+    case 0x01: return S == 1 ? "Audio Control" : S == 2 ? "Audio Streaming" : S == 3 ? "MIDI" : "Audio";
+    case 0x02: return S == 2 && P == 0xFF ? "RNDIS Network" : S == 2 ? "Modem" : S == 6 ? "Ethernet (ECM)" : S == 0x0D ? "Ethernet (NCM)" :
+                      S == 0x0E ? "Mobile Broadband (MBIM)" : "Communications";
+    case 0x03: return S == 1 && P == 1 ? "Keyboard" : S == 1 && P == 2 ? "Mouse" : "Human Interface Device";
+    case 0x05: return "Physical Interface Device";
+    case 0x06: return "Still Image Device";
+    case 0x07: return "Printer";
+    case 0x08: return P == 0x62 ? "Mass Storage (UAS)" : "Mass Storage";
+    case 0x09: return "Hub";
+    case 0x0A: return "CDC Data";
+    case 0x0B: return "Smart Card Reader";
+    case 0x0D: return "Content Security";
+    case 0x0E: return S == 1 ? "Video Control" : S == 2 ? "Video Streaming" : "Video";
+    case 0x0F: return "Personal Healthcare";
+    case 0x10: return "Audio/Video";
+    case 0x11: return "Billboard";
+    case 0x12: return "Type-C Bridge";
+    case 0xDC: return "Diagnostic";
+    case 0xE0: return S == 1 && P == 1 ? "Bluetooth Radio" : S == 1 && P == 3 ? "RNDIS Network" : "Wireless Controller";
+    case 0xEF: return S == 4 && P == 1 ? "RNDIS Network" : S == 2 && P == 1 ? "Composite" : "Miscellaneous";
+    case 0xFE: return S == 1 ? "Firmware Update (DFU)" : S == 2 ? "IrDA Bridge" : S == 3 ? "Test and Measurement" :
+                      "Application Specific";
+    case 0xFF: return "Vendor Specific";
+    default: return NULL;
+    }
+}
+
+/* "USB Mass Storage Device", "USB Keyboard": the device a class name stands for */
+WCHAR *UsbClassDevice(WCHAR *P, const char *Name)
+{
+    static const char *noun[] = { "Keyboard", "Mouse", "Printer", "Hub", "Radio", "Reader", "Modem", "Network",
+                                  "Device", "Bridge", "(ECM)", "(NCM)", "(MBIM)", "(UAS)", "(DFU)" };
+    const char *last = Name, *q;
+    ULONG i;
+
+    for (q = Name; *q; q++) {
+        if (*q == ' ') {
+            last = q + 1;
+        }
+    }
+    P = WStr(P, "USB ");
+    P = WStr(P, Name);
+    for (i = 0; i < sizeof(noun) / sizeof(noun[0]); i++) {
+        const char *a = last, *b = noun[i];
+        while (*a && *a == *b) {
+            a++;
+            b++;
+        }
+        if (*a == 0 && *b == 0) {
+            return P;
+        }
+    }
+    return WStr(P, " Device");
+}
+
+/* "<product> - <class> (Interface n)" / "(Interfaces n-m)"; the device: its product string, else the
+   manufacturer's, else its ids */
+static void PartName(UD_FUNC *F, WCHAR *P, const char *Cls, UCHAR First, UCHAR Count)
+{
+    if (F->Product[0]) {
+        P = WStr(P, F->Product);
+    } else if (F->Mfg[0]) {
+        P = WStr(P, F->Mfg);
+        P = WStr(P, " USB Device");
+    } else {
+        P = WStr(P, "USB Device VID_");
+        P = WHex(P, GET16(F->DevDesc + 8), 4);
+        P = WStr(P, " PID_");
+        P = WHex(P, GET16(F->DevDesc + 10), 4);
+    }
+    P = WStr(P, " - ");
+    P = WStr(P, Cls != NULL ? Cls : "Function");
+    P = WStr(P, Count > 1 ? " (Interfaces " : " (Interface ");
+    P = WDec(P, First, First >= 10 ? 2 : 1);
+    if (Count > 1) {
+        UCHAR last = (UCHAR)(First + Count - 1);
+        P = WStr(P, "-");
+        P = WDec(P, last, last >= 10 ? 2 : 1);
+    }
+    WStr(P, ")");
+}
+
+/* the name a device or function of one gets: its product string, else the manufacturer's and what it is,
+   else what it is and its ids; a function says which interface(s): "UD-3900 - Audio Control (Interface 0)" */
+static void FuncName(UD_FUNC *F, WCHAR *P)
+{
+    UCHAR c, s, pr;
+    const char *cls;
+
+    ClassOf(F, &c, &s, &pr);
+    cls = UsbClassName(c, s, pr);
+    if (F->Whole) {
+        if (F->Product[0]) {
+            WStr(P, F->Product);
+            return;
+        }
+        if (F->Mfg[0]) {
+            P = WStr(P, F->Mfg);
+            P = WStr(P, " ");
+        }
+        if (Composite(F) || cls == NULL || (c == 0xEF && s == 2 && pr == 1)) {
+            P = WStr(P, Composite(F) ? "USB Composite Device" : "USB Device");
+        } else {
+            P = UsbClassDevice(P, cls);
+        }
+        if (!F->Mfg[0]) {
+            P = WStr(P, " (VID_");
+            P = WHex(P, GET16(F->DevDesc + 8), 4);
+            P = WStr(P, " PID_");
+            P = WHex(P, GET16(F->DevDesc + 10), 4);
+            WStr(P, ")");
+        }
+        return;
+    }
+    PartName(F, P, cls, F->First, F->Count);
+}
+
+/*
+ * Windows XP's composite driver (usbccgp) names its functions after the device's product string, or
+ * "USB Device" when there is none - several functions alike.  A function that has no driver (Device
+ * Manager shows its DeviceDesc) gets the name of its interfaces: "USB Device VID_0414 PID_A00B - Audio
+ * Control (Interface 0)" (Enum\USB\VID_v&PID_p&MI_nn, every instance without a service; a few seconds
+ * after usbccgp started, and once more later).  UsbInterfaceNames = 0: off.
+ */
+static void ChildNames(UD_FUNC *F)
+{
+    const UCHAR *end = F->Cfg + F->CfgLen, *d;
+    UCHAR covered[32];
+    WCHAR name[160];
+    int n;
+
+    RtlZeroMemory(covered, sizeof(covered));
+    for (d = F->Cfg; (d = UsbNextDesc(d, end)) != NULL;) {
+        if (d[1] == 0x0B && d[0] >= 8 && d[2] < 32) {
+            PartName(F, name, UsbClassName(d[4], d[5], d[6]), d[2], d[3]);
+            WdmNameUsbFunction(GET16(F->DevDesc + 8), GET16(F->DevDesc + 10), d[2], name);
+            for (n = d[2]; n < d[2] + d[3] && n < 32; n++) {
+                covered[n] = 1;
+            }
+        }
+    }
+    for (d = F->Cfg; (d = UsbNextDesc(d, end)) != NULL;) {
+        if (d[1] == USB_DT_INTERFACE && d[0] >= 9 && d[3] == 0 && d[2] < 32 && !covered[d[2]]) {
+            PartName(F, name, UsbClassName(d[5], d[6], d[7]), d[2], 1);
+            WdmNameUsbFunction(GET16(F->DevDesc + 8), GET16(F->DevDesc + 10), d[2], name);
+        }
+    }
+}
+
 NTSTATUS UsbdiQueryText(UD_FUNC *F, PIRP Irp, DEVICE_TEXT_TYPE Type)
 {
-    WCHAR buf[96], *p = buf;
+    WCHAR buf[160], *p = buf;
     ULONG n;
     PWCHAR out;
 
     if (Type == DeviceTextDescription) {
-        p = WStr(p, F->Product[0] ? F->Product : "USB Device");
+        FuncName(F, p);
+        while (*p) p++;
     } else if (Type == DeviceTextLocationInformation) {
         p = WStr(p, "Port_#");
         p = WDec(p, F->Port, 4);
@@ -1709,9 +1867,17 @@ NTSTATUS UsbdiPnp(UD_FUNC *F, PIRP Irp, BOOLEAN Reported, BOOLEAN *Free)
     ULONG_PTR info = Irp->IoStatus.Information;
 
     *Free = FALSE;
+    if (!F->NameDone && sp->MinorFunction != IRP_MN_QUERY_ID && sp->MinorFunction != IRP_MN_QUERY_CAPABILITIES &&
+        sp->MinorFunction != IRP_MN_QUERY_DEVICE_TEXT && KeGetCurrentIrql() == PASSIVE_LEVEL) {
+        /* a node without a driver keeps the name it got first ("USB Device" from older versions) */
+        WCHAR name[160];
+        FuncName(F, name);
+        F->NameDone = WdmNameDriverless(F->Pdo, name);
+    }
     switch (sp->MinorFunction) {
     case IRP_MN_START_DEVICE:
         F->Started = TRUE;
+        F->StartedAt = OsTimeMs();
         st = STATUS_SUCCESS;
         break;
     case IRP_MN_QUERY_STOP_DEVICE:
@@ -1880,6 +2046,9 @@ void UsbdiInit(void)
     PsGetVersion(&maj, &min, &build, NULL);
     WinBuild = build;
     UsbPdoMode = OsGetConfig("UsbPdo", 1);
+    if (UsbTextSetupHid && UsbPdoMode == 0) {
+        UsbPdoMode = 1;                         /* text-mode setup: the HID devices are setup's */
+    }
     UsbWinVideo = OsGetConfig("WindowsCamera", 0);
     if (UsbWinVideo && UsbPdoMode) {
         UsbLog(LOG_INFO, "usbdi: cameras go to Windows' camera driver (usbvideo.sys)\n");
@@ -1955,8 +2124,10 @@ static BOOLEAN Plan(USB_DEV *Dev)
         Dev->NativeIf = 0xFFFFFFFFUL;       /* asked once */
         return FALSE;
     }
-    if (Dev->NativeIf == 0 && (total == 1 || WinBuild >= 2600)) {
-        return AddWant(Dev, 0, (UCHAR)total, TRUE);     /* the whole device (Windows XP splits composites) */
+    /* the whole device (Windows XP splits composites); in text-mode setup the functions, as Windows 2000
+       has them: setup binds them by their class ids, and nothing copies usbccgp for the installed system */
+    if (Dev->NativeIf == 0 && (total == 1 || (WinBuild >= 2600 && !UsbTextSetupHid))) {
+        return AddWant(Dev, 0, (UCHAR)total, TRUE);
     }
     for (d = Dev->Config; (d = UsbNextDesc(d, end)) != NULL;) {
         if (d[1] == 0x0B && d[0] >= 8) {    /* interface association */
@@ -2052,6 +2223,17 @@ BOOLEAN UsbdiService(void)
                     CompleteList(&done);
                     break;
                 }
+            }
+        }
+    }
+    /* the functions usbccgp made of a composite device: names (ChildNames) */
+    for (f = Funcs; f != NULL; f = f->Next) {
+        if (f->Whole && f->Started && f->Cfg != NULL && f->ChildNames < 2 && Composite(f) &&
+            OsTimeMs() - f->StartedAt > (f->ChildNames == 0 ? 3000UL : 20000UL) &&
+            KeGetCurrentIrql() == PASSIVE_LEVEL) {
+            f->ChildNames++;
+            if (OsGetConfig("UsbInterfaceNames", 1)) {
+                ChildNames(f);
             }
         }
     }
@@ -2163,6 +2345,7 @@ UD_FUNC *UsbdiNewFunc(void)
     RtlCopyMemory(f->DevDesc, dev->DevDesc, 18);
     RtlCopyMemory(f->Product, dev->Product, sizeof(f->Product));
     RtlCopyMemory(f->Serial, dev->Serial, sizeof(f->Serial));
+    RtlCopyMemory(f->Mfg, dev->Mfg, sizeof(f->Mfg));
     BuildCfg(f, dev);
     KeAcquireSpinLock(&UdLock, &irql);
     f->Next = Funcs;

@@ -1,11 +1,14 @@
-"""Thunderbolt 3 / 4 and USB4 (tbt.c) on the bare metal harness with the
+"""Thunderbolt 1 to 5 and USB4 (tbt.c) on the bare metal harness with the
 usb4-nhi QEMU model (test/qemu/usbnt-qemu-test.patch).
 
 USB4 host without firmware connection manager: the driver enumerates the
 routers that are plugged in (and one that is there from the start), sets up
 the PCIe and USB 3 tunnels, a chained second router, a Thunderbolt 3 device
 router, unplugging; an NVMe drive arrives through the tunnel (PCIe hot plug)
-and is written and read.  Intel firmware connection manager: Falcon / Alpine /
+and is written and read.  Thunderbolt 5 / USB4 v2: Gen 4 link, CM version 2,
+PCIe extended encapsulation, a USB4 v1 device on it.  Thunderbolt 1 / 2 hosts
+of Macs (driver as connection manager), of PCs (the BIOS runs them) and Alpine
+Ridge in USB only mode.  Intel firmware connection manager: Falcon / Alpine /
 Titan Ridge message formats, security levels none / user / secure (new key,
 challenge with the stored key, wrong key, device that lost its key), approval
 switched off, Ice Lake force power and Tiger Lake.
@@ -118,7 +121,7 @@ try:
     clean(h, "chain")
     r = h.cmd("tbt")
     print("\n".join("     " + l for l in r if l.startswith("TBT")))
-    chk(any("USB4 host router" in l and "Connection manager: the driver" in l for l in r) and
+    chk(any("USB4 (AMD) host router" in l and "Connection manager: the driver" in l for l in r) and
         sum("USB4 router 8086:0b26 - PCIe + USB 3" in l for l in r) == 2, "usbtree lines (host + 2 routers)")
     # unplug everything: drive first (attention button), then the cable
     h.qmp_cmd("device_del", id="nv1")
@@ -159,6 +162,80 @@ try:
     chk(qget(h, "usb3-0") and not qget(h, "pcie0"), "USB 3 only")
     chk(qget(h, "gbps0") == 20 and "20 Gb/s x 1 = 20 Gb/s" in h.all, "TbtLaneBonding=0: one lane, 20 Gb/s")
     clean(h, "TbtApprove=0")
+finally:
+    h.close()
+
+print("== Thunderbolt 5 / USB4 v2 host (Barlow Ridge): Gen 4 link, CM version 2, PCIe extended encapsulation")
+h = boot("mode=usb4,v2=on", log="tbt_v2")
+try:
+    chk("USB4 v2 (Thunderbolt 5) host router 8086:5781" in h.all, "USB4 v2 host router, driver is the CM")
+    qset(h, "kind0", "usb4v2")
+    qset(h, "plug0", True)
+    chk(wait_log(h, "(extended encapsulation)", 10), "USB4 v2 router: PCIe tunnel with extended encapsulation")
+    chk(wait_prop(h, "pcie0", True) and qget(h, "usb3-0") and qget(h, "ee0"), "model: tunnels valid, EE on both ends")
+    chk(qget(h, "gbps0") == 80 and "40 Gb/s x 2 = 80 Gb/s (Gen 4" in h.all, "Gen 4 link: 80 Gb/s, bonded by the hardware")
+    r = h.cmd("tbt")
+    print("\n".join("     " + l for l in r if l.startswith("TBT")))
+    chk(any("Thunderbolt 5 (Barlow Ridge 80G) host router" in l for l in r) and
+        any("USB4 v2 router 8086:5786 - PCIe + USB 3" in l and "Thunderbolt 5 / USB4 v2 Gen 4" in l for l in r),
+        "usbtree lines (Thunderbolt 5 host + router)")
+    clean(h, "Gen 4")
+    qset(h, "plug0", False)
+    chk(wait_log(h, "removed", 8) and wait_prop(h, "host-clean", True), "USB4 v2 router removed, host clean")
+    qset(h, "kind0", "usb4")
+    qset(h, "plug0", True)
+    chk(wait_log(h, "PCIe tunnel 0:6 <-> 1:5", 10, 2) and wait_prop(h, "pcie0", True), "USB4 v1 device on it: PCIe")
+    chk(qget(h, "gbps0") == 40 and not qget(h, "ee0"), "v1 device: lanes bonded (40 Gb/s), no extended encapsulation")
+    clean(h, "v1 device on a v2 host")
+    show(h)
+finally:
+    h.close()
+
+print("== Thunderbolt 1 host (Cactus Ridge) of a Mac: the driver is the connection manager")
+h = boot("mode=legacy,device-id=0x1547", log="tbt_tb1")
+try:
+    chk("Thunderbolt 1 host router 8086:1547" in h.all and "the driver is the connection manager" in h.all,
+        "Thunderbolt 1 host router started")
+    qset(h, "kind0", "tb3")
+    qset(h, "plug0", True)
+    chk(wait_log(h, "PCIe tunnel 0:6 <-> 1:5", 10) and wait_prop(h, "pcie0", True), "Thunderbolt device: PCIe tunnel")
+    chk(qget(h, "gbps0") == 20 and not qget(h, "usb3-0"), "one lane (Thunderbolt 1 does not bond), no USB 3 tunnel")
+    r = h.cmd("tbt")
+    print("\n".join("     " + l for l in r if l.startswith("TBT")))
+    chk(any("Thunderbolt 1 (Cactus Ridge) host router" in l and "Connection manager: the driver" in l for l in r),
+        "usbtree: Thunderbolt 1 host")
+    qset(h, "plug0", False)
+    chk(wait_log(h, "removed", 8), "removed")
+    clean(h, "Thunderbolt 1")
+    show(h)
+finally:
+    h.close()
+
+print("== Thunderbolt 2 host (Falcon Ridge) of a Mac, firmware CM off: driver CM, lane bonding through the LC")
+h = boot("mode=legacy,device-id=0x156C", log="tbt_tb2")
+try:
+    chk(wait_log(h, "the driver does it", 5), "no firmware connection manager: the driver does it")
+    qset(h, "kind0", "tb3")
+    qset(h, "plug0", True)
+    chk(wait_log(h, "PCIe tunnel 0:6 <-> 1:5", 10) and wait_prop(h, "pcie0", True), "PCIe tunnel")
+    chk(qget(h, "gbps0") == 40, "lanes bonded: 40 Gb/s")
+    clean(h, "Thunderbolt 2")
+finally:
+    h.close()
+
+print("== Thunderbolt 1 controller of a PC (BIOS assist) and Alpine Ridge in USB only mode: left alone")
+h = boot("mode=legacy,device-id=0x1547,apple=off,plug0=on", log="tbt_bios")
+try:
+    chk(wait_log(h, "the BIOS manages it", 5), "PC: the BIOS manages it")
+    r = h.cmd("tbt")
+    chk(any("Connection manager: the BIOS" in l for l in r), "usbtree: the BIOS")
+    clean(h, "BIOS assist")
+finally:
+    h.close()
+h = boot("mode=ar,device-id=0x15DD", log="tbt_usbonly")
+try:
+    chk(wait_log(h, "USB only mode", 5), "Alpine Ridge USB only mode recognised")
+    clean(h, "USB only")
 finally:
     h.close()
 

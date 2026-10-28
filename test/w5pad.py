@@ -33,6 +33,15 @@ def tap(vm):
     touch(vm, '', 0.8)
 
 
+def double_tap(vm):
+    """two quick taps, the second a little off the first (a finger's jitter)"""
+    touch(vm, '500:500', 0.05)
+    touch(vm, '', 0.12)
+    touch(vm, '505:503', 0.03)
+    touch(vm, '508:505', 0.03)
+    touch(vm, '', 0.8)
+
+
 def run(guest, proto, keep=False, boot2=False):
     F = 'C:\\USBNT\\FSTEST.EXE'
     bat = [
@@ -83,6 +92,7 @@ def run(guest, proto, keep=False, boot2=False):
             res['wheeltst up'] = time.time() - t0 < 300
             time.sleep(3)
             tap(vm)                                         # 1: in the window
+            double_tap(vm)                                  # a double click in the window
             for i in range(14):                             # two fingers down the pad: wheel up
                 touch(vm, '400:%d 600:%d' % (200 + i * 40, 200 + i * 40))
             touch(vm, '', 1.0)
@@ -104,7 +114,8 @@ def run(guest, proto, keep=False, boot2=False):
         print('\n'.join(l for l in log.splitlines() if 'ps2' in l))
         lb = wl.count('LBUTTONDOWN')
         wheel = [int(l.split()[1]) for l in wl.splitlines() if l.startswith('MOUSEWHEEL')]
-        res['tap 1 reached the window, tap 2 (pointer moved off it) not: %d' % lb] = lb == 1
+        res['tap 1 and the double tap reached the window, tap 2 (pointer moved off it) not: %d' % lb] = lb == 2
+        res['double tap = double click'] = 'LBUTTONDBLCLK' in wl
         res['two finger scroll: WM_MOUSEWHEEL up %s' % wheel[:6]] = len(wheel) >= 3 and all(w > 0 for w in wheel)
     finally:
         if not keep and os.path.exists(work):

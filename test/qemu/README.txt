@@ -32,8 +32,12 @@ reference):
                          ring with CRC checks; mode=usb4 (USB4 host router and
                          device routers, the driver is the connection manager)
                          or fr|ar|tr|icl|tgl (Intel firmware connection manager),
-                         security=0..2; run time: plug0/plug1, kind0/kind1,
-                         devkey0, pcie0/usb3-0/approved0/host-clean, violations
+                         security=0..2; v2=on (Thunderbolt 5 / USB4 v2 host:
+                         Gen 4 links, CM version 2, PCIe extended encapsulation);
+                         mode=legacy (Thunderbolt 1 / 2 / 3 host without firmware
+                         CM, apple=on|off); run time: plug0/plug1, kind0/kind1
+                         (usb4, usb4v2, tb3, tb1), devkey0, pcie0/usb3-0/ee0/
+                         approved0/host-clean, gbps0/gbps1, violations
   meson.build changes
 
 Build (only i386 is needed):
@@ -70,6 +74,8 @@ usb-uac properties:
   fbppm=N        device clock offset in ppm (feedback value, capture rate)
   implicit=on    asynchronous playback without a feedback endpoint: the
                  host must follow the capture stream (implicit feedback)
+  vendor=on      every interface (and the association) vendor specific: no
+                 class driver takes it (test/w5tree.py: function names)
   ratemask=7     bit 0 44.1 kHz, bit 1 48 kHz, bit 2 96 kHz
   midi=on        USB MIDI streaming interface with a bulk OUT port
   debug=1        log class requests, interface changes and stream
@@ -101,8 +107,8 @@ has it): "tp-ps2pad", a PS/2 touch pad in place of the i8042's PS/2 mouse
   -device tp-ps2pad,id=tp,proto=synaptics|elantech|alps[,stick=on]
       Synaptics TouchPad 8.1 (W mode, advanced gesture mode, pass-through
       port), Elantech v4, ALPS v7 (command mode registers); stick=on adds a
-      trackpoint.  Fingers: qom-set /machine/peripheral/tp touch "x:y [x:y]
-      [b=N]" (per mille of the pad, y downwards; "" = no finger), "s=dx:dy[:b]"
+      trackpoint.  Fingers: qom-set /machine/peripheral/tp touch "x:y [x:y
+      ...] [b=N]" (1 - 4 fingers, per mille of the pad, y downwards; "" = no finger), "s=dx:dy[:b]"
       a trackpoint packet; qom-get mode = 1 once the pad is absolute.
       test/tps2.py uses it.
 
@@ -116,3 +122,11 @@ keyboard is):
       without the i8042 at all (-machine pc,i8042=off) is no such machine:
       Windows 2000's NTDETECT does not come back there.  test/tnlite.py uses
       it: every key text-mode setup reads comes from the USB keyboard.
+
+ps2-mouse-bat.patch (on top of ps2-kbd-absent.patch; also in the tree under
+/home/claude/qemu-src): "bat-delay" property of the i8042's PS/2 mouse:
+  -global ps2-mouse.bat-delay=1500
+      after a reset (FF) the mouse sends its ACK at once and its self test
+      result (AA 00) only after that many milliseconds, answering nothing in
+      the meantime - what slow trackpoints and touch pads do (300 ms to over
+      1 s).  test/ntinput.py --bat MS uses it.

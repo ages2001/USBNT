@@ -5,7 +5,8 @@
  *
  * Opens a window in the foreground, records the characters typed, mouse
  * clicks per button, wheel turns and movement for SECONDS, then prints
- *   INPTEST chars=[...] left=N right=N middle=N x1=N x2=N wheel=N moves=N dx=N dy=N
+ *   INPTEST chars=[...] left=N right=N middle=N x1=N x2=N wheel=N moves=N dx=N dy=N dbl=N
+ * (dbl: double clicks of the left button; the second press counts in left as well)
  * on standard output.
  */
 #include <windows.h>
@@ -19,7 +20,7 @@
 
 static char Chars[512];
 static int NChars;
-static LONG Left, Right, Middle, X1, X2, Wheel, Moves;
+static LONG Left, Right, Middle, X1, X2, Wheel, Moves, Dbl;
 static int Dismissed;
 static LONG LastX = -100000, LastY, SumDx, SumDy;
 static HWND Wnd;
@@ -31,8 +32,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (NChars < (int)sizeof(Chars) - 1 && w >= 0x20 && w < 0x7F) Chars[NChars++] = (char)w;
         return 0;
     case WM_LBUTTONDOWN: Left++; return 0;
-    case WM_RBUTTONDOWN: Right++; return 0;
-    case WM_MBUTTONDOWN: Middle++; return 0;
+    case WM_LBUTTONDBLCLK: Left++; Dbl++; return 0;   /* the second press of a double click */
+    case WM_RBUTTONDOWN: case WM_RBUTTONDBLCLK: Right++; return 0;
+    case WM_MBUTTONDOWN: case WM_MBUTTONDBLCLK: Middle++; return 0;
     case WM_XBUTTONDOWN: if (HIWORD(w) == 1) X1++; else X2++; return 0;
     case WM_MOUSEWHEEL: Wheel += (SHORT)HIWORD(w) / 120; return 0;
     case WM_MOUSEMOVE: {
@@ -68,6 +70,7 @@ void __stdcall Entry(void)
     secs = Num(cl);
     if (!secs) secs = 60;
     { char *p = (char *)&wc; int i; for (i = 0; i < (int)sizeof(wc); i++) p[i] = 0; }
+    wc.style = CS_DBLCLKS;
     wc.lpfnWndProc = WndProc;
     wc.hInstance = GetModuleHandleA(NULL);
     wc.hCursor = LoadCursorA(NULL, (LPCSTR)IDC_ARROW);
@@ -103,12 +106,12 @@ void __stdcall Entry(void)
                 mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
                 PostMessageA(box, WM_COMMAND, IDOK, 0);
                 Dismissed++;
-                Left = Right = Middle = 0;
+                Left = Right = Middle = 0; Dbl = 0;
             }
             if (!box && Dismissed && Dismissed < 100) {
                 Dismissed = 100;
                 SetCursorPos(GetSystemMetrics(SM_CXSCREEN) / 2, GetSystemMetrics(SM_CYSCREEN) / 2);
-                Left = Right = Middle = 0;
+                Left = Right = Middle = 0; Dbl = 0;
                 Moves = 0; SumDx = SumDy = 0;
             }
             if (GetForegroundWindow() != Wnd) SetForegroundWindow(Wnd);
@@ -118,8 +121,8 @@ void __stdcall Entry(void)
         DispatchMessageA(&msg);
     }
     Chars[NChars] = 0;
-    wsprintfA(out, "INPTEST chars=[%s] left=%d right=%d middle=%d x1=%d x2=%d wheel=%d moves=%d dx=%d dy=%d\r\n",
-              Chars, Left, Right, Middle, X1, X2, Wheel, Moves, SumDx, SumDy);
+    wsprintfA(out, "INPTEST chars=[%s] left=%d right=%d middle=%d x1=%d x2=%d wheel=%d moves=%d dx=%d dy=%d dbl=%d\r\n",
+              Chars, Left, Right, Middle, X1, X2, Wheel, Moves, SumDx, SumDy, Dbl);
     WriteFile(so, out, lstrlenA(out), &n, NULL);
     ExitProcess(0);
 }

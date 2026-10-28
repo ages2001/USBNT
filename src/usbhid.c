@@ -129,15 +129,20 @@ static void KbdReport(HID_DEV *h, const UCHAR *Rep, ULONG Len)
     UsbMemSet(cur, 0, sizeof(cur));
     UsbMemCpy(cur, Rep, Len > 8 ? 8 : Len);
     UsbLog(LOG_TRACE, "kbd report %02x %02x %02x at %u ms\n", cur[0], cur[2], cur[3], OsTimeMs());
-    if (cur[2] == 0x01 || cur[3] == 0x01) {
-        return;
-    }
-
     changed = (UCHAR)(cur[0] ^ h->Prev[0]);
     for (i = 0; i < 8; i++) {
         if (changed & (1 << i)) {
             AddKey(ev, &n, ModMap[i], (USHORT)((cur[0] & (1 << i)) ? UKEY_MAKE : UKEY_BREAK));
         }
+    }
+    if (cur[2] == 0x01 || cur[3] == 0x01) {
+        /* ErrorRollOver (too many keys, or a ghosting matrix): the key array means nothing, the
+           modifier byte still counts - a shift let go now must not stay down */
+        h->Prev[0] = cur[0];
+        if (n != 0) {
+            OsKbdInput(ev, n);
+        }
+        return;
     }
 
     irql = OsLock();

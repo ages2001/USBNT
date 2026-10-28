@@ -8,7 +8,7 @@
 
 #include "usbos.h"
 
-#define USBNT_VERSION_STR "1.1"
+#define USBNT_VERSION_STR "1.2"
 
 /* ------------------------------------------------------------------ */
 /* Utilities (usbutil.c)                                                */
@@ -407,6 +407,7 @@ extern int I2cHidCount;
 extern ULONG UsbPollWantMs;
 /* Windows 2000 / XP: devices for Windows' own USB drivers (usbdi.c) */
 extern ULONG UsbPdoMode;        /* 0 none, 1 what USBNT has no driver for, 2 all but hubs */
+extern ULONG UsbTextSetupHid;   /* text-mode setup: HID devices go to setup's own hidusb / kbdhid / mouhid */
 extern ULONG UsbWinVideo;       /* Windows 2000 / XP: cameras go to Windows' usbvideo.sys */
 extern void (*UsbDetachHook)(USB_DEV *Dev);     /* worker period wanted by polled devices (0 = default) */
 void    OsNotifyChange(void);

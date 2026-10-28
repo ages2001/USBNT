@@ -6,7 +6,9 @@ mouse behind it and a stick on a root port.
 
 Checked with fstest devlist (what Device Manager lists): the controller's own name
 ("QEMU USB 3.0 Host Controller (USBNT)"), "USB 3.x Root Hub (USBNT)" below it, the hub
-below the root hub, the keyboard and mouse below the hub, the stick below the root hub,
+("USB 1.1 Hub (USBNT)") below the root hub, a USB network device for Windows' drivers by
+its product name (Windows 2000: one node per function, "... - Communications (Interfaces
+0-1)"), the keyboard and mouse below the hub, the stick below the root hub,
 "USBNT USB Keyboard" / "USBNT USB Mouse" in their classes and the disk - all without a
 problem code; then keys typed and the mouse moved and clicked on the USB devices only
 reach a window, the stick is read and written.
@@ -92,6 +94,8 @@ def run(guest, keep=False):
         'C:\\USBNT\\USBINST.EXE /install /nogroup /nomon /set DebugPort=0x2f8 /set DebugLevel=%s' % os.environ.get('W5_DEBUGLEVEL', '2'),
         'C:\\USBNT\\INPTEST.EXE 90',
         '%s devlist USBNT' % F,
+        '%s devlist VID_0525' % F,
+        '%s devlist VID_46F4&PID_0102' % F,
         '%s find HELLO.TXT 60000' % F,
         '%s cat ?:\\HELLO.TXT' % F,
         '%s write ?:\\TREE.TXT written-by-%s' % (F, guest),
@@ -111,7 +115,9 @@ def run(guest, keep=False):
              '-device', 'usb-mouse,bus=xhci.0,port=1.2,display=vga0,id=umou',
              '-blockdev', 'driver=file,filename=%s,node-name=stickf' % img,
              '-blockdev', 'driver=raw,file=stickf,node-name=stick',
-             '-device', 'usb-storage,drive=stick,bus=xhci.0,port=2,id=stickdev']
+             '-device', 'usb-storage,drive=stick,bus=xhci.0,port=2,id=stickdev',
+             '-device', 'usb-net,bus=xhci.0,port=3,id=unet',
+             '-audiodev', 'none,id=snd0', '-device', 'usb-uac,bus=xhci.0,port=4,id=uac,audiodev=snd0,vendor=on']
     vm = vm5.VM(guest, work, extra=extra, name='tree-' + guest, front=front)
     typed = False
     t0 = time.time()
@@ -137,7 +143,9 @@ def run(guest, keep=False):
     ds = devs(out)
     hc = [d for d in ds if d['id'].startswith('PCI\\VEN_1B36&DEV_000D')]
     root = find(ds, 'Root Hub (USBNT)')
-    hub = [d for d in ds if d['name'].startswith('USB Hub') and d['id'].startswith('USBNT\\VID_')]
+    hub = [d for d in ds if d['name'].startswith('USB 1.1 Hub') and d['id'].startswith('USBNT\\VID_')]
+    net = [d for d in ds if d['id'].startswith('USB\\VID_0525&PID_A4A2')]
+    uac = [d for d in ds if d['id'].startswith('USB\\VID_46F4&PID_0102')]
     kbd = find(ds, 'USB Keyboard (')
     mou = find(ds, 'USB Mouse (')
     msd = find(ds, 'USB Mass Storage Device')
@@ -156,12 +164,20 @@ def run(guest, keep=False):
         'keyboard / mouse below the hub': bool(kbd) and bool(mou) and kbd[0]['prob'] == 0 and mou[0]['prob'] == 0 and
                                           under(kbd, hub) and under(mou, hub),
         'stick below the root hub': bool(msd) and msd[0]['prob'] == 0 and under(msd, root),
+        # a device for Windows' own drivers (usbdi.c): its product name; Windows 2000 (no usbccgp): one
+        # node per function, "<product> - <class> (Interface n)"
+        'network device named': bool(net) and all(d['name'].startswith('RNDIS/QEMU USB Network Device') for d in net) and
+                                (guest != 'w2k' or any(' - ' in d['name'] and '(Interface' in d['name'] for d in net)),
+        # an interface association without a name, vendor specific (no driver): Windows 2000 - USBNT's
+        # function node, XP - usbccgp's function, named by the string USBNT gives the association
+        'function without a name named': any(d['name'] == 'QEMU UAC Test Device - Vendor Specific (Interfaces 0-2)'
+                                             for d in uac),
         'USBNT USB Keyboard (Keyboard class)': any(d['name'] == 'USBNT USB Keyboard' and isclass(d, 'Keyboard') and
                                                    d['prob'] == 0 for d in ds),
         'USBNT USB Mouse (Mouse class)': any(d['name'] == 'USBNT USB Mouse' and isclass(d, 'Mouse') and
                                              d['prob'] == 0 for d in ds),
         'disk (DiskDrive class)': any(isclass(d, 'DiskDrive') and d['prob'] == 0 for d in ds),
-        'no USBNT device with a problem': bool(ds) and all(d['prob'] == 0 for d in ds),
+        'no USBNT device with a problem': bool(ds) and all(d['prob'] == 0 for d in ds if d not in net and d not in uac),
         'keys typed': typed and 'usbkey' in chars,
         'mouse moved and clicked': moves > 0 and left > 0,
         'stick read': '[hello from usb' in out,

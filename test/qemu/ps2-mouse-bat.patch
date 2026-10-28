@@ -1,0 +1,86 @@
+diff --git a/hw/input/ps2.c b/hw/input/ps2.c
+--- a/hw/input/ps2.c
++++ b/hw/input/ps2.c
+@@ -24,6 +24,7 @@
+ 
+ #include "qemu/osdep.h"
+ #include "hw/qdev-properties.h"
++#include "qemu/timer.h"
+ #include "qemu/log.h"
+ #include "hw/irq.h"
+ #include "hw/sysbus.h"
+@@ -893,6 +894,9 @@
+     if (ps2_mouse_write_hook && ps2_mouse_write_hook(s, val)) {
+         return;
+     }
++    if (s->in_bat) {
++        return;                         /* in its self test: no answer */
++    }
+     trace_ps2_write_mouse(s, val);
+     switch (ps2->write_cmd) {
+     default:
+@@ -970,6 +974,12 @@
+             s->mouse_status = 0;
+             s->mouse_type = 0;
+             ps2_reset_queue(ps2);
++            if (s->bat_delay) {
++                ps2_queue(ps2, AUX_ACK);
++                s->in_bat = true;
++                timer_mod(s->bat_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + s->bat_delay);
++                break;
++            }
+             ps2_queue_3(ps2,
+                 AUX_ACK,
+                 0xaa,
+@@ -1264,11 +1274,28 @@
+     .sync  = ps2_mouse_sync,
+ };
+ 
++static void ps2_mouse_bat_done(void *opaque)
++{
++    PS2MouseState *s = opaque;
++
++    s->in_bat = false;
++    ps2_queue_2(PS2_DEVICE(s), 0xaa, s->mouse_type);
++}
++
+ static void ps2_mouse_realize(DeviceState *dev, Error **errp)
+ {
++    PS2MouseState *s = PS2_MOUSE_DEVICE(dev);
++
++    s->bat_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, ps2_mouse_bat_done, s);
+     qemu_input_handler_register(dev, &ps2_mouse_handler);
+ }
+ 
++static Property ps2_mouse_props[] = {
++    /* -global ps2-mouse.bat-delay=1500: a mouse whose reset self test takes 1.5 s */
++    DEFINE_PROP_UINT32("bat-delay", PS2MouseState, bat_delay, 0),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
+ static Property ps2_kbd_props[] = {
+     /* -global ps2-kbd.absent=on: a keyboard controller without a keyboard (driver tests) */
+     DEFINE_PROP_BOOL("absent", PS2KbdState, absent, false),
+@@ -1302,6 +1329,7 @@
+     PS2DeviceClass *ps2dc = PS2_DEVICE_CLASS(klass);
+ 
+     dc->realize = ps2_mouse_realize;
++    device_class_set_props(dc, ps2_mouse_props);
+     resettable_class_set_parent_phases(rc, NULL, ps2_mouse_reset_hold, NULL,
+                                        &ps2dc->parent_phases);
+     dc->vmsd = &vmstate_ps2_mouse;
+diff --git a/include/hw/input/ps2.h b/include/hw/input/ps2.h
+--- a/include/hw/input/ps2.h
++++ b/include/hw/input/ps2.h
+@@ -93,6 +93,11 @@
+     int mouse_dz;
+     int mouse_dw;
+     uint8_t mouse_buttons;
++    /* bat-delay=ms: the self test after a reset takes that long (slow trackpoints, pads);
++       the device does not answer in the meantime */
++    uint32_t bat_delay;
++    bool in_bat;
++    QEMUTimer *bat_timer;
+ };
+ 
+ #define TYPE_PS2_MOUSE_DEVICE "ps2-mouse"

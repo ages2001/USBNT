@@ -80,7 +80,7 @@ def lf_lists(hiv):
     open(hiv, 'wb').write(bytes(d))
 
 
-def build_iso(src_iso, choice, debug, out_iso, tree, which='all'):
+def build_iso(src_iso, choice, debug, out_iso, tree, which='all', sets=()):
     if os.path.exists(tree):
         shutil.rmtree(tree)
     os.makedirs(tree)
@@ -112,10 +112,12 @@ def build_iso(src_iso, choice, debug, out_iso, tree, which='all'):
     t = open(p, 'rb').read().decode('latin1')
     t = sif_insert(t, 'Files', ['d1,usbnt.sys'])
     open(p, 'wb').write(t.encode('latin1'))
-    if debug:
+    if debug or sets:
         hiv = os.path.join(i386, 'SETUPREG.HIV')
-        script = ('cd ControlSet001\\Services\nadd usbnt\ncd usbnt\nadd Parameters\ncd Parameters\nsetval 2\n'
-                  'DebugPort\ndword:0x3f8\nDebugLevel\ndword:0x3\ncommit\n')
+        vals = ([('DebugPort', 0x3f8), ('DebugLevel', 3)] if debug else []) + \
+               [(k, int(v, 0)) for k, v in (x.split('=') for x in sets)]
+        script = ('cd ControlSet001\\Services\nadd usbnt\ncd usbnt\nadd Parameters\ncd Parameters\nsetval %d\n'
+                  % len(vals)) + ''.join('%s\ndword:0x%x\n' % kv for kv in vals) + 'commit\n'
         sh = os.path.join(W, 'hiv.hsh')
         open(sh, 'w').write(script)
         r = subprocess.run(['hivexsh', '-w', '-f', sh, hiv], capture_output=True, text=True)
@@ -248,15 +250,16 @@ def main():
     ap.add_argument('--debug', action='store_true')
     ap.add_argument('--ids', default='all', choices=['all', 'pci', 'none'])
     ap.add_argument('--keep', action='store_true')
+    ap.add_argument('--set', action='append', default=[], help='Name=value: a usbnt parameter in the setup hive')
     a = ap.parse_args()
     os.makedirs(W, exist_ok=True)
-    name = 'nlite-%s-%s-%s' % (a.choice, a.hc, a.ids)
+    name = 'nlite-%s-%s-%s%s' % (a.choice, a.hc, a.ids, ''.join('-' + x.split('=')[0] + x.split('=')[1] for x in a.set))
     out = os.path.join(W, name)
     if os.path.exists(out):
         shutil.rmtree(out)
     os.makedirs(out)
     iso = os.path.join(W, name + '.iso')
-    build_iso(a.iso, a.choice, a.debug, iso, os.path.join(W, 'tree'), a.ids)
+    build_iso(a.iso, a.choice, a.debug, iso, os.path.join(W, 'tree'), a.ids, a.set)
     vm = Vm(iso, out, a.hc)
     res = {}
     # the text-mode screens and the USB key each one wants, until setup formats / copies
@@ -311,7 +314,12 @@ def main():
     log = open(os.path.join(out, 'com1.log'), 'rb').read().decode('latin1')
     print('---- usbnt log (COM1) ----')
     print('\n'.join(l for l in log.splitlines() if 'PnP: child' not in l)[-6000:])
-    if a.debug:
+    if a.debug and 'TextSetupHid=1' in a.set:
+        # the keyboard went to setup's own hidusb / kbdhid through USBNT's USB bus interface
+        res["keyboard to setup's hidusb / kbdhid (log)"] = "go to setup's hidusb" in log and \
+            "to Windows' USB drivers" in log
+        res['no keys lent to i8042prt / kbdhid (log)'] = 'USB keys go to the class driver of' not in log
+    elif a.debug:
         # the keys went through kbdclass on USBNT's own keyboard device, not to another keyboard's class
         res['kbdclass on the USBNT keyboard (log)'] = 'keyboard class driver connected' in log
         res['no keys lent to i8042prt / kbdhid (log)'] = 'USB keys go to the class driver of' not in log

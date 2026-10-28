@@ -46,10 +46,9 @@ index cd61a63..3e04087 100644
  void ps2_queue_noirq(PS2State *s, int b);
 diff --git a/hw/input/tp_ps2pad.c b/hw/input/tp_ps2pad.c
 new file mode 100644
-index 0000000..8a3770c
 --- /dev/null
 +++ b/hw/input/tp_ps2pad.c
-@@ -0,0 +1,546 @@
+@@ -0,0 +1,560 @@
 +/*
 + * PS/2 touch pad test device (for the USBNT PS/2 touch pad protocols).
 + *
@@ -76,7 +75,8 @@ index 0000000..8a3770c
 + *   "s=dx:dy[:b]"            a trackpoint packet (counts, y downwards)
 + * Each frame becomes the packets of the protocol (reporting must be on).
 + * "commands" counts the bytes written by the guest, "mode" is 1 once the pad
-+ * is in its absolute mode.
++ * is in its absolute mode.  TP_PS2PAD_TRACE=1 in the environment logs every
++ * byte the guest writes to stderr.
 + *
 + * This work is licensed under the terms of the GNU GPL, version 2 or later.
 + */
@@ -309,6 +309,10 @@ index 0000000..8a3770c
 +    uint8_t b = (uint8_t)val;
 +
 +    s->commands++;
++    if (getenv("TP_PS2PAD_TRACE")) {
++        fprintf(stderr, "tp-ps2pad: %" PRId64 " ms: %02x%s\n", qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL), b,
++                s->arg_for ? " (argument)" : "");
++    }
 +    if (s->arg_for) {
 +        uint8_t c = (uint8_t)s->arg_for;
 +        bool e6;
@@ -456,6 +460,15 @@ index 0000000..8a3770c
 +    } else {
 +        x1 = 0xFF0;
 +        r1 = 0x7FF;
++    }
++    if (n >= 3) {
++        /* three or more fingers ("id 2" packet): the second point coarser, the count - 3 in byte 5 */
++        reply(s, 6, 0x48 | ((btn & 1) ? 0x80 : 0) | ((btn & 2) ? 0x20 : 0) | (r0 & 7), (r0 >> 3) & 0xFF,
++              0x40 | ((x0 & 0x800) >> 4) | ((x0 >> 5) & 0x3F),
++              0x48 | ((x1 & 0x800) >> 4) | ((x0 & 0x18) << 1) | (x0 & 7),
++              0x01 | ((x1 & 0x400) >> 3) | ((x1 >> 4) & 0x3C) | ((r1 >> 4) & 0x02),
++              ((r1 & 0x400) >> 3) | ((r1 >> 4) & 0x3C) | ((n - 3) & 3));
++        return;
 +    }
 +    reply(s, 6, 0x48 | ((btn & 1) ? 0x80 : 0) | ((btn & 2) ? 0x20 : 0) | (r0 & 7), (r0 >> 3) & 0xFF,
 +          0x40 | ((x0 & 0x800) >> 4) | ((x0 >> 5) & 0x3F),

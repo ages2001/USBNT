@@ -77,9 +77,9 @@ static BOOLEAN Reset(const PS2PAD_IO *Io)
     if (!Cmd(Io, 0xFF)) {
         return FALSE;
     }
-    b = Io->Read(Io->Ctx, 800);
+    b = Io->Read(Io->Ctx, 2500);                        /* self test: up to 2.5 s on some pads */
     if (b == 0xAA) {
-        (void)Io->Read(Io->Ctx, 100);                   /* device id 00 */
+        (void)Io->Read(Io->Ctx, 200);                   /* device id 00 */
     }
     return TRUE;
 }

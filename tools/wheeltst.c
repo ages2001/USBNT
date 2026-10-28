@@ -17,11 +17,12 @@
 #define WM_APPCOMMAND_      0x0319
 
 enum { C_VDOWN, C_VUP, C_HRIGHT, C_HLEFT, C_WHEEL, C_X1, C_X2, C_BACK, C_FWD, C_ALTLEFT, C_ALTRIGHT,
-       C_LEFT, C_RIGHT, C_MIDDLE, C_AUTO, C_COUNT };
+       C_LEFT, C_RIGHT, C_MIDDLE, C_DOUBLE, C_AUTO, C_COUNT };
 static const char *const Names[C_COUNT] = {
     "WM_VSCROLL down", "WM_VSCROLL up", "WM_HSCROLL right", "WM_HSCROLL left", "WM_MOUSEWHEEL",
     "WM_XBUTTONDOWN 1 (back)", "WM_XBUTTONDOWN 2 (forward)", "WM_APPCOMMAND back", "WM_APPCOMMAND forward",
-    "Alt+Left", "Alt+Right", "left button", "right button", "middle button", "autoscroll started" };
+    "Alt+Left", "Alt+Right", "left button", "right button", "middle button", "double click (left)",
+    "autoscroll started" };
 
 static HANDLE Log;
 static LONG TopIndex, LeftIndex;
@@ -163,6 +164,10 @@ static LRESULT CALLBACK WndProc(HWND Wnd, UINT Msg, WPARAM Wp, LPARAM Lp)
     case WM_LBUTTONDOWN: LogLine("LBUTTONDOWN\r\n"); Bump(Wnd, C_LEFT); return 0;
     case WM_RBUTTONDOWN: LogLine("RBUTTONDOWN\r\n"); Bump(Wnd, C_RIGHT); return 0;
     case WM_MBUTTONDOWN: LogLine("MBUTTONDOWN\r\n"); Bump(Wnd, C_MIDDLE); return 0;
+    /* the second press of a double click (the class has CS_DBLCLKS) */
+    case WM_LBUTTONDBLCLK: LogLine("LBUTTONDBLCLK\r\n"); Bump(Wnd, C_LEFT); Bump(Wnd, C_DOUBLE); return 0;
+    case WM_RBUTTONDBLCLK: LogLine("RBUTTONDOWN\r\n"); Bump(Wnd, C_RIGHT); return 0;
+    case WM_MBUTTONDBLCLK: LogLine("MBUTTONDOWN\r\n"); Bump(Wnd, C_MIDDLE); return 0;
     case WM_LBUTTONUP: LogLine("LBUTTONUP\r\n"); return 0;
     case WM_RBUTTONUP: LogLine("RBUTTONUP\r\n"); return 0;
     case WM_MBUTTONUP: LogLine("MBUTTONUP\r\n"); return 0;
@@ -213,6 +218,7 @@ void __stdcall Entry(void)
             p[i] = 0;
         }
     }
+    wc.style = CS_DBLCLKS;
     wc.lpfnWndProc = WndProc;
     wc.hInstance = inst;
     wc.hIcon = LoadIconA(inst, MAKEINTRESOURCEA(1));
@@ -221,7 +227,7 @@ void __stdcall Entry(void)
     wc.lpszClassName = "WheelTest";
     RegisterClassA(&wc);
     w = CreateWindowA("WheelTest", "Wheel test", WS_OVERLAPPEDWINDOW | WS_VSCROLL | WS_HSCROLL | WS_VISIBLE,
-                      160, 100, 320, 290, NULL, NULL, inst, NULL);
+                      160, 100, 320, 305, NULL, NULL, inst, NULL);
     SetScrollRange(w, SB_VERT, 0, 100, FALSE);
     SetScrollRange(w, SB_HORZ, 0, 100, FALSE);
     SetForegroundWindow(w);

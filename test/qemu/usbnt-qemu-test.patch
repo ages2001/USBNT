@@ -1504,7 +1504,7 @@ new file mode 100644
 index 0000000..264bcd2
 --- /dev/null
 +++ b/hw/usb/dev-uac.c
-@@ -0,0 +1,1013 @@
+@@ -0,0 +1,1023 @@
 +/*
 + * QEMU USB Audio Class 1 / 2 test device ("usb-uac").
 + *
@@ -1599,6 +1599,7 @@ index 0000000..264bcd2
 +    uint32_t debug;
 +    bool midi;
 +    bool implicit;
++    bool vendor;                        /* every interface vendor specific (no class driver takes it) */
 +
 +    /* descriptors (built at realize) */
 +    USBDesc desc;
@@ -1920,6 +1921,11 @@ index 0000000..264bcd2
 +        build_ms(s, &s->ifs[n++], s->capture ? 3 : 2);
 +    }
 +    s->nifs = n;
++    if (s->vendor) {
++        for (n = 0; n < s->nifs; n++) {
++            s->ifs[n].bInterfaceClass = 0xFF;
++        }
++    }
 +
 +    s->devdesc.bcdUSB = s->hs ? 0x0200 : 0x0110;
 +    s->devdesc.bMaxPacketSize0 = 64;
@@ -1940,6 +1946,9 @@ index 0000000..264bcd2
 +        s->iad.bFunctionClass = USB_CLASS_AUDIO;
 +        s->iad.bFunctionSubClass = 0;
 +        s->iad.bFunctionProtocol = 0x20;
++        if (s->vendor) {
++            s->iad.bFunctionClass = 0xFF;
++        }
 +        s->iad.nif = s->nifs;
 +        s->iad.ifs = s->ifs;
 +        s->conf.nif_groups = 1;
@@ -2484,6 +2493,7 @@ index 0000000..264bcd2
 +    DEFINE_PROP_UINT32("debug", UACState, debug, 0),
 +    DEFINE_PROP_BOOL("midi", UACState, midi, false),
 +    DEFINE_PROP_BOOL("implicit", UACState, implicit, false),
++    DEFINE_PROP_BOOL("vendor", UACState, vendor, false),
 +    DEFINE_PROP_END_OF_LIST(),
 +};
 +
@@ -4435,13 +4445,13 @@ new file mode 100644
 index 0000000..40ab9f6
 --- /dev/null
 +++ b/hw/usb/usb4-nhi.c
-@@ -0,0 +1,1776 @@
+@@ -0,0 +1,1932 @@
 +/*
 + * Thunderbolt / USB4 host interface (NHI) with routers behind it - test
 + * model for the USBNT tbt.c driver.
 + *
-+ *   -device usb4-nhi,id=tb[,mode=usb4|fr|ar|tr|icl|tgl][,security=0..2]
-+ *        [,device-id=0x....][,caps-version=0x20]
++ *   -device usb4-nhi,id=tb[,mode=usb4|legacy|fr|ar|tr|icl|tgl][,security=0..2]
++ *        [,device-id=0x....][,caps-version=0x20][,v2=on][,apple=on|off]
 + *
 + * Ring 0 (control channel, raw mode) is emulated with descriptor and CRC-32C
 + * checks.  mode=usb4: a USB4 host router (route 0) with two USB4 ports
@@ -4450,16 +4460,27 @@ index 0000000..40ab9f6
 + * firmware connection manager (ICM) with the message formats of Falcon /
 + * Alpine Ridge (fr, ar), Titan Ridge (tr) or Ice Lake and later (icl: force
 + * power through PCI config 0xFC first; tgl: firmware already running).
++ * v2=on (mode=usb4): USB4 v2 / Thunderbolt 5 host router (Barlow Ridge id,
++ * caps version 0x40): a link to a USB4 v2 device router comes up at Gen 4,
++ * bonded by the hardware (2 x 40 Gb/s); the CM must program CM version 2 and
++ * PCIe extended encapsulation on both PCIe adapters.  mode=legacy: Thunderbolt
++ * 1 / 2 / 3 host router without firmware connection manager (device-id: 0x1547
++ * Cactus Ridge (default, Thunderbolt 1), 0x156C Falcon Ridge, 0x15EB Titan
++ * Ridge); apple=on (default) gives it Apple's subsystem ids 2222:1111, the
++ * driver must be the connection manager then (plug events of the host router,
++ * link controller from Thunderbolt 2 on); apple=off: a PC, the BIOS runs it
++ * and the driver must keep its hands off (any packet is a violation).
 + *
 + * Run time properties (qom-set / qom-get):
 + *   plug0, plug1     device router 0 at host port 1; router 1 behind its port 3
-+ *   kind0, kind1     "usb4" or "tb3" (before plugging)
++ *   kind0, kind1     "usb4", "usb4v2", "tb3" or "tb1" (before plugging)
 + *   devkey0          "clear" (device forgets its key), "bad" (other key),
 + *                    "hex:<64 digits>" (key from an earlier pairing)
 + *   pcie0/1, usb3-0/1  tunnel to router 0 / 1 up (read only)
 + *   approved0        firmware connected router 0 (read only)
 + *   host-clean       no tunnel of router 0 left in the host router
-+ *   gbps0, gbps1     link speed to router 0 / 1 (20 one lane, 40 bonded)
++ *   gbps0, gbps1     link speed to router 0 / 1 (20 one lane, 40 bonded, 80 Gen 4)
++ *   ee0              PCIe tunnel 0 with extended encapsulation (read only)
 + *   violations, vlog protocol errors seen (count, last messages)
 + *
 + * This work is licensed under the terms of the GNU GPL, version 2 or later.
@@ -4510,11 +4531,13 @@ index 0000000..40ab9f6
 +#define SW_PE_VSE       0x30            /* Thunderbolt 3 plug events capability */
 +#define SW_LC_VSE       0x40            /* Thunderbolt 3 link controller capability */
 +
-+enum { M_USB4, M_FR, M_AR, M_TR, M_ICL, M_TGL };
++enum { M_USB4, M_FR, M_AR, M_TR, M_ICL, M_TGL, M_LEGACY };
 +
 +typedef struct Router {
 +    bool present;
 +    bool usb4;
++    int ver;                            /* USB4 version (0: Thunderbolt) */
++    int gen;                            /* Thunderbolt generation of a version 0 router (1 .. 3) */
 +    int depth, up, maxport;
 +    uint32_t route;                     /* where it is */
 +    bool enumerated;
@@ -4556,6 +4579,7 @@ index 0000000..40ab9f6
 +    uint8_t security;
 +    uint16_t device_id;
 +    uint32_t caps_version;
++    bool v2, apple;
 +    uint32_t ring[HOPS * 2][4];         /* tx 0..11, rx 12..23 */
 +    uint32_t opt[HOPS * 2][2];
 +    uint16_t tx_cons, rx_prod;          /* hardware indexes */
@@ -4709,6 +4733,69 @@ index 0000000..40ab9f6
 +    }
 +}
 +
++enum { K_USB4, K_V2, K_TB3, K_TB2, K_TB1 };
++
++static bool swcm(Usb4NhiState *s)
++{
++    return s->mode == M_USB4 || s->mode == M_LEGACY;
++}
++
++static int kind_of(const char *k)
++{
++    if (k == NULL || !strcmp(k, "usb4")) {
++        return K_USB4;
++    }
++    if (!strcmp(k, "usb4v2")) {
++        return K_V2;
++    }
++    if (!strcmp(k, "tb1")) {
++        return K_TB1;
++    }
++    return K_TB3;
++}
++
++static int host_kind(Usb4NhiState *s)
++{
++    switch (s->mode) {
++    case M_USB4:
++        return s->v2 ? K_V2 : K_USB4;
++    case M_ICL:
++    case M_TGL:
++        return K_USB4;
++    case M_LEGACY:
++        if (s->device_id == 0x1513 || s->device_id == 0x1547 || s->device_id == 0x1548) {
++            return K_TB1;
++        }
++        if (s->device_id == 0x156A || s->device_id == 0x156C) {
++            return K_TB2;
++        }
++        return K_TB3;
++    default:
++        return K_TB3;
++    }
++}
++
++/* Gen 4: both routers USB4 v2, the two lanes come up as one 80 Gb/s link */
++static void gen4_link(Usb4NhiState *s, int c)
++{
++    Router *pr = &s->r[c - 1], *r = &s->r[c];
++    int l0 = (c == 1) ? 1 : 3, k;
++
++    if (pr->ver < 2 || r->ver < 2) {
++        return;
++    }
++    for (k = 0; k < 2; k++) {
++        uint32_t *a = &pr->port[l0 + k][CAP_PHY_OFF + 1], *b = &r->port[r->up + k][CAP_PHY_OFF + 1];
++        *a = (*a & ~((0x3Fu << 20) | (0xFu << 16))) | (2u << 20) | (0x2u << 16);
++        *b = (*b & ~((0x3Fu << 20) | (0xFu << 16))) | (2u << 20) | (0x2u << 16);
++    }
++}
++
++static bool gen4(Router *r, int lane)
++{
++    return ((r->port[lane][CAP_PHY_OFF + 1] >> 16) & 0xF) == 0x2;
++}
++
 +static void port_init(Router *r, int p, uint32_t type, bool usb4, int pnum)
 +{
 +    uint32_t *pt = r->port[p];
@@ -4721,7 +4808,7 @@ index 0000000..40ab9f6
 +    if (type == T_LANE) {
 +        pt[1] = CAP_PHY_OFF;
 +        /* supported: single and dual width, Gen 2 and Gen 3 */
-+        pt[CAP_PHY_OFF] = 0x01u << 8 | (usb4 ? CAP_USB4_OFF : 0) | (3u << 20) | (0xCu << 16);
++        pt[CAP_PHY_OFF] = 0x01u << 8 | (usb4 ? CAP_USB4_OFF : 0) | (3u << 20) | ((r->ver >= 2 ? 0xEu : 0xCu) << 16);
 +        pt[CAP_PHY_OFF + 1] = LANE_DEFAULT | (7u << 26);       /* unplugged */
 +        if (usb4) {
 +            pt[CAP_USB4_OFF] = 0x06u << 8;
@@ -4736,13 +4823,16 @@ index 0000000..40ab9f6
 +    }
 +}
 +
-+static void router_init(Usb4NhiState *s, int i, bool usb4)
++static void router_init(Usb4NhiState *s, int i, int kind)
 +{
 +    Router *r = &s->r[i];
++    bool usb4 = kind == K_USB4 || kind == K_V2;
 +    int p;
 +
 +    memset(r, 0, sizeof(*r));
 +    r->usb4 = usb4;
++    r->ver = kind == K_V2 ? 2 : usb4 ? 1 : 0;
++    r->gen = kind == K_TB1 ? 1 : kind == K_TB2 ? 2 : 3;
 +    if (i == 0) {
 +        r->maxport = 9;
 +        r->depth = 0;
@@ -4755,8 +4845,8 @@ index 0000000..40ab9f6
 +        port_init(r, 5, T_NHI, usb4, 5);
 +        port_init(r, 6, T_PCIE_DOWN, usb4, 6);
 +        port_init(r, 7, T_PCIE_DOWN, usb4, 7);
-+        port_init(r, 8, T_USB3_DOWN, usb4, 8);
-+        port_init(r, 9, T_USB3_DOWN, usb4, 9);
++        port_init(r, 8, usb4 ? T_USB3_DOWN : 0, usb4, 8);
++        port_init(r, 9, usb4 ? T_USB3_DOWN : 0, usb4, 9);
 +        r->sw[0] = PCI_DEVICE(s)->config[0] | (PCI_DEVICE(s)->config[1] << 8) |
 +                   ((uint32_t)s->device_id << 16);
 +        r->present = true;
@@ -4786,7 +4876,7 @@ index 0000000..40ab9f6
 +        }
 +        r->port[1][5] &= ~0x80000000u;
 +        r->port[2][5] &= ~0x80000000u;
-+        r->sw[0] = 0x8086 | ((usb4 ? 0x0B26u : 0x15EFu) << 16);
++        r->sw[0] = 0x8086 | ((kind == K_V2 ? 0x5786u : usb4 ? 0x0B26u : kind == K_TB1 ? 0x1549u : 0x15EFu) << 16);
 +        /* downstream lanes of a USB4 router are locked until the CM unlocks them */
 +        if (usb4) {
 +            r->port[3][4] |= 0x80000000u;
@@ -4795,12 +4885,14 @@ index 0000000..40ab9f6
 +        r->sw[6] = 0x00040000u;                         /* HCI: internal xHCI */
 +    }
 +    r->sw[1] = (usb4 ? 0 : SW_PE_VSE) | ((uint32_t)r->maxport << 14) | (1u << 24);
-+    r->sw[4] = usb4 ? 0x20u << 24 : 0x02u << 24;
++    r->sw[4] = r->ver == 2 ? 0x40u << 24 : usb4 ? 0x20u << 24 : 0x02u << 24;
 +    if (!usb4) {
 +        r->sw[6] = 0;
-+        /* plug events (short header) and link controller (long header) */
-+        r->sw[SW_PE_VSE] = SW_LC_VSE | (0x05u << 8) | (0x01u << 16) | (2u << 24);
++        /* plug events (short header) and link controller (long header; not on Thunderbolt 1) */
++        r->sw[SW_PE_VSE] = (r->gen >= 2 ? SW_LC_VSE : 0) | (0x05u << 8) | (0x01u << 16) | (2u << 24);
 +        r->sw[SW_PE_VSE + 1] = 0x7C;
++    }
++    if (!usb4 && r->gen >= 2) {
 +        r->sw[SW_LC_VSE] = (0x05u << 8) | (0x06u << 16);
 +        r->sw[SW_LC_VSE + 1] = 0 | (0x100u << 16);     /* long header: next 0, length */
 +        /* descriptor: 2 link controllers, start 0x10, 0x20 dwords each */
@@ -4936,11 +5028,34 @@ index 0000000..40ab9f6
 +        }
 +        return false;
 +    }
-+    if (!r->usb4 && !(r->sw[tb3_lc_ctrl(r, 1)] & (1u << 30))) {
++    if (!r->usb4 && r->gen >= 2 && !(r->sw[tb3_lc_ctrl(r, 1)] & (1u << 30))) {
 +        if (report) {
 +            violation(s, "%s: Thunderbolt 3 lane not configured (LC SX_CTRL)", what);
 +        }
 +        return false;
++    }
++    if (!pr->usb4 && pr->gen >= 2 && !(pr->sw[tb3_lc_ctrl(pr, pl)] & (pl & 1 ? 1u << 16 : 1u << 20))) {
++        if (report) {
++            violation(s, "%s: downstream Thunderbolt lane of router %d not configured (LC SX_CTRL)", what, i - 1);
++        }
++        return false;
++    }
++    {
++        bool want = pr->ver >= 2 && r->ver >= 2 && gen4(r, 1);
++        bool ee_d = pr->port[pd][CAP_ADAP_OFF + 1] & 1, ee_u = r->port[5][CAP_ADAP_OFF + 1] & 1;
++        if (want && (!ee_d || !ee_u)) {
++            if (report) {
++                violation(s, "%s: USB4 v2 Gen 4 link without PCIe extended encapsulation (down %d up %d)", what,
++                          ee_d, ee_u);
++            }
++            return false;
++        }
++        if (!want && (ee_d || ee_u)) {
++            if (report) {
++                violation(s, "%s: PCIe extended encapsulation on a link that does not have it", what);
++            }
++            return false;
++        }
 +    }
 +    return tunnel_ok(s, pr, pd, pl, r, 5, 1, 8, what, report);
 +}
@@ -5079,8 +5194,12 @@ index 0000000..40ab9f6
 +        }
 +        return;
 +    case 4:
-+        if (r->usb4 && ((v >> 8) & 0xFF) != 0x10 && ((v >> 8) & 0xFF) != 0x20) {
-+            violation(s, "router %d: CM version %02x not written", ri, (v >> 8) & 0xFF);
++        if (r->ver == 1 && ((v >> 8) & 0xFF) != 0x10) {
++            violation(s, "router %d: CM version %02x written (USB4 v1 router: 10)", ri, (v >> 8) & 0xFF);
++        }
++        if (r->ver == 2 && ((v >> 8) & 0xFF) != 0x20) {
++            violation(s, "router %d: USB4 v2 router programmed with CM version %02x (v2 features stay hidden)", ri,
++                      (v >> 8) & 0xFF);
 +        }
 +        r->sw[4] = (old & 0xFF000000u) | (v & 0x00FFFFFFu);
 +        return;
@@ -5126,6 +5245,14 @@ index 0000000..40ab9f6
 +        return;
 +    }
 +    r = &s->r[c];
++    if (gen4(pr, p)) {
++        violation(s, "lane bonding requested on a Gen 4 link to router %d (it is bonded already)", c);
++        return;
++    }
++    if (pr->gen < 2 || r->gen < 2) {
++        violation(s, "lane bonding requested with a Thunderbolt 1 router (router %d)", c);
++        return;
++    }
 +    for (k = 0; k < 2; k++) {
 +        if (((pr->port[p + k][CAP_PHY_OFF + 1] >> 4) & 3) != 3 || ((r->port[r->up + k][CAP_PHY_OFF + 1] >> 4) & 3) != 3) {
 +            violation(s, "lane bonding to router %d requested before both lanes of both ends were set to dual", c);
@@ -5169,6 +5296,16 @@ index 0000000..40ab9f6
 +        return;
 +    }
 +    if (type == T_PCIE_DOWN || type == T_PCIE_UP) {
++        if (off == CAP_ADAP_OFF + 1) {
++            if (((v ^ old) & 1) && (pt[CAP_ADAP_OFF] & 0x80000000u)) {
++                violation(s, "router %d adapter %d: extended encapsulation changed while the adapter is enabled", ri, p);
++            }
++            if ((v & 1) && r->ver < 2) {
++                violation(s, "router %d adapter %d: extended encapsulation on a router before USB4 v2", ri, p);
++            }
++            pt[off] = v & 1;
++            return;
++        }
 +        if (off == CAP_ADAP_OFF) {
 +            pt[off] = (old & 0x7FFFFFFFu) | (v & 0x80000000u);
 +            if (!(old & 0x80000000u) && (v & 0x80000000u)) {
@@ -5547,7 +5684,11 @@ index 0000000..40ab9f6
 +            violation(s, "config packet too short");
 +            return;
 +        }
-+        if (s->mode != M_USB4) {
++        if (s->mode == M_LEGACY && !s->apple) {
++            violation(s, "control packet to a Thunderbolt controller the BIOS runs");
++            return;
++        }
++        if (!swcm(s)) {
 +            /* the firmware lets the driver read the host router only */
 +            if (d[1] != 0 || type == P_WRITE || !s->icm_ready) {
 +                if (!s->icm_ready) {
@@ -5581,7 +5722,7 @@ index 0000000..40ab9f6
 +    case P_NOTIFY_ACK:
 +        break;
 +    case P_ICM_CMD:
-+        if (s->mode == M_USB4) {
++        if (swcm(s)) {
 +            violation(s, "firmware request to a host without firmware connection manager");
 +            return;
 +        }
@@ -5653,6 +5794,7 @@ index 0000000..40ab9f6
 +
 +    lane_state(pr, l0, 2);
 +    lane_state(pr, l0 + 1, 2);
++    gen4_link(s, c);
 +    if (pr->usb4) {
 +        if (s->r[c].usb4) {
 +            pr->port[l0][CAP_USB4_OFF + 0x12] &= ~0x200u;
@@ -5660,7 +5802,12 @@ index 0000000..40ab9f6
 +            pr->port[l0][CAP_USB4_OFF + 0x12] |= 0x200u;       /* Thunderbolt 3 compatible mode */
 +        }
 +    }
-+    if (s->mode == M_USB4) {
++    if (swcm(s)) {
++        if (!pr->usb4 && (c == 1 || pr->enumerated) && (pr->sw[SW_PE_VSE + 1] & 0x78)) {
++            violation(s, "router %d: device plugged in, but its plug events are off (Thunderbolt plug events "
++                      "capability)", c - 1);
++            return;
++        }
 +        if ((c == 1 || pr->enumerated) && !(pr->port[l0][5] & 0x80000000u)) {
 +            send_plug(s, pr->route, l0, false);
 +            send_plug(s, pr->route, l0 + 1, false);
@@ -5749,7 +5896,7 @@ index 0000000..40ab9f6
 +            busy = true;
 +        }
 +    }
-+    if (s->mode != M_USB4 && s->icm_ready && s->plug[0] && !s->dev[0].reported && s->up_at[0] == 0) {
++    if (!swcm(s) && s->icm_ready && s->plug[0] && !s->dev[0].reported && s->up_at[0] == 0) {
 +        icm_connected(s, 0);
 +    }
 +    rx_flush(s);
@@ -5862,7 +6009,7 @@ index 0000000..40ab9f6
 +    switch (a) {
 +    case REG_RESET:
 +        if (v & 1) {
-+            router_init(s, 0, true);
++            router_init(s, 0, host_kind(s));
 +            lane_state(&s->r[0], 1, s->plug[0] ? 2 : 7);
 +            lane_state(&s->r[0], 2, s->plug[0] ? 2 : 7);
 +        }
@@ -5873,7 +6020,7 @@ index 0000000..40ab9f6
 +    case REG_INMAIL_CMD:
 +        if (v & 0x80000000u) {
 +            uint8_t cmd = v & 0xFF;
-+            if (s->mode == M_USB4 || (cmd != 0x23 && cmd != 0x05)) {
++            if (swcm(s) || (cmd != 0x23 && cmd != 0x05)) {
 +                violation(s, "mailbox command %02x", cmd);
 +                s->inmail_cmd = (v & ~0x80000000u) | 0x40000000u;
 +            } else {
@@ -5938,7 +6085,7 @@ index 0000000..40ab9f6
 +        return;
 +    }
 +    s->plug[i] = on;
-+    if (s->mode != M_USB4) {
++    if (!swcm(s)) {
 +        if (i == 0) {
 +            if (on) {
 +                s->up_at[0] = now_ms() + 20;
@@ -5957,7 +6104,7 @@ index 0000000..40ab9f6
 +    }
 +    if (on) {
 +        const char *k = s->kind[i] ? s->kind[i] : "usb4";
-+        router_init(s, i + 1, strcmp(k, "tb3") != 0);
++        router_init(s, i + 1, kind_of(k));
 +        s->r[i + 1].present = true;
 +        {
 +            Router *pr = &s->r[i];
@@ -5996,7 +6143,7 @@ index 0000000..40ab9f6
 +static bool get_pcie0(Object *o, Error **e)
 +{
 +    Usb4NhiState *s = USB4_NHI(o);
-+    return s->mode == M_USB4 ? pcie_up(s, 1, false) : (s->plug[0] && s->dev[0].approved);
++    return swcm(s) ? pcie_up(s, 1, false) : (s->plug[0] && s->dev[0].approved);
 +}
 +static bool get_pcie1(Object *o, Error **e) { return pcie_up(USB4_NHI(o), 2, false); }
 +static bool get_usb30(Object *o, Error **e) { return usb3_up(USB4_NHI(o), 1, false); }
@@ -6008,9 +6155,15 @@ index 0000000..40ab9f6
 +    uint32_t cs1 = r->port[r->up][CAP_PHY_OFF + 1], n = 0;
 +
 +    if (r->present) {
-+        n = (((cs1 >> 16) & 0xF) == 0x4 ? 20 : 10) * ((cs1 >> 20) & 0x3F);
++        uint32_t sp = (cs1 >> 16) & 0xF;
++        n = (sp == 0x2 ? 40 : sp == 0x4 ? 20 : 10) * ((cs1 >> 20) & 0x3F);
 +    }
 +    visit_type_uint32(v, name, &n, errp);
++}
++static bool get_ee0(Object *o, Error **e)
++{
++    Usb4NhiState *s = USB4_NHI(o);
++    return (s->r[0].port[6][CAP_ADAP_OFF + 1] & 1) && (s->r[1].port[5][CAP_ADAP_OFF + 1] & 1);
 +}
 +static bool get_approved0(Object *o, Error **e) { return USB4_NHI(o)->dev[0].approved; }
 +static bool get_clean(Object *o, Error **e) { return host_clean(USB4_NHI(o)); }
@@ -6064,6 +6217,7 @@ index 0000000..40ab9f6
 +    object_property_add_bool(obj, "usb3-0", get_usb30, NULL);
 +    object_property_add_bool(obj, "usb3-1", get_usb31, NULL);
 +    object_property_add_bool(obj, "approved0", get_approved0, NULL);
++    object_property_add_bool(obj, "ee0", get_ee0, NULL);
 +    object_property_add_bool(obj, "host-clean", get_clean, NULL);
 +    object_property_add_str(obj, "vlog", get_vlog, NULL);
 +    object_property_add_str(obj, "kind0", get_kind0, set_kind0);
@@ -6091,6 +6245,7 @@ index 0000000..40ab9f6
 +    s->inmail_cmd = s->inmail_data = 0;
 +    switch (s->mode) {
 +    case M_USB4:
++    case M_LEGACY:
 +        s->fw_sts = 0;
 +        break;
 +    case M_ICL:
@@ -6101,20 +6256,20 @@ index 0000000..40ab9f6
 +        break;
 +    }
 +    s->outmail_cmd = 3u << 8;
-+    router_init(s, 0, s->mode == M_USB4 || s->mode == M_ICL || s->mode == M_TGL);
++    router_init(s, 0, host_kind(s));
 +    s->r[1].present = s->r[2].present = false;
 +    /* devices plugged in from the start: links up, no events */
 +    if (s->plug[0]) {
-+        if (s->mode == M_USB4) {
++        if (swcm(s)) {
 +            int i;
 +            for (i = 0; i < 2 && s->plug[i]; i++) {
-+                const char *k = s->kind[i] ? s->kind[i] : "usb4";
-+                router_init(s, i + 1, strcmp(k, "tb3") != 0);
++                router_init(s, i + 1, kind_of(s->kind[i]));
 +                s->r[i + 1].present = true;
 +                s->up_at[i] = 0;
 +                lane_state(&s->r[i], i == 0 ? 1 : 3, 2);
 +                lane_state(&s->r[i], i == 0 ? 2 : 4, 2);
-+                if (!s->r[i + 1].usb4) {
++                gen4_link(s, i + 1);
++                if (!s->r[i + 1].usb4 && s->r[i].usb4) {
 +                    s->r[i].port[i == 0 ? 1 : 3][CAP_USB4_OFF + 0x12] |= 0x200u;
 +                }
 +            }
@@ -6135,7 +6290,12 @@ index 0000000..40ab9f6
 +                                       0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef };
 +
 +    if (!strcmp(m, "usb4")) {
-+        s->mode = M_USB4; id = 0x1668; cls = 0x0C0340;
++        s->mode = M_USB4; id = s->v2 ? 0x5781 : 0x1668; cls = 0x0C0340;
++        if (s->v2 && s->caps_version == 0x20) {
++            s->caps_version = 0x40;
++        }
++    } else if (!strcmp(m, "legacy")) {
++        s->mode = M_LEGACY; id = 0x1547; cls = 0x088000;
 +    } else if (!strcmp(m, "fr")) {
 +        s->mode = M_FR; id = 0x156C; cls = 0x088000;
 +    } else if (!strcmp(m, "ar")) {
@@ -6147,7 +6307,7 @@ index 0000000..40ab9f6
 +    } else if (!strcmp(m, "tgl")) {
 +        s->mode = M_TGL; id = 0x9A1B; cls = 0x0C0340;
 +    } else {
-+        error_setg(errp, "usb4-nhi: mode is usb4, fr, ar, tr, icl or tgl");
++        error_setg(errp, "usb4-nhi: mode is usb4, legacy, fr, ar, tr, icl or tgl");
 +        return;
 +    }
 +    if (s->device_id == 0) {
@@ -6156,6 +6316,10 @@ index 0000000..40ab9f6
 +    pci_config_set_vendor_id(pd->config, s->mode == M_USB4 && s->device_id == 0x1668 ? 0x1022 : 0x8086);
 +    pci_config_set_device_id(pd->config, s->device_id);
 +    pci_config_set_class(pd->config, cls >> 8);
++    if (s->mode == M_LEGACY && s->apple) {
++        pci_set_word(pd->config + PCI_SUBSYSTEM_VENDOR_ID, 0x2222);
++        pci_set_word(pd->config + PCI_SUBSYSTEM_ID, 0x1111);
++    }
 +    pd->config[PCI_CLASS_PROG] = cls & 0xFF;
 +    pd->config[PCI_INTERRUPT_PIN] = 1;
 +    pci_set_long(pd->wmask + 0xE0, 0xFFFFFFFFu);
@@ -6174,6 +6338,8 @@ index 0000000..40ab9f6
 +    DEFINE_PROP_UINT8("security", Usb4NhiState, security, 1),
 +    DEFINE_PROP_UINT16("device-id", Usb4NhiState, device_id, 0),
 +    DEFINE_PROP_UINT32("caps-version", Usb4NhiState, caps_version, 0x20),
++    DEFINE_PROP_BOOL("v2", Usb4NhiState, v2, false),
++    DEFINE_PROP_BOOL("apple", Usb4NhiState, apple, true),
 +    DEFINE_PROP_END_OF_LIST(),
 +};
 +

@@ -60,7 +60,7 @@ typedef struct _PTP_STATE {
     HID_PTP_LAYOUT L;
     PTP_CONTACT C[PTP_MAX_CONTACTS];
     UCHAR   Tap, ScrollMode, ButtonDown, ClickButtons, TapButtons, LastButtons, TapPossible, TapMax;
-    UCHAR   Flags, EdgeScroll, Accel, Edge, PhysButtons, Pad2[3];
+    UCHAR   Flags, EdgeScroll, Accel, Edge, PhysButtons, Swipe, SwDone, Pad2;
     ULONG   Speed, ScrollSpeed;
     LONG    MinX, MaxX, MinY, MaxY;
     LONG    RangeX, RangeY;
@@ -71,6 +71,7 @@ typedef struct _PTP_STATE {
     LONG    PrevCx, PrevCy, AccX, AccY;
     ULONG   TapStart, TapUntil;
     LONG    TapX0, TapY0, TapMove;
+    LONG    SwX0, SwY0;                 /* where a three finger swipe started */
     PTP_OUT Out;
     void   *Ctx;
 } PTP_STATE;

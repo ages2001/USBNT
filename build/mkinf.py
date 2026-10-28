@@ -24,7 +24,7 @@ import os, re, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, '..', 'src')
 OUT = os.path.join(HERE, 'out', '2kxp')
-VER = '06/01/1999,1.1.0.0'
+VER = '06/01/1999,1.2.0.0'
 os.makedirs(OUT, exist_ok=True)
 
 lpss = re.findall(r'\{ 0x([0-9a-f]{4}),', open(os.path.join(SRC, 'lpssids.h')).read())
@@ -35,11 +35,20 @@ tbt_src = open(os.path.join(SRC, 'tbt.c')).read()
 gen = tbt_src[tbt_src.index('static UCHAR Generation(USHORT Id)'):]
 gen = gen[:gen.index('default:')]
 tbt = re.findall(r'case 0x([0-9A-F]{4}):', gen)
+# host interfaces that share their device id with their own PCIe bridges: named with the class (0880)
+shared = re.findall(r'0x([0-9A-F]{4})', tbt_src[tbt_src.index('SharedIds[] = {'):].split('}')[0])
+# the names of the controllers (ChipName in tbt.c)
+chip = {}
+cn = tbt_src[tbt_src.index('static const char *ChipName('):]
+cn = cn[:cn.index('default:')]
+for ids, name in re.findall(r'((?:case 0x[0-9A-F]{4}: )+)return "([^"]+)";', cn):
+    for d in re.findall(r'0x([0-9A-F]{4})', ids):
+        chip[d] = name
 
 
 models = [('xhci', 'PCI\\CC_0C0330'), ('usb4', 'PCI\\CC_0C0340'), ('usbhc', 'PCI\\CC_0C03')]
 for d in tbt:
-    models.append(('tbt', 'PCI\\VEN_8086&DEV_%s' % d))
+    models.append(('tbt_' + d, 'PCI\\VEN_8086&DEV_%s%s' % (d, '&CC_0880' if d in shared else '')))
 models.append(('sdhci', 'PCI\\CC_080501'))
 models.append(('sdhci', 'PCI\\CC_080500'))
 for d in rtsx:
@@ -54,10 +63,10 @@ models.append(('node', 'USBNT\\DEVICE'))
 models.append(('bus', 'USBNT\\Bus'))
 
 DESC = {
-    'xhci': 'USBNT USB 3.x eXtensible Host Controller',
-    'usbhc': 'USBNT USB Host Controller',
-    'usb4': 'USBNT USB4 Host Router',
-    'tbt': 'USBNT Thunderbolt 3 / 4 Host Router',
+    'xhci': 'USBNT USB 3.x eXtensible Host Controller (xHCI)',
+    'usbhc': 'USBNT USB 1.1 / 2.0 Host Controller (UHCI, OHCI, EHCI)',
+    'usb4': 'USBNT USB4 / Thunderbolt 4 / Thunderbolt 5 Host Router',
+    'tbt': 'USBNT Thunderbolt Host Router',
     'sdhci': 'USBNT SD Card Reader (SDHCI)',
     'rtsx': 'USBNT SD Card Reader (Realtek PCIe)',
     'i2c': 'USBNT HID over I2C Controller (touch pad, touch screen)',
@@ -111,6 +120,8 @@ body += SERVICE
 body += '[Strings]\nUSBNT = "USBNT"\nDisk = "USBNT disk"\nSvcDesc = "USBNT USB driver"\n'
 for k, d in DESC.items():
     body += '%s.Desc = "%s"\n' % (k, d)
+for d in tbt:
+    body += 'tbt_%s.Desc = "USBNT %s Host Router"\n' % (d, chip.get(d, 'Thunderbolt'))
 wr('usbnt.inf', body)
 
 for name, cls, guid, hwid, desc, extra in (
@@ -137,7 +148,8 @@ OEM = os.path.join(HERE, 'out', 'oem')
 os.makedirs(OEM, exist_ok=True)
 KBD_GUID = '{4D36E96B-E325-11CE-BFC1-08002BE10318}'
 MOU_GUID = '{4D36E96F-E325-11CE-BFC1-08002BE10318}'
-new_ids = ['PCI\\CC_0C0330', 'PCI\\CC_0C0340'] + ['PCI\\VEN_8086&DEV_%s' % d for d in tbt] + \
+new_ids = ['PCI\\CC_0C0330', 'PCI\\CC_0C0340'] + \
+          ['PCI\\VEN_8086&DEV_%s%s' % (d, '&CC_0880' if d in shared else '') for d in tbt] + \
           ['PCI\\CC_080501', 'PCI\\CC_080500'] + ['PCI\\VEN_10EC&DEV_%s' % d for d in rtsx]
 # (UHCI / OHCI / EHCI: by the class code id usbnt.inf names them with - see above)
 old_ids = ['PCI\\CC_0C03']

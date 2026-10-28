@@ -7,8 +7,11 @@ QEMU's tp-ps2pad takes the place of the PS/2 mouse; usbinst disables
 i8042prt (boot 1), usbnt.sys finds the touch pad and runs it in its native
 mode (boot 2), wheeltst.exe (/center) logs what reaches its window into
 C:\\WHEEL.LOG.  Checked: a tap clicks in the window; the pointer moves (out of
-the window to the left: a tap there does not reach it; back: it does); two
-fingers down the pad turn into WM_MOUSEWHEEL for the window.
+the window to the left: a tap there does not reach it; back: it does); a double
+tap is a double click; two fingers down the pad turn into WM_MOUSEWHEEL for the
+window, two fingers to the left into WM_HSCROLL right (usbmon); a two finger tap
+is a right click; three fingers swiped right / left are back / forward (usbmon:
+Alt+Left / Alt+Right).
 Work image: $NTPAD_WORK (default <image dir>/wt-ps2-pad.raw, deleted at the end).
 """
 import json, os, socket, sys, time
@@ -45,6 +48,14 @@ class Qmp:
 
     def tap(self):
         self.touch('500:500', 0.05)
+        self.touch('', 0.8)
+
+    def double_tap(self):
+        # two quick taps, the second a little off the first (a finger's jitter)
+        self.touch('500:500', 0.05)
+        self.touch('', 0.12)
+        self.touch('505:503', 0.03)
+        self.touch('508:505', 0.03)
         self.touch('', 0.8)
 
 
@@ -84,7 +95,7 @@ def main():
     v.quit()
     print('boot 1 (install):', 'done' if ok1 else 'TIMEOUT')
     # boot 2
-    bat = ['@echo off', 'C:\\USBNT\\FSTEST.EXE sleep 5000', 'start C:\\USBNT\\WHEELTST.EXE /center',
+    bat = ['@echo off', 'start C:\\USBNT\\USBMON.EXE', 'C:\\USBNT\\FSTEST.EXE sleep 5000', 'start C:\\USBNT\\WHEELTST.EXE /center',
            'start C:\\USBNT\\FSTEST.EXE front Wheel_test 20000', 'C:\\USBNT\\FSTEST.EXE sleep 80000', '']
     p = os.path.join(vm.OUT, 'pad-run.bat')
     open(p, 'w').write('\r\n'.join(bat))
@@ -99,6 +110,15 @@ def main():
         v.key('ret', 2)
         v.wait_serial('##AGENT-START##', 120)
     time.sleep(16)                                  # wheeltst starts, comes to the front
+    # NT 4.0's "a service failed" box (no network here) may come up over wheeltst: ENTER closes it
+    from ntmouse import scm_box, parse
+    t0 = time.time()
+    while time.time() - t0 < 25:
+        if scm_box(v.shot('scm')):
+            v.key('ret', 2)
+            print('closed the "service failed" box')
+            break
+        time.sleep(2)
     v.shot('pad0')
     q.tap()                                         # 1: in the window (the pointer starts in the middle)
     for i in range(12):                             # far to the left: off the window
@@ -110,8 +130,22 @@ def main():
     q.touch('', 0.5)
     v.shot('pad1')
     q.tap()                                         # 3: in the window again
+    q.double_tap()                                  # a double click in the window
     for i in range(14):                             # two fingers down the pad: wheel up
         q.touch('400:%d 600:%d' % (200 + i * 40, 200 + i * 40))
+    q.touch('', 1.0)
+    for i in range(14):                             # two fingers to the left: WM_HSCROLL right (usbmon)
+        q.touch('%d:400 %d:600' % (800 - i * 40, 800 - i * 40))
+    q.touch('', 1.0)
+    q.touch('450:500 550:500', 0.05)                # two finger tap: right click
+    q.touch('', 1.0)
+    for i in range(10):                             # three fingers to the right: back
+        x = 200 + i * 50
+        q.touch('%d:300 %d:500 %d:700' % (x, x, x))
+    q.touch('', 1.0)
+    for i in range(10):                             # three fingers to the left: forward
+        x = 700 - i * 50
+        q.touch('%d:300 %d:500 %d:700' % (x, x, x))
     q.touch('', 1.0)
     v.shot('pad2')
     done = v.wait_serial('##AGENT-SHUTDOWN##', 150)
@@ -126,10 +160,16 @@ def main():
     print('\n'.join(l for l in ulog.splitlines() if 'ps2' in l))
     lb = log.count('LBUTTONDOWN')
     wheel = [int(l.split()[1]) for l in log.splitlines() if l.startswith('MOUSEWHEEL')]
+    c = parse(log)
     checks = [
         ('touch pad in its native mode', 'in its native mode' in ulog),
-        ('taps 1 and 3 reached the window, 2 (pointer moved off it) did not: %d' % lb, lb == 2),
+        ('taps 1, 3 and the double tap reached the window, 2 (pointer moved off it) did not: %d' % lb, lb == 3),
+        ('double tap = double click', 'LBUTTONDBLCLK' in log),
         ('two finger scroll: WM_MOUSEWHEEL up %s' % wheel, len(wheel) >= 3 and all(w > 0 for w in wheel)),
+        ('two fingers sideways: WM_HSCROLL right %d, left %d' % (c['hright'], c['hleft']), c['hright'] > 0 and c['hleft'] == 0),
+        ('two finger tap: right click (%d)' % c['rbutton'], c['rbutton'] == 1),
+        ('three fingers right / left: back / forward (Alt+Left %d, Alt+Right %d)' % (c['alt-left'], c['alt-right']),
+         c['alt-left'] == 1 and c['alt-right'] == 1),
     ]
     ok = done and bool(log)
     for name, good in checks:

@@ -152,14 +152,19 @@ static int CmdRead(UCHAR c)
     return -1;
 }
 
-/* byte to a device, wait for its ACK (resend up to 3 times) */
+/* byte to a device, wait for its ACK (resend up to 3 times).  Bytes that are neither ACK nor
+   resend - the late AA 00 of a slow reset, a packet that was under way - are skipped, as
+   Linux' libps2 does; the device must answer within 25 ms, slow ones get 100 */
 static BOOLEAN Send(BOOLEAN aux, UCHAR b)
 {
-    int r, tries;
+    int r, tries, n;
     for (tries = 0; tries < 3; tries++) {
         if (aux && !Cmd(0xD4)) return FALSE;
         if (!Data(b)) return FALSE;
-        r = Read(aux, 30);
+        for (n = 0; n < 8; n++) {
+            r = Read(aux, 100);
+            if (r < 0 || r == 0xFA || r == 0xFE || r == 0xFC) break;
+        }
         if (r == 0xFA) return TRUE;
         if (r != 0xFE) return FALSE;
     }
@@ -174,7 +179,7 @@ static BOOLEAN SetRate(UCHAR rate)
 static int MouseId(void)
 {
     if (!Send(TRUE, 0xF2)) return -1;
-    return Read(TRUE, 30);
+    return Read(TRUE, 100);
 }
 
 /* ------------------------------------------------------------------ */
@@ -187,7 +192,7 @@ static BOOLEAN KbdInit(void)
         /* some keyboards (and KVMs) do not ACK a reset: try to talk to it anyway */
         if (!Send(FALSE, 0xF5)) return FALSE;
     } else {
-        r = Read(FALSE, 800);                             /* basic assurance test */
+        r = Read(FALSE, 2500);                            /* basic assurance test */
         if (r != 0xAA) UsbLog(LOG_INFO, "ps2: keyboard self test %x\n", r);
     }
     Send(FALSE, 0xED); Send(FALSE, Ps.Leds);
@@ -215,17 +220,19 @@ static void PadOut(void *Ctx, UCHAR Buttons, LONG Dx, LONG Dy, SHORT Wheel, SHOR
     }
 }
 
+/* the self test of a reset takes 300 - 900 ms, on some trackpoints and touch pads over 1 s */
 static BOOLEAN MouseReset(void)
 {
     int r;
     if (!Send(TRUE, 0xFF)) return FALSE;
-    r = Read(TRUE, 800);
-    if (r == 0xAA) (void)Read(TRUE, 100);                 /* device id 00 */
+    r = Read(TRUE, 2500);
+    if (r == 0xAA) (void)Read(TRUE, 200);                 /* device id 00 */
     return TRUE;
 }
 
 static BOOLEAN MouseInit(void)
 {
+    int tries, id = 0;
     if (!MouseReset()) return FALSE;
     Ps.Native = 0;
     /* a touch pad with an SMBus side (Synaptics InterTouch, Elan) may go to SMBus */
@@ -249,11 +256,19 @@ static BOOLEAN MouseInit(void)
     }
     Send(TRUE, 0xF6);                                     /* defaults */
     Ps.MouseId = 0;
-    /* IntelliMouse knock: 200, 100, 80 -> id 3 */
-    if (SetRate(200) && SetRate(100) && SetRate(80) && MouseId() == 3) {
-        Ps.MouseId = 3;
-        /* IntelliMouse Explorer: 200, 200, 80 -> id 4 */
-        if (SetRate(200) && SetRate(200) && SetRate(80) && MouseId() == 4) Ps.MouseId = 4;
+    /* IntelliMouse knock: 200, 100, 80 -> id 3; IntelliMouse Explorer: 200, 200, 80 -> id 4.
+       Twice: some mice (and KVMs) miss the first knock after a reset, or after the touch pad
+       probes before it */
+    for (tries = 0; tries < 2 && !Ps.MouseId; tries++) {
+        if (tries) {
+            UsbLog(LOG_INFO, "ps2: mouse id %d after the wheel knock, once more\n", id);
+            Send(TRUE, 0xF6);
+        }
+        id = (SetRate(200) && SetRate(100) && SetRate(80)) ? MouseId() : -1;
+        if (id == 3 || id == 4) {
+            Ps.MouseId = 3;
+            if (SetRate(200) && SetRate(200) && SetRate(80) && MouseId() == 4) Ps.MouseId = 4;
+        }
     }
     SetRate(100);
     Send(TRUE, 0xE8); Send(TRUE, 0x02);                   /* 4 counts/mm */
@@ -268,11 +283,9 @@ static BOOLEAN MouseInit(void)
 static void KbdByte(UCHAR b)
 {
     USB_KEY_EVENT e;
-    if (b == 0xFA || b == 0xFE || b == 0x00 || b == 0xFF) return;   /* ACK, resend, overrun */
-    if (b == 0xAA && !Ps.KeyPrefix) {
-        /* keyboard re-plugged or reset itself: restore LEDs (best effort, async) */
-        return;
-    }
+    /* ACK, resend, overrun.  (0xAA is not dropped: in set 1 it is the break code of the left
+       shift key - a keyboard's self test result looks the same, i8042prt passes it on too) */
+    if (b == 0xFA || b == 0xFE || b == 0x00 || b == 0xFF) return;
     if (b == 0xE0 || b == 0xE1) { Ps.KeyPrefix = b; return; }
     e.MakeCode = (USHORT)(b & 0x7F);
     e.Flags = (USHORT)((b & 0x80) ? UKEY_BREAK : UKEY_MAKE);
@@ -308,16 +321,36 @@ static void MouseByte(UCHAR b)
     Ps.Pkt[Ps.PktLen++] = b;
     if (Ps.PktLen < need) return;
     Ps.PktLen = 0;
-    if (Ps.Pkt[0] & 0xC0) return;                          /* overflow: drop the packet */
     dx = Ps.Pkt[1] - ((Ps.Pkt[0] & 0x10) ? 256 : 0);
     dy = Ps.Pkt[2] - ((Ps.Pkt[0] & 0x20) ? 256 : 0);
+    /* an overflowed axis has no usable motion, but the buttons of the packet count (a click in
+       it would be lost - one of a double click, or its release) */
+    if (Ps.Pkt[0] & 0x40) dx = 0;
+    if (Ps.Pkt[0] & 0x80) dy = 0;
     RtlZeroMemory(&e, sizeof(e));
     e.X = dx;
     e.Y = -dy;                                             /* PS/2: up is positive */
     n = (UCHAR)(Ps.Pkt[0] & 0x07);
     if (Ps.MouseId == 4) {
-        n |= (UCHAR)((Ps.Pkt[3] & 0x30) >> 1);             /* buttons 4, 5 -> bits 3, 4 */
-        e.Wheel = (SHORT)(-((Ps.Pkt[3] & 0x08) ? (LONG)(Ps.Pkt[3] & 0x0F) - 16 : (LONG)(Ps.Pkt[3] & 0x0F)));
+        /* IntelliMouse Explorer.  Bits 7..6 = 10 / 01: an IntelliMouse Explorer 4.0 (and
+           tilt wheel mice) report a 6-bit vertical / horizontal wheel value and no buttons 4 / 5
+           in this byte - read as the classic format these turned into presses of back and
+           forward (as Linux' psmouse does) */
+        UCHAR b3 = Ps.Pkt[3];
+        switch (b3 & 0xC0) {
+        case 0x80:
+            n |= (UCHAR)(Ps.Buttons & 0x18);
+            e.Wheel = (SHORT)((LONG)(b3 & 32) - (LONG)(b3 & 31));
+            break;
+        case 0x40:
+            n |= (UCHAR)(Ps.Buttons & 0x18);
+            e.Pan = (SHORT)((LONG)(b3 & 32) - (LONG)(b3 & 31));
+            break;
+        default:
+            n |= (UCHAR)((b3 & 0x30) >> 1);                /* buttons 4, 5 -> bits 3, 4 */
+            e.Wheel = (SHORT)(-((b3 & 0x08) ? (LONG)(b3 & 0x0F) - 16 : (LONG)(b3 & 0x0F)));
+            break;
+        }
     } else if (Ps.MouseId == 3) {
         e.Wheel = (SHORT)(-(LONG)(signed char)Ps.Pkt[3]);
     }

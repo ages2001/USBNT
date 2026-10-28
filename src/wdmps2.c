@@ -121,13 +121,16 @@ static int AuxRead(void *Ctx, ULONG Ms)
 
 static BOOLEAN AuxSend(void *Ctx, UCHAR B)
 {
-    int r, t;
+    int r = -1, t, n;
     for (t = 0; t < 3; t++) {
         if (!WaitIn()) return FALSE;
         WRITE_PORT_UCHAR((PUCHAR)0x64, 0xD4);
         if (!WaitIn()) return FALSE;
         WRITE_PORT_UCHAR((PUCHAR)0x60, B);
-        r = AuxRead(Ctx, 30);
+        for (n = 0; n < 8; n++) {                       /* stray bytes (a late AA 00, a packet) skipped */
+            r = AuxRead(Ctx, 100);
+            if (r < 0 || r == 0xFA || r == 0xFE || r == 0xFC) break;
+        }
         if (r == 0xFA) return TRUE;
         if (r != 0xFE) return FALSE;
     }
@@ -141,7 +144,7 @@ static BOOLEAN Rate(UCHAR R) { return (BOOLEAN)(AuxSend(NULL, 0xF3) && AuxSend(N
 static int GetId(void)
 {
     if (!AuxSend(NULL, 0xF2)) return -1;
-    return AuxRead(NULL, 30);
+    return AuxRead(NULL, 100);
 }
 
 static void Out(void *Ctx, UCHAR Buttons, LONG Dx, LONG Dy, SHORT Wheel, SHORT Pan);
@@ -160,17 +163,17 @@ static BOOLEAN NTAPI Detect(PVOID Ctx)
     F->Id = (UCHAR)(id == 3 || id == 4 ? id : 0);
     F->Rate = 100;
     F->Res = 3;
-    if (AuxSend(NULL, 0xE9) && (r = AuxRead(NULL, 30)) >= 0) {
+    if (AuxSend(NULL, 0xE9) && (r = AuxRead(NULL, 100)) >= 0) {
         st[0] = (UCHAR)r;
-        st[1] = (UCHAR)AuxRead(NULL, 30);
-        st[2] = (UCHAR)AuxRead(NULL, 30);
+        st[1] = (UCHAR)AuxRead(NULL, 100);
+        st[2] = (UCHAR)AuxRead(NULL, 100);
         if (st[1] <= 3) F->Res = st[1];
         if (st[2] >= 10 && st[2] <= 200) F->Rate = st[2];
     }
     F->Result = PS2PAD_NONE;
     if (AuxSend(NULL, 0xFF)) {
-        r = AuxRead(NULL, 800);
-        if (r == 0xAA) (void)AuxRead(NULL, 100);
+        r = AuxRead(NULL, 2500);                      /* self test: up to 2.5 s (slow trackpoints, pads) */
+        if (r == 0xAA) (void)AuxRead(NULL, 200);
         F->Result = Ps2PadDetect(&F->Pad, &Io, Out, NULL);
     }
     if (F->Result != PS2PAD_NONE && AuxSend(NULL, 0xF4)) {
@@ -184,8 +187,8 @@ static BOOLEAN NTAPI Detect(PVOID Ctx)
     F->Result = PS2PAD_NONE;
     AuxSend(NULL, 0xF6);
     if (AuxSend(NULL, 0xFF)) {
-        r = AuxRead(NULL, 800);
-        if (r == 0xAA) (void)AuxRead(NULL, 100);
+        r = AuxRead(NULL, 2500);                      /* self test: up to 2.5 s (slow trackpoints, pads) */
+        if (r == 0xAA) (void)AuxRead(NULL, 200);
     }
     if (F->Id >= 3) {
         if (Rate(200) && Rate(100) && Rate(80) && GetId() == 3 && F->Id == 4) {
@@ -211,8 +214,11 @@ static void Out(void *Ctx, UCHAR Buttons, LONG Dx, LONG Dy, SHORT Wheel, SHORT P
     if (!Ps2PadEvent(&F->Prev, Buttons, Dx, Dy, Wheel, Pan, &e) || F->Upper.ClassService == NULL) {
         return;
     }
+    if (Pan != 0) {
+        OsMousePan(Pan);                                /* 2000 / XP have no horizontal wheel: usbmon, WM_HSCROLL */
+    }
     if (e.ButtonFlags == 0 && Dx == 0 && Dy == 0) {
-        return;                                         /* horizontal only: 2000 / XP have no horizontal wheel */
+        return;
     }
     RtlZeroMemory(&d, sizeof(d));
     d.Flags = MOUSE_MOVE_RELATIVE;

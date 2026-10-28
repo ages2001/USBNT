@@ -6,7 +6,7 @@
 # for nLite and the like).
 set -e
 cd "$(dirname "$0")"
-VER=1.1
+VER=1.2
 bash ntbuild.sh
 bash tlbuild.sh
 bash wdmbuild.sh

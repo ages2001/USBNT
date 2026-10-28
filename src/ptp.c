@@ -7,7 +7,8 @@
  * (vertical wheel and horizontal pan), a finger along the right edge (or the
  * bottom edge) scrolls on pads without a finger count, the pad button clicks
  * (with two fingers on the pad, or in the bottom right corner of a ClickPad:
- * right button), taps click (one finger left, two right, three middle).
+ * right button), taps click (one finger left, two right, three middle), three
+ * fingers swiped right / left are back / forward (buttons 4 / 5).
  *
  * Reports may carry all contacts at once ("parallel") or a few per report
  * ("hybrid": the contact count is only in the first report of a frame);
@@ -21,12 +22,13 @@
  *   TouchpadSpeed       pointer speed in percent (100)
  *   TouchpadAccel       1 = pointer acceleration (default), 0 = linear
  *   TouchpadScrollSpeed scrolling speed in percent (100)
+ *   TouchpadSwipe       1 = three finger swipes are back / forward (default), 0 = off
  */
 
 #include "usbinput.h"
 #include "ptp.h"
 
-#define TAP_MS          180
+#define TAP_MS          200
 #define CLICK_MS        40
 
 static void Settings(PTP_STATE *S)
@@ -42,6 +44,7 @@ static void Settings(PTP_STATE *S)
         S->ScrollSpeed = 100;
     }
     S->Accel = (UCHAR)OsGetConfig("TouchpadAccel", 1);
+    S->Swipe = (UCHAR)OsGetConfig("TouchpadSwipe", 1);
     S->EdgeScroll = (UCHAR)OsGetConfig("TouchpadEdgeScroll", 2);
     if (S->EdgeScroll == 2) {
         S->EdgeScroll = (UCHAR)((S->Flags & PTP_PAD_ONEFINGER) != 0);
@@ -257,6 +260,25 @@ static void Frame(PTP_STATE *S, void *Mouse, ULONG Now)
         S->PrevCx = cx;
         S->PrevCy = cy;
     }
+    /* three fingers swiped sideways: right = back (button 4), left = forward (button 5), once
+       per touch; a click of the button like a tap's */
+    if (n == 3 && S->Swipe) {
+        LONG cx = (f[0]->X + f[1]->X + f[2]->X) / 3, cy = (f[0]->Y + f[1]->Y + f[2]->Y) / 3;
+        if (S->PrevN != 3) {
+            S->SwX0 = cx;
+            S->SwY0 = cy;
+            S->SwDone = 0;
+        } else if (!S->SwDone) {
+            LONG mx = cx - S->SwX0, my = cy - S->SwY0;
+            LONG ax = mx < 0 ? -mx : mx, ay = my < 0 ? -my : my;
+            if (ax > S->RangeX / 5 && ax > 2 * ay) {
+                S->SwDone = 1;
+                S->TapPossible = 0;
+                S->TapButtons = (UCHAR)(mx > 0 ? 0x08 : 0x10);
+                S->TapUntil = Now + CLICK_MS;
+            }
+        }
+    }
     /* taps */
     if (n > 0 && S->PrevN == 0) {
         S->TapStart = Now;
@@ -282,6 +304,13 @@ static void Frame(PTP_STATE *S, void *Mouse, ULONG Now)
     }
     if (n == 0) {
         S->TapPossible = S->TapPossible && Now - S->TapStart <= TAP_MS;
+    }
+    /* a finger that may still be a tap does not move the pointer: the jitter of a
+       tap moved it a few pixels, and the second tap of a double tap then fell outside
+       Windows' double click rectangle (two clicks instead of a double click) */
+    if (n == 1 && S->Tap && S->TapPossible && Now - S->TapStart <= TAP_MS && S->TapMove < S->RangeX / 30) {
+        dx = dy = 0;
+        S->RemX = S->RemY = 0;
     }
     if (dx || dy || wheel || pan || (UCHAR)(S->ClickButtons | S->TapButtons | S->PhysButtons) != S->LastButtons) {
         Emit(S, Mouse, dx, dy, wheel, pan);

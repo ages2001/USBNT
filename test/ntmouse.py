@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Back / forward buttons and autoscroll in an NT 3.1 or NT 4.0 guest.
 
-  ntmouse.py [HC] [--nt4] [--nohook]
+  ntmouse.py [HC] [--nt4] [--nohook] [--bat MS]
 
 usbnt.sys drives a PS/2 mouse (IntelliMouse Explorer: buttons 4 / 5) and a
 USB mouse (QEMU's usb-mouse has five buttons); usbmon runs, wheeltst.exe
@@ -17,6 +17,14 @@ USB mouse (QEMU's usb-mouse has five buttons); usbmon runs, wheeltst.exe
   - holding the middle button of the USB mouse and dragging up scrolls up,
     releasing it ends autoscroll
   - afterwards a left click reaches the window again (nothing is held back)
+  - button 5 of the PS/2 mouse arrives as Alt+Right too; the PS/2 wheel turned
+    up twice then down three times scrolls up, then down (NT 4.0:
+    WM_MOUSEWHEEL, NT 3.x: WM_VSCROLL); tilted right twice (IntelliMouse
+    Explorer 4.0 packets) it scrolls right (usbmon: WM_HSCROLL) and presses no
+    back / forward button
+
+--bat MS: the PS/2 mouse's reset self test takes MS ms (QEMU ps2-mouse bat-delay,
+test/qemu/ps2-mouse-bat.patch): it must still be found as an IntelliMouse Explorer.
 
 NT 3.1 and --nohook: autoscroll through the driver (the middle button goes
 to usbmon); NT 4.0 (SP6) without --nohook: through the low level mouse hook.
@@ -137,6 +145,7 @@ def main():
     hc = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith('-') else 'xhci'
     nt4 = '--nt4' in sys.argv
     nohook = '--nohook' in sys.argv
+    batms = sys.argv[sys.argv.index('--bat') + 1] if '--bat' in sys.argv else None
     if nt4:
         os.environ.setdefault('AUDIONT_IMG', '/home/claude/nt4')
     # PS/2 events go to the unbound PS/2 mouse, the USB mouse is bound to the second head
@@ -156,6 +165,8 @@ def main():
     qmp_path = os.path.join(vm.OUT, 'qmp.sock')
     usb = ['-device', '%s,id=hc' % HC[hc], '-device', 'usb-mouse,bus=hc.0,display=vga1,id=m1',
            '-qmp', 'unix:%s,server,nowait' % qmp_path, '-serial', 'file:' + com2]
+    if batms:
+        usb += ['-global', 'ps2-mouse.bat-delay=%s' % batms]
     # boot 1: the installer disables i8042prt, usbnt drives the PS/2 keyboard and mouse
     pre = ['@echo off', 'C:\\USBNT\\USBINST.EXE /install /nogroup /nomon /set DebugPort=0x2f8 /set DebugLevel=3', '']
     p = os.path.join(vm.OUT, 'mouse-pre.bat')
@@ -223,6 +234,8 @@ def main():
     q.click(PS2, 'side')                            # back
     time.sleep(0.5)
     q.click(USB, 'extra')                           # forward
+    time.sleep(0.5)
+    q.click(PS2, 'extra')                           # forward on the PS/2 mouse
     time.sleep(0.8)
     # autoscroll with a click of the PS/2 wheel button
     q.click(PS2, 'middle')
@@ -252,6 +265,11 @@ def main():
     time.sleep(0.5)
     q.click(USB, 'right')
     time.sleep(1)
+    # the PS/2 wheel: two notches up, three down
+    for b in ('wheel-up', 'wheel-up', 'wheel-down', 'wheel-down', 'wheel-down', 'wheel-right', 'wheel-right'):
+        q.click(PS2, b)
+        time.sleep(0.4)
+    time.sleep(1)
     v.shot('mouse4')
     done = v.wait_serial('##AGENT-SHUTDOWN##', 240)
     time.sleep(8)
@@ -264,12 +282,19 @@ def main():
     ulog = open(com2, 'rb').read().decode('latin1') if os.path.exists(com2) else ''
     print('\n'.join(l for l in ulog.splitlines() if 'ps2' in l or 'mouse' in l))
     c = parse(log)
+    # the PS/2 wheel part: what came after the last right click
+    tail = log[log.rfind('RBUTTONDOWN'):] if 'RBUTTONDOWN' in log else ''
+    wl = [l.split() for l in tail.splitlines()]
+    seq = [('up' if int(w[1]) > 0 else 'down') for w in wl if len(w) > 1 and w[0] == 'MOUSEWHEEL'] if nt4 else \
+          [('up' if w[1] == '0' else 'down') for w in wl if len(w) > 1 and w[0] == 'VSCROLL' and w[1] in ('0', '1')]
+    hright = sum(1 for w in wl if len(w) > 1 and w[0] == 'HSCROLL' and w[1] == '1')
+    hleft = sum(1 for w in wl if len(w) > 1 and w[0] == 'HSCROLL' and w[1] == '0')
     print({k: v for k, v in c.items()})
     hook = nt4 and not nohook
     checks = [
         ('PS/2 mouse in IntelliMouse Explorer mode (id 4)', 'id 4)' in ulog),
         ('button 4 (PS/2) -> Alt+Left', c['alt-left'] == 1),
-        ('button 5 (USB) -> Alt+Right', c['alt-right'] == 1),
+        ('button 5 (USB and PS/2) -> Alt+Right', c['alt-right'] == 2),
         ('no X button messages (NT has none)', c['xbutton'] == 0),
         ('autoscroll started twice', c['starts'] == 2),
         ('scroll cursor while it runs (hot spot 16,16)', len(c['on']) == 2 and all(h == (16, 16) for h in c['on'])),
@@ -280,6 +305,9 @@ def main():
         ('middle clicks did not reach the window', c['mbutton'] == 0),
         ('the click that ended it did not reach the window; the others did', c['lbutton'] == 2),
         ('right click after autoscroll', c['rbutton'] == 1),
+        ('PS/2 wheel: up, then down %s' % seq, bool(seq) and 'up' in seq and 'down' in seq and
+         seq.index('down') > seq.index('up') and 'up' not in seq[seq.index('down'):]),
+        ('PS/2 tilt right: WM_HSCROLL right %d, left %d' % (hright, hleft), hright > 0 and hleft == 0),
         ('autoscroll through %s' % ('the mouse hook' if hook else 'the driver'),
          ('usbmon takes buttons 1' in ulog and 'usbmon takes buttons 3' not in ulog) if hook else
          'usbmon takes buttons 3' in ulog),
@@ -288,8 +316,8 @@ def main():
     for name, good in checks:
         ok &= good
         print('%s %s' % ('ok  ' if good else 'FAIL', name))
-    print('RESULT mouse %s%s%s %s' % (hc, ' nt4' if nt4 else ' nt31', ' nohook' if nohook else '',
-                                      'PASS' if ok else 'FAIL'))
+    print('RESULT mouse %s%s%s%s %s' % (hc, ' nt4' if nt4 else ' nt31', ' nohook' if nohook else '',
+                                        (' bat %s' % batms) if batms else '', 'PASS' if ok else 'FAIL'))
 
 
 if __name__ == '__main__':

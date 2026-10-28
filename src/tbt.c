@@ -1,5 +1,5 @@
 /*
- * tbt.c - Thunderbolt 3, Thunderbolt 4 and USB4 host routers.
+ * tbt.c - Thunderbolt 1 to 5 and USB4 (v1, v2) host routers.
  *
  * A Thunderbolt or USB4 controller carries PCIe, USB 3 and DisplayPort over
  * one cable.  Its host interface (NHI) is a DMA engine; ring 0 of it is the
@@ -14,11 +14,22 @@
  *    keeps and that is checked by a challenge on later connections (level
  *    "secure").  Keys are kept in the registry.
  *
- *  - Other USB4 hosts (AMD, Intel from Meteor Lake on when the firmware leaves
- *    it to the OS, and others) need the driver to be the connection manager:
- *    enumerate each router through the control channel, give it a route,
- *    program the paths (hop tables) of a PCIe tunnel and a USB 3 tunnel to it,
- *    and react to plug and unplug events.
+ *  - Other USB4 hosts (AMD, Intel Lunar Lake, Panther Lake, Wildcat Lake,
+ *    the Thunderbolt 5 controllers (Barlow Ridge, USB4 v2), Meteor Lake when
+ *    the firmware leaves it to the OS, and others) need the driver to be the
+ *    connection manager: enumerate each router through the control channel,
+ *    give it a route, program the paths (hop tables) of a PCIe tunnel and a
+ *    USB 3 tunnel to it, and react to plug and unplug events.  The same code
+ *    drives Thunderbolt 1 / 2 / 3 host routers whose firmware does not do it
+ *    (Apple Macs: Light, Cactus, Falcon, Alpine and Titan Ridge).
+ *
+ *  - Thunderbolt 5 / USB4 v2 links run at 2 x 40 Gb/s (Gen 4, bonded by the
+ *    hardware); the routers are told the connection manager knows USB4 v2
+ *    and a PCIe tunnel between two of them uses extended encapsulation.
+ *
+ *  - Thunderbolt 1 / 2 controllers of PCs (Light, Cactus, Redwood, Win
+ *    Ridge) are run by the BIOS (SMI "BIOS assist"): the driver leaves them
+ *    alone, devices show up through PCIe hot plug.
  *
  * The tunnelled PCIe link shows up at a hot plug capable PCIe port of the
  * host; what is behind it (NVMe drives, the xHCI of a dock, a card reader)
@@ -110,6 +121,8 @@
 #define CS_6_HCI        0x00040000UL
 #define CS_6_RR         0x01000000UL
 #define CS_6_CR         0x02000000UL
+#define CS_4_CMUV_V1    0x10            /* connection manager USB4 version (15:8) */
+#define CS_4_CMUV_V2    0x20
 
 /* adapter types */
 #define PT_LANE         0x000001UL
@@ -136,6 +149,7 @@
 #define PORT_CS_19      0x13
 #define PORT_CS_19_PC   0x00000008UL
 #define PCIE_PE         0x80000000UL
+#define PCIE_CS_1_EE    0x00000001UL    /* ADP_PCIE_CS_1: extended encapsulation (USB4 v2) */
 #define USB3_PE         0x80000000UL
 #define USB3_V          0x40000000UL
 #define USB3_HCA        0x80000000UL
@@ -175,6 +189,8 @@
 #define GEN_TR          3               /* Titan Ridge, Maple Ridge */
 #define GEN_ICL         4               /* Ice Lake to Meteor Lake, no approval by the driver */
 #define GEN_USB4        5               /* driver is the connection manager */
+#define GEN_LEGACY      6               /* Thunderbolt 1 / 2 without firmware connection manager */
+#define GEN_USBONLY     7               /* Alpine Ridge in USB only mode: nothing to manage */
 
 static const char *SlName[] = { "none", "user", "secure", "dponly", "usbonly", "nopcie" };
 
@@ -203,12 +219,14 @@ typedef struct _TB_ROUTER {
     UCHAR Parent;                       /* index + 1 (0: host router) */
     UCHAR ParentPort;                   /* lane adapter of the parent */
     UCHAR Depth, Up, MaxPort;
-    UCHAR Version;                      /* USB4 major version, 0 = Thunderbolt 3 */
+    UCHAR Version;                      /* USB4 major version, 0 = Thunderbolt 1 / 2 / 3 */
     BOOLEAN LinkUsb4;
     UCHAR LinkGbps, LinkLanes;          /* upstream link: per lane speed, lanes */
     ULONG Route;                        /* depth <= 4 */
     ULONG Id;
     UCHAR PcieDown, PcieUp, PcieLD, PcieLU;
+    BOOLEAN PcieEe;                     /* PCIe tunnel with extended encapsulation */
+    BOOLEAN HwBonded;                   /* Gen 4 link: bonded by the hardware, stays so */
     UCHAR Usb3Down, Usb3Up, Usb3LD, Usb3LU;
     TB_PORT P[TB_PORTS];
 } TB_ROUTER;
@@ -244,6 +262,7 @@ typedef struct _TB_DEV {
 #define HS_ICM          4
 #define HS_SW           5
 #define HS_DEAD         6
+#define HS_BIOS         7               /* the BIOS (or nobody) manages it */
 
 typedef struct _TB_HOST {
     BOOLEAN Used;
@@ -1170,12 +1189,39 @@ static ULONG FindVse(TB_HOST *h, TB_ROUTER *r, UCHAR Vsec)
 }
 
 /* Thunderbolt 3 device router: lane configured (link controller) */
+/* Thunderbolt generation of a router (1 .. 3; 4 = USB4): link controller and bonding from 2 on */
+static UCHAR RouterGen(TB_ROUTER *r)
+{
+    if (r->Version != 0) {
+        return 4;
+    }
+    if ((r->Id & 0xFFFF) == 0x8086) {
+        switch (r->Id >> 16) {
+        case 0x1513: case 0x151A: case 0x151B: case 0x1547: case 0x1548: case 0x1549: case 0x1567: case 0x1569:
+            return 1;
+        case 0x156B: case 0x156D: case 0x157E:
+            return 2;
+        }
+    }
+    return 3;
+}
+
+static const char *RouterKind(TB_ROUTER *r)
+{
+    static const char *k[] = { "", "Thunderbolt 1 router", "Thunderbolt 2 router", "Thunderbolt 3 router" };
+
+    if (r->Version >= 2) {
+        return "USB4 v2 router";
+    }
+    return r->Version ? "USB4 router" : k[RouterGen(r)];
+}
+
 static void Tb3LinkConfigured(TB_HOST *h, TB_ROUTER *r, UCHAR Port, BOOLEAN Upstream)
 {
-    ULONG lc = FindVse(h, r, VSE_LC), desc, ctl, cap;
+    ULONG lc, desc, ctl, cap;
 
-    if (lc == 0 || Rd1(h, r, SP_SWITCH, 0, lc + LC_DESC, &desc) != 0) {
-        return;
+    if (RouterGen(r) < 2 || (lc = FindVse(h, r, VSE_LC)) == 0 || Rd1(h, r, SP_SWITCH, 0, lc + LC_DESC, &desc) != 0) {
+        return;                                 /* Thunderbolt 1 has no link controller to tell */
     }
     /* descriptor: link controllers (3:0), start (15:8), size per link controller (27:16) */
     cap = lc + ((desc >> 8) & 0xFF) + ((ULONG)(Port - 1) / 2) * ((desc >> 16) & 0xFFF);
@@ -1382,11 +1428,23 @@ static void TunnelPcie(TB_HOST *h, TB_ROUTER *pr, TB_ROUTER *r)
         UsbLog(LOG_ERR, "%s: PCIe tunnel paths could not be set up\n", h->Name);
         return;
     }
+    /* USB4 v2 routers on a Gen 4 link: extended encapsulation (larger PCIe packets), both ends, before PE */
+    r->PcieEe = FALSE;
+    if (pr->Version >= 2 && r->Version >= 2 && r->LinkGbps >= 40 && OsGetConfig("TbtPcieExtEncap", 1)) {
+        if (Rd1(h, pr, SP_PORT, down, pr->P[down].CapAdap + 1, &v) == 0) {
+            Wr1(h, pr, SP_PORT, down, pr->P[down].CapAdap + 1, v | PCIE_CS_1_EE);
+        }
+        if (Rd1(h, r, SP_PORT, up, r->P[up].CapAdap + 1, &v) == 0) {
+            Wr1(h, r, SP_PORT, up, r->P[up].CapAdap + 1, v | PCIE_CS_1_EE);
+        }
+        r->PcieEe = TRUE;
+    }
     Wr1(h, r, SP_PORT, up, r->P[up].CapAdap, PCIE_PE);
     Wr1(h, pr, SP_PORT, down, pr->P[down].CapAdap, PCIE_PE);
     r->PcieDown = down;
     r->PcieUp = up;
-    UsbLog(LOG_INFO, "%s: PCIe tunnel %x:%u <-> %x:%u\n", h->Name, pr->Route, down, r->Route, up);
+    UsbLog(LOG_INFO, "%s: PCIe tunnel %x:%u <-> %x:%u%s\n", h->Name, pr->Route, down, r->Route, up,
+           r->PcieEe ? " (extended encapsulation)" : "");
 }
 
 /* lane adapter: current speed per lane (Gb/s) and width (1, 2) */
@@ -1444,7 +1502,17 @@ static void Bond(TB_HOST *h, TB_ROUTER *pr, TB_ROUTER *r)
     BOOLEAN possible = FALSE;
 
     LinkState(h, r, up, &r->LinkGbps, &r->LinkLanes);
-    if (r->LinkLanes >= 2 || up1 == 0 || down1 == 0 || OsGetConfig("TbtLaneBonding", 1) == 0) {
+    if (r->LinkLanes >= 2) {
+        /* USB4 v2 Gen 4 (Thunderbolt 5) links come up bonded (also one bonded before, by the firmware):
+           the paths get the credits of a bonded link */
+        r->HwBonded = r->LinkGbps >= 40;        /* a Gen 4 link cannot be split again */
+        r->P[up].Bonded = TRUE;
+        pr->P[down].Bonded = TRUE;
+        if (up1) r->P[up1].Bonded = TRUE;
+        if (down1) pr->P[down1].Bonded = TRUE;
+        goto out;
+    }
+    if (up1 == 0 || down1 == 0 || OsGetConfig("TbtLaneBonding", 1) == 0 || RouterGen(r) < 2 || RouterGen(pr) < 2) {
         goto out;
     }
     if (r->Version != 0) {
@@ -1488,9 +1556,34 @@ static void Bond(TB_HOST *h, TB_ROUTER *pr, TB_ROUTER *r)
     LinkState(h, r, up, &r->LinkGbps, &r->LinkLanes);
 out:
     if (r->LinkGbps) {
-        UsbLog(LOG_INFO, "%s: link to router %x: %u Gb/s x %u = %u Gb/s\n", h->Name, r->Route, r->LinkGbps,
-               r->LinkLanes, r->LinkGbps * r->LinkLanes);
+        UsbLog(LOG_INFO, "%s: link to router %x: %u Gb/s x %u = %u Gb/s%s\n", h->Name, r->Route, r->LinkGbps,
+               r->LinkLanes, r->LinkGbps * r->LinkLanes, r->LinkGbps >= 40 ? " (Gen 4, USB4 v2 / Thunderbolt 5)" : "");
     }
+}
+
+/* Thunderbolt 1 / 2 / 3 router: hot plug events on (the internal USB ones off, except Thunderbolt 1, which
+   has none, and Alpine Ridge, whose xHCI needs them) */
+static void PlugEventsOn(TB_HOST *h, TB_ROUTER *r)
+{
+    ULONG pe = FindVse(h, r, VSE_PLUG_EVENTS), v;
+    USHORT id = (USHORT)(r->Id >> 16);
+
+    if (pe == 0 || Rd1(h, r, SP_SWITCH, 0, pe + 1, &v) != 0) {
+        return;
+    }
+    v &= 0xFFFFFF83UL;
+    if (RouterGen(r) != 1 && id != 0x1578 && id != 0x1576 && id != 0x15C0 && id != 0x15D3 && id != 0x15DA) {
+        v |= 0x04;
+    }
+    Wr1(h, r, SP_SWITCH, 0, pe + 1, v);
+}
+
+/* ROUTER_CS_4: notification timeout 255 ms; USB4 routers: the USB4 version the connection manager knows (v2
+   routers hide their v2 features from a v1 one) */
+static ULONG Cs4(TB_ROUTER *r, ULONG Cs4)
+{
+    return (Cs4 & 0xFFFF0000UL) | 0xFF |
+           (r->Version == 0 ? (Cs4 & 0xFF00) : ((ULONG)(r->Version >= 2 ? CS_4_CMUV_V2 : CS_4_CMUV_V1) << 8));
 }
 
 static void Enumerate(TB_HOST *h, int Pi, UCHAR Port);
@@ -1572,7 +1665,7 @@ static void Enumerate(TB_HOST *h, int Pi, UCHAR Port)
     cs[1] = (cs[1] & ~((0x3FUL << 8) | (7UL << 20))) | ((ULONG)up << 8) | ((ULONG)r->Depth << 20);
     cs[2] = route;
     cs[3] = 0x80000000UL;
-    cs[4] = (cs[4] & 0xFFFF0000UL) | 0xFF | (r->Version ? 0x10UL << 8 : (cs[4] & 0xFF00));
+    cs[4] = Cs4(r, cs[4]);
     if (Cfg(h, route, SP_SWITCH, 0, 1, &cs[1], 4, TRUE, NULL, 1000) != 0) {
         UsbLog(LOG_ERR, "%s: router %x could not be configured\n", h->Name, route);
         r->Used = FALSE;
@@ -1615,21 +1708,13 @@ static void Enumerate(TB_HOST *h, int Pi, UCHAR Port)
             Wr1(h, r, SP_PORT, up, r->P[up].CapUsb4 + PORT_CS_19, v | PORT_CS_19_PC);
         }
     } else {
-        /* Thunderbolt 3 device router: plug events on, lane configured */
-        ULONG pe = FindVse(h, r, VSE_PLUG_EVENTS);
-        if (pe && Rd1(h, r, SP_SWITCH, 0, pe + 1, &v) == 0) {
-            v &= 0xFFFFFF83UL;
-            if ((r->Id >> 16) != 0x1578 && (r->Id >> 16) != 0x1576 && (r->Id >> 16) != 0x15C0 &&
-                (r->Id >> 16) != 0x15D3 && (r->Id >> 16) != 0x15DA) {
-                v |= 0x04;                              /* not Alpine Ridge: USB plug events off */
-            }
-            Wr1(h, r, SP_SWITCH, 0, pe + 1, v);
-        }
+        /* Thunderbolt 1 / 2 / 3 device router: plug events on, lane configured */
+        PlugEventsOn(h, r);
         Tb3LinkConfigured(h, r, up, TRUE);
     }
     if (pr->P[Port].CapUsb4 && Rd1(h, pr, SP_PORT, Port, pr->P[Port].CapUsb4 + PORT_CS_19, &v) == 0) {
         Wr1(h, pr, SP_PORT, Port, pr->P[Port].CapUsb4 + PORT_CS_19, v | PORT_CS_19_PC);
-    } else if (pr->Version == 0 && pr->Depth != 0) {
+    } else if (pr->Version == 0) {
         Tb3LinkConfigured(h, pr, Port, FALSE);
     }
     Bond(h, pr, r);
@@ -1641,8 +1726,7 @@ static void Enumerate(TB_HOST *h, int Pi, UCHAR Port)
         }
     }
     UsbLog(LOG_INFO, "%s: router %04x:%04x at %x (depth %u, %s link, upstream adapter %u), %s\n", h->Name,
-           r->Id & 0xFFFF, r->Id >> 16, route, r->Depth, r->LinkUsb4 ? "USB4" : "Thunderbolt 3", up,
-           r->Version ? "USB4 router" : "Thunderbolt 3 router");
+           r->Id & 0xFFFF, r->Id >> 16, route, r->Depth, r->LinkUsb4 ? "USB4" : "Thunderbolt", up, RouterKind(r));
 
     TunnelUsb3(h, pr, r);
     if (OsGetConfig("TbtApprove", 1) != 0) {
@@ -1669,7 +1753,7 @@ static void Remove(TB_HOST *h, int Ri, BOOLEAN ParentThere)
     if (ParentThere) {
         UCHAR other = OtherLane(pr, r->ParentPort);
         ULONG v;
-        if (pr->P[r->ParentPort].Bonded && Rd1(h, pr, SP_PORT, r->ParentPort, pr->P[r->ParentPort].CapPhy + 1, &v) == 0) {
+        if (pr->P[r->ParentPort].Bonded && !r->HwBonded && Rd1(h, pr, SP_PORT, r->ParentPort, pr->P[r->ParentPort].CapPhy + 1, &v) == 0) {
             /* bonding off again, single lane width on both lanes for the next device */
             Wr1(h, pr, SP_PORT, r->ParentPort, pr->P[r->ParentPort].CapPhy + 1, (v & ~(LANE_LB | 0x30UL)) | 0x10);
             if (other) {
@@ -1678,6 +1762,9 @@ static void Remove(TB_HOST *h, int Ri, BOOLEAN ParentThere)
         }
         if (r->PcieDown) {
             Wr1(h, pr, SP_PORT, r->PcieDown, pr->P[r->PcieDown].CapAdap, 0);
+            if (r->PcieEe && Rd1(h, pr, SP_PORT, r->PcieDown, pr->P[r->PcieDown].CapAdap + 1, &v) == 0) {
+                Wr1(h, pr, SP_PORT, r->PcieDown, pr->P[r->PcieDown].CapAdap + 1, v & ~PCIE_CS_1_EE);
+            }
             ClearHop(h, pr, r->PcieDown, PCIE_HOPID);
             ClearHop(h, pr, r->ParentPort, r->PcieLU);
         }
@@ -1767,19 +1854,18 @@ static BOOLEAN SwStart(TB_HOST *h)
     r->Up = up;
     r->MaxPort = (UCHAR)((cs[1] >> 14) & 0x3F);
     r->Version = (UCHAR)((cs[4] >> 29) & 7);
-    if (r->Version == 0) {
-        UsbLog(LOG_ERR, "%s: not a USB4 host router and its firmware does not manage connections\n", h->Name);
-        return FALSE;
-    }
     cs[1] = (cs[1] & ~((0x3FUL << 8) | (7UL << 20))) | ((ULONG)up << 8);
     cs[2] = 0;
     cs[3] = 0x80000000UL;
-    cs[4] = (cs[4] & 0xFFFF0000UL) | 0xFF | (0x10UL << 8);
+    cs[4] = Cs4(r, cs[4]);
     if (Cfg(h, 0, SP_SWITCH, 0, 1, &cs[1], 4, TRUE, NULL, 1000) != 0) {
         UsbLog(LOG_ERR, "%s: host router could not be configured\n", h->Name);
         return FALSE;
     }
     ReadPorts(h, r);
+    if (r->Version == 0) {
+        PlugEventsOn(h, r);                     /* Thunderbolt 1 / 2 / 3 host router (Apple) */
+    }
     for (i = 1; i <= r->MaxPort && i < TB_PORTS; i++) {
         if (r->P[i].CapUsb4 && Rd1(h, r, SP_PORT, (UCHAR)i, ADP_CS_5, &v) == 0 && (v & ADP_CS_5_DHP)) {
             Wr1(h, r, SP_PORT, (UCHAR)i, ADP_CS_5, v & ~ADP_CS_5_DHP);
@@ -1792,8 +1878,11 @@ static BOOLEAN SwStart(TB_HOST *h)
             pcie += r->P[i].Type == PT_PCIE_DOWN;
             usb3 += r->P[i].Type == PT_USB3_DOWN;
         }
-        UsbLog(LOG_INFO, "%s: USB4 host router %04x:%04x, %u USB4 ports, %u PCIe and %u USB 3 adapters; the "
-               "driver is the connection manager\n", h->Name, r->Id & 0xFFFF, r->Id >> 16, lanes, pcie, usb3);
+        UsbLog(LOG_INFO, "%s: %s host router %04x:%04x, %u %s ports, %u PCIe and %u USB 3 adapters; the "
+               "driver is the connection manager\n", h->Name,
+               r->Version >= 2 ? "USB4 v2 (Thunderbolt 5)" : r->Version ? "USB4" : RouterGen(r) == 1 ? "Thunderbolt 1" :
+               RouterGen(r) == 2 ? "Thunderbolt 2" : "Thunderbolt 3", r->Id & 0xFFFF, r->Id >> 16, lanes,
+               r->Version ? "USB4" : "Thunderbolt", pcie, usb3);
     }
     ScanRouter(h, 0);
     return TRUE;
@@ -1803,21 +1892,74 @@ static BOOLEAN SwStart(TB_HOST *h)
 /* start and service                                                    */
 /* ------------------------------------------------------------------ */
 
+/* Intel host interfaces (NHI device ids); mkinf.py makes the INF entries from this list */
 static UCHAR Generation(USHORT Id)
 {
     switch (Id) {
+    case 0x1513: case 0x1547: case 0x1548: case 0x1566: case 0x1568: case 0x157D:
+        return GEN_LEGACY;
     case 0x156A: case 0x156C:
         return GEN_FR;
     case 0x1575: case 0x1577: case 0x15BF: case 0x15D2: case 0x15D9:
         return GEN_AR;
+    case 0x15DC: case 0x15DD: case 0x15DE:
+        return GEN_USBONLY;
     case 0x15E8: case 0x15EB: case 0x1134: case 0x1137:
         return GEN_TR;
     case 0x8A17: case 0x8A0D: case 0x9A1B: case 0x9A1D: case 0x9A1F: case 0x9A21: case 0x463E: case 0x466D:
     case 0xA73E: case 0xA76D: case 0x7EB2: case 0x7EC2: case 0x7EC3:
         return GEN_ICL;
+    case 0xA833: case 0xA834: case 0xE333: case 0xE334: case 0xE433: case 0xE434: case 0x4D33:
+    case 0x5781: case 0x5784:
+        return GEN_USB4;
     default:
         return 0;
     }
+}
+
+/* host interfaces with the device id of their own PCIe bridges: only the one of class 0880 (system
+   peripheral) is the NHI (mkinf.py names them PCI\VEN_8086&DEV_xxxx&CC_0880) */
+static const USHORT SharedIds[] = { 0x1513, 0x1547, 0x1548 };
+
+/* what the controller is (usbtree, the log, the INF names; at most 35 characters) */
+static const char *ChipName(USHORT Ven, USHORT Id)
+{
+    if (Ven == 0x1022) {
+        return "USB4 (AMD)";
+    }
+    if (Ven != 0x8086) {
+        return "USB4";
+    }
+    switch (Id) {
+    case 0x1513: return "Thunderbolt 1 (Light Ridge)";
+    case 0x1547: case 0x1548: return "Thunderbolt 1 (Cactus Ridge)";
+    case 0x1566: case 0x1568: return "Thunderbolt 2 (Redwood Ridge)";
+    case 0x157D: return "Thunderbolt 2 (Win Ridge)";
+    case 0x156A: case 0x156C: return "Thunderbolt 2 (Falcon Ridge)";
+    case 0x1575: case 0x1577: case 0x15BF: case 0x15D2: case 0x15D9: return "Thunderbolt 3 (Alpine Ridge)";
+    case 0x15DC: case 0x15DD: case 0x15DE: return "Alpine Ridge (USB only mode)";
+    case 0x15E8: case 0x15EB: return "Thunderbolt 3 (Titan Ridge)";
+    case 0x1134: case 0x1137: return "Thunderbolt 4 (Maple Ridge)";
+    case 0x8A17: case 0x8A0D: return "Thunderbolt 3 / USB4 (Ice Lake)";
+    case 0x9A1B: case 0x9A1D: case 0x9A1F: case 0x9A21: return "Thunderbolt 4 / USB4 (Tiger Lake)";
+    case 0x463E: case 0x466D: return "Thunderbolt 4 / USB4 (Alder Lake)";
+    case 0xA73E: case 0xA76D: return "Thunderbolt 4 / USB4 (Raptor Lake)";
+    case 0x7EB2: case 0x7EC2: case 0x7EC3: return "Thunderbolt 4 / USB4 (Meteor Lake)";
+    case 0xA833: case 0xA834: return "Thunderbolt 4 / USB4 (Lunar Lake)";
+    case 0xE333: case 0xE334: case 0xE433: case 0xE434: return "Thunderbolt 4 / USB4 (Panther Lake)";
+    case 0x4D33: return "Thunderbolt 4 / USB4 (Wildcat Lake)";
+    case 0x5781: return "Thunderbolt 5 (Barlow Ridge 80G)";
+    case 0x5784: return "Thunderbolt 5 (Barlow Ridge 40G)";
+    default: return "USB4";
+    }
+}
+
+/* Apple puts its subsystem ids on the Thunderbolt controllers of the Macs (Linux: 2222:1111) */
+static BOOLEAN IsApple(TB_HOST *h)
+{
+    ULONG ss = OsPciRead(h->Bus, h->Dev, h->Fn, 0x2C, 4);
+
+    return (ss & 0xFFFF) == 0x106B || ss == 0x11112222UL;
 }
 
 static BOOLEAN IsIcl(USHORT Id)
@@ -1833,6 +1975,11 @@ void TbtProbe(UCHAR Bus, UCHAR Dev, UCHAR Fn, ULONG Id, ULONG Cls)
 
     if ((Id & 0xFFFF) == 0x8086) {
         gen = Generation((USHORT)(Id >> 16));
+        for (i = 0; i < sizeof(SharedIds) / sizeof(SharedIds[0]); i++) {
+            if ((USHORT)(Id >> 16) == SharedIds[i] && (Cls >> 8) != 0x0880) {
+                gen = 0;                        /* one of its bridges */
+            }
+        }
     }
     if (gen == 0 && Cls != 0x0C0340) {
         return;
@@ -1886,8 +2033,8 @@ void TbtProbe(UCHAR Bus, UCHAR Dev, UCHAR Fn, ULONG Id, ULONG Cls)
         }
     }
     TbtHostCount++;
-    UsbLog(LOG_INFO, "%s: %s %04x:%04x\n", h->Name, gen == 0 ? "USB4 host interface" : "Thunderbolt host interface",
-           Id & 0xFFFF, Id >> 16);
+    UsbLog(LOG_INFO, "%s: %s host interface %04x:%04x\n", h->Name, ChipName((USHORT)Id, h->DevId), Id & 0xFFFF,
+           Id >> 16);
 }
 
 static void SetState(TB_HOST *h, UCHAR S)
@@ -1923,6 +2070,30 @@ static void Start(TB_HOST *h)
         SetState(h, HS_DEAD);
         return;
     }
+    if (h->Gen == GEN_USBONLY) {
+        UsbLog(LOG_INFO, "%s: Thunderbolt is switched off (USB only mode, BIOS setup): its USB controller works "
+               "without a connection manager\n", h->Name);
+        SetState(h, HS_BIOS);
+        return;
+    }
+    if (h->Gen == GEN_LEGACY) {
+        /* PCs: the BIOS does it (SMI); a second connection manager would fight it.  Macs: the OS does it */
+        ULONG cm = OsGetConfig("TbtDriverCm", 2);
+        if (cm == 0 || (cm == 2 && !IsApple(h))) {
+            UsbLog(LOG_INFO, "%s: Thunderbolt 1 / 2 controller of a PC: the BIOS manages it (devices come through "
+                   "PCIe hot plug); TbtDriverCm=1 lets the driver do it\n", h->Name);
+            SetState(h, HS_BIOS);
+            return;
+        }
+        h->HopCount = v & 0x3FF;
+        RingsStart(h);
+        h->Gen = GEN_USB4;
+        SetState(h, HS_SW);
+        if (!SwStart(h)) {
+            SetState(h, HS_DEAD);
+        }
+        return;
+    }
     h->HopCount = v & 0x3FF;
     if (h->Gen == GEN_ICL && IsIcl(h->DevId)) {
         /* Ice Lake: force power, then wait for the firmware */
@@ -1944,10 +2115,14 @@ static void Start(TB_HOST *h)
     } else if (h->Gen != GEN_USB4) {
         icm = (Rd(h, NHI_FW_STS) & FW_STS_ICM_EN) != 0;
         if (!icm) {
-            UsbLog(LOG_ERR, "%s: the firmware connection manager is not running (Apple?), Thunderbolt not used\n",
-                   h->Name);
-            SetState(h, HS_DEAD);
-            return;
+            if (OsGetConfig("TbtDriverCm", 2) == 0) {
+                UsbLog(LOG_ERR, "%s: the firmware connection manager is not running, Thunderbolt not used "
+                       "(TbtDriverCm = 0)\n", h->Name);
+                SetState(h, HS_DEAD);
+                return;
+            }
+            UsbLog(LOG_INFO, "%s: the firmware connection manager is not running (%s): the driver does it\n",
+                   h->Name, IsApple(h) ? "Apple Mac" : "switched off");
         }
     }
     if (!icm) {
@@ -2170,8 +2345,6 @@ void TbtShutdown(void)
    Detail lines are separated by '\n' */
 BOOLEAN TbtInfo(int Index, char *Name, int Size, char *Detail, int DSize)
 {
-    static const char *gen[] = { "", "Thunderbolt 2 (Falcon Ridge)", "Thunderbolt 3 (Alpine Ridge)",
-                                 "Thunderbolt 3 (Titan Ridge)", "Thunderbolt 4 / USB4", "USB4" };
     int i, k;
 
     for (i = 0; i < TB_HOSTS; i++) {
@@ -2180,11 +2353,15 @@ BOOLEAN TbtInfo(int Index, char *Name, int Size, char *Detail, int DSize)
             continue;
         }
         if (Index-- == 0) {
-            UsbFormat(Name, Size, "%s host router", (h->DevId == 0x1134 || h->DevId == 0x1137) ?
-                      "Thunderbolt 4 (Maple Ridge)" : gen[h->Gen]);
+            const char *chip = ChipName((USHORT)OsPciRead(h->Bus, h->Dev, h->Fn, 0, 2), h->DevId);
+            if (h->State == HS_SW && h->R[0].Used && h->R[0].Version >= 2 && chip[0] == 'U') {
+                chip = "USB4 v2 (80 Gb/s)";
+            }
+            UsbFormat(Name, Size, "%s host router", chip);
             UsbFormat(Detail, DSize, "PCI %02x:%02x.%u, id %04x\nConnection manager: %s%s%s", h->Bus, h->Dev, h->Fn,
                       h->DevId,
                       h->State == HS_DEAD ? "none (not in use, see the log)" :
+                      h->State == HS_BIOS ? "the BIOS / not needed (see the log)" :
                       h->State == HS_SW ? "the driver" :
                       h->State == HS_ICM ? "firmware" : "starting",
                       h->State == HS_ICM && h->Gen != GEN_ICL ? "\nSecurity level: " : "",
@@ -2206,13 +2383,13 @@ BOOLEAN TbtInfo(int Index, char *Name, int Size, char *Detail, int DSize)
         for (k = 1; k < TB_ROUTERS; k++) {
             TB_ROUTER *r = &h->R[k];
             if (r->Used && Index-- == 0) {
-                UsbFormat(Name, Size, "%s router %04x:%04x - %s%s", r->Version ? "USB4" : "Thunderbolt 3",
-                          r->Id & 0xFFFF, r->Id >> 16, r->PcieDown ? "PCIe" : "no PCIe",
-                          r->Usb3Down ? " + USB 3" : "");
-                UsbFormat(Detail, DSize, "Route %x, depth %u, upstream adapter %u\n%s link, %u Gb/s (%u x %u)%s%s",
-                          r->Route, r->Depth, r->Up, r->LinkUsb4 ? "USB4" : "Thunderbolt 3",
-                          r->LinkGbps * r->LinkLanes, r->LinkLanes, r->LinkGbps,
-                          r->PcieDown ? "\nPCIe tunnel" : "", r->Usb3Down ? "\nUSB 3 tunnel" : "");
+                UsbFormat(Name, Size, "%s %04x:%04x - %s%s", RouterKind(r), r->Id & 0xFFFF, r->Id >> 16,
+                          r->PcieDown ? "PCIe" : "no PCIe", r->Usb3Down ? " + USB 3" : "");
+                UsbFormat(Detail, DSize, "Route %x, depth %u, upstream adapter %u\n%s link, %u Gb/s (%u x %u)%s%s%s",
+                          r->Route, r->Depth, r->Up, r->LinkUsb4 ? (r->LinkGbps >= 40 ? "Thunderbolt 5 / USB4 v2 Gen 4" : "USB4") :
+                          "Thunderbolt", r->LinkGbps * r->LinkLanes, r->LinkLanes, r->LinkGbps,
+                          r->PcieDown ? "\nPCIe tunnel" : "", r->PcieEe ? " (extended encapsulation)" : "",
+                          r->Usb3Down ? "\nUSB 3 tunnel" : "");
                 return TRUE;
             }
         }

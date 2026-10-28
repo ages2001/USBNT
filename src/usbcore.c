@@ -692,6 +692,7 @@ static void ReadStrings(USB_DEV *Dev)
 }
 
 ULONG UsbPdoMode;
+ULONG UsbTextSetupHid;
 ULONG UsbWinVideo;
 void (*UsbDetachHook)(USB_DEV *Dev);
 static ULONG DevGen;
@@ -735,6 +736,9 @@ static void BindInterfaces(USB_DEV *Dev)
             }
             break;
         case USB_CLASS_HID:
+            if (UsbTextSetupHid) {
+                break;                      /* text-mode setup: setup's own HID drivers (usbdi.c) */
+            }
             if (HidAttach(Dev, d, end) == USB_OK) {
                 bound++;
             }
@@ -1099,10 +1103,22 @@ void UsbWorkerIteration(void)
  * XUSB2PRM), 2 = only SuperSpeed to xHCI, the USB 2.0 side stays with EHCI
  * (Windows 2000 / XP when Windows' own EHCI driver drives the EHCI: USB 2.0
  * devices must reach it), 0 = leave what the firmware set.
+ *
+ * Windows 2000 / XP default 2 (usbinst writes the value it chose; text-mode setup writes
+ * none): there the USB 2.0 side of the ports always has a driver - Windows' EHCI driver, or
+ * USBNT's own - so moving it to xHCI only took the devices away from Windows' EHCI.  In
+ * text-mode setup with the "USB 3 xHCI" choice that was the USB keyboard setup was reading
+ * (XP's text-mode setup has its own USB keyboard support, on EHCI) and the USB install media:
+ * no keyboard in text-mode setup on Intel 7 series and later, while the installed system
+ * (where usbinst writes 2) worked.
  */
 static void IntelRouteToXhci(UCHAR Bus, UCHAR Dev, UCHAR Fn)
 {
+#ifdef USB_WDM
+    ULONG mode = OsGetConfig("IntelRouteToXhci", 2);
+#else
     ULONG mode = OsGetConfig("IntelRouteToXhci", 1);
+#endif
     ULONG mask;
 
     if (mode == 0) {

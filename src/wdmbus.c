@@ -853,7 +853,24 @@ void WdmBusInit(void)
     }
     InputClassFix();
     if (TextSetupClaim()) {
+        ULONG maj, min, build;
         WdmTextSetupInput();
+        /*
+         * USB keyboards and mice in text-mode setup: setup reads its keys from the keyboards its own
+         * drivers serve.  Its TXTSETUP.SIF loads hidusb, kbdhid and mouhid and binds USB\Class_03 and
+         * HID_DEVICE_SYSTEM_KEYBOARD / _MOUSE to them ([HardwareIdsDatabase]; Windows 2000 and XP, also
+         * with Windows' own USB 1.1 / 2.0 drivers) - so USBNT hands the HID devices to them, as a USB
+         * bus driver (usbdi.c; xhci98 does the same), instead of being the keyboard itself.  Windows XP
+         * and later by default (TextSetupHid = 1); Windows 2000 copies hidusb.sys for the installed
+         * system without usbd.sys / hidclass.sys / hidparse.sys and stops at its first start (STOP
+         * c000026c), so there USBNT stays the keyboard (TextSetupHid = 0, the class node above).  After
+         * text-mode setup USBNT drives the keyboard and mouse itself again.
+         */
+        PsGetVersion(&maj, &min, &build, NULL);
+        UsbTextSetupHid = OsGetConfig("TextSetupHid", build >= 2600 ? 1 : 0);
+        if (UsbTextSetupHid) {
+            UsbLog(LOG_INFO, "PnP: text-mode setup: USB keyboards and mice go to setup's hidusb / kbdhid / mouhid\n");
+        }
     }
     RtlInitUnicodeString(&path, L"\\Registry\\Machine\\System\\CurrentControlSet\\Enum\\Root");
     root = OpenSub(NULL, &path);

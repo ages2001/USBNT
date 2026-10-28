@@ -150,7 +150,9 @@ static const struct {
     { 0x14E4, L"Broadcom" }, { 0x1B36, L"QEMU" }, { 0x1D94, L"Hygon" }, { 0x1283, L"ITE" }, { 0x197B, L"JMicron" },
 };
 
-/* "Renesas uPD720202 USB 3.0 Host Controller (USBNT)", "Intel USB 2.0 Enhanced Host Controller (USBNT)" */
+/* "Renesas uPD720202 USB 3.0 Host Controller (USBNT)", "Intel USB 2.0 Enhanced Host Controller - 24CD (USBNT)",
+   "Intel USB 1.1 Universal Host Controller - 24C2 (USBNT)": the USB version, the kind of controller and,
+   like Windows names them, the PCI device id that tells the controllers of one chip set apart */
 static void HcName(USB_HC *H, WCHAR *Out)
 {
     UCHAR rev = (UCHAR)OsPciRead(H->Bus, H->Dev, H->Fn, 8, 1);
@@ -175,9 +177,33 @@ static void HcName(USB_HC *H, WCHAR *Out)
         }
         p = WCat(p, H->Type == HC_XHCI ? L"USB 3.x eXtensible Host Controller" :
                     H->Type == HC_EHCI ? L"USB 2.0 Enhanced Host Controller" :
-                    H->Type == HC_OHCI ? L"USB Open Host Controller" : L"USB Universal Host Controller");
+                    H->Type == HC_OHCI ? L"USB 1.1 Open Host Controller" : L"USB 1.1 Universal Host Controller");
+        p = WCat(p, L" - ");
+        p = HexCat(p, H->DeviceId, 4);
     }
     WCat(p, L" (USBNT)");
+}
+
+/* the class of a device nobody here drives: the device's, else its first interface's */
+static const char *DevClass(USB_DEV *D, BOOLEAN *Composite)
+{
+    const UCHAR *d = D->Config, *end = D->Config + D->ConfigLen;
+    int n = 0;
+    const char *first = NULL;
+
+    *Composite = FALSE;
+    if (D->DevDesc[4] != 0 && D->DevDesc[4] != 0xEF) {
+        return UsbClassName(D->DevDesc[4], D->DevDesc[5], D->DevDesc[6]);
+    }
+    while (d != NULL && (d = UsbNextDesc(d, end)) != NULL) {
+        if (d[1] == USB_DT_INTERFACE && d[0] >= 9 && d[3] == 0) {
+            if (n++ == 0) {
+                first = UsbClassName(d[5], d[6], d[7]);
+            }
+        }
+    }
+    *Composite = n > 1;
+    return first;
 }
 
 static const WCHAR *DevKind(USB_DEV *D)
@@ -232,7 +258,7 @@ static void NodeName(WDM_EXT *x, WCHAR *Out)
     if (x->Child == PDO_HUB && d == NULL) {
         USB_HC *h = NodeHc(x);
         p = WCat(p, h == NULL ? L"USB Root Hub" : h->Type == HC_XHCI ? L"USB 3.x Root Hub" :
-                    h->Type == HC_EHCI ? L"USB 2.0 Root Hub" : L"USB Root Hub");
+                    h->Type == HC_EHCI ? L"USB 2.0 Root Hub" : L"USB 1.1 Root Hub");
         WCat(p, L" (USBNT)");
         return;
     }
@@ -242,11 +268,24 @@ static void NodeName(WDM_EXT *x, WCHAR *Out)
     }
     if (x->Child == PDO_HUB) {
         p = WCat(p, d->Speed == USB_SPEED_SUPER ? L"USB 3.x Hub" : d->Speed == USB_SPEED_HIGH ? L"USB 2.0 Hub" :
-                    L"USB Hub");
+                    L"USB 1.1 Hub");
         WCat(p, L" (USBNT)");
         return;
     }
-    p = WCat(p, DevKind(d));
+    if ((d->Function & ~USB_FUNC_HUB) == 0) {
+        /* nobody here drives it: what its class says ("USB Printer", "USB Vendor Specific Device") */
+        BOOLEAN comp;
+        const char *cls = DevClass(d, &comp);
+        if (comp) {
+            p = WCat(p, L"USB Composite Device");
+        } else if (cls != NULL) {
+            p = UsbClassDevice(p, cls);
+        } else {
+            p = WCat(p, DevKind(d));
+        }
+    } else {
+        p = WCat(p, DevKind(d));
+    }
     if (d->Product[0] || d->Mfg[0]) {
         p = WCat(p, L" (");
         if (d->Product[0]) {
@@ -254,6 +293,12 @@ static void NodeName(WDM_EXT *x, WCHAR *Out)
         } else {
             p = ACat(p, d->Mfg, sizeof(d->Mfg));
         }
+        WCat(p, L")");
+    } else {
+        p = WCat(p, L" (VID_");
+        p = HexCat(p, GET16(d->DevDesc + 8), 4);
+        p = WCat(p, L" PID_");
+        p = HexCat(p, GET16(d->DevDesc + 10), 4);
         WCat(p, L")");
     }
 }
@@ -330,6 +375,77 @@ static void SetSzValue(HANDLE K, const WCHAR *Name, const WCHAR *Val)
     while (Val[n]) n++;
     RtlInitUnicodeString(&vn, Name);
     ZwSetValueKey(K, &vn, 0, REG_SZ, (PVOID)Val, (n + 1) * sizeof(WCHAR));
+}
+
+/* a device node without a driver (no service yet) shows its DeviceDesc: the name the device gets now
+   (nodes from older versions kept "USB Device"); FALSE: no instance key yet, ask again later */
+BOOLEAN WdmNameDriverless(PDEVICE_OBJECT Pdo, const WCHAR *Name)
+{
+    UCHAR vb[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 64];
+    UNICODE_STRING vn;
+    ULONG len = 0;
+    HANDLE k = OpenInstance(Pdo);
+
+    if (k == NULL) {
+        return FALSE;
+    }
+    RtlInitUnicodeString(&vn, L"Service");
+    if (!NT_SUCCESS(ZwQueryValueKey(k, &vn, KeyValuePartialInformation, vb, sizeof(vb), &len)) ||
+        ((PKEY_VALUE_PARTIAL_INFORMATION)vb)->DataLength <= sizeof(WCHAR)) {
+        SetSzValue(k, L"DeviceDesc", Name);
+    }
+    ZwClose(k);
+    return TRUE;
+}
+
+/* the functions Windows XP's usbccgp makes of a composite device for Windows' drivers: every instance of
+   Enum\USB\VID_v&PID_p&MI_nn that has no driver (no service) gets Name as its DeviceDesc */
+void WdmNameUsbFunction(USHORT Vid, USHORT Pid, UCHAR If, const WCHAR *Name)
+{
+    WCHAR path[128], *p;
+    UNICODE_STRING us, vn;
+    OBJECT_ATTRIBUTES oa;
+    HANDLE dev = NULL, inst;
+    ULONG i, len;
+    union {
+        KEY_BASIC_INFORMATION b;
+        UCHAR raw[sizeof(KEY_BASIC_INFORMATION) + 128 * sizeof(WCHAR)];
+    } ki;
+    UCHAR vb[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 64];
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return;
+    }
+    p = WCat(path, L"\\Registry\\Machine\\System\\CurrentControlSet\\Enum\\USB\\VID_");
+    p = HexCat(p, Vid, 4);
+    p = WCat(p, L"&PID_");
+    p = HexCat(p, Pid, 4);
+    p = WCat(p, L"&MI_");
+    HexCat(p, If, 2);
+    RtlInitUnicodeString(&us, path);
+    InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    if (!NT_SUCCESS(ZwOpenKey(&dev, KEY_READ, &oa))) {
+        return;
+    }
+    for (i = 0; i < 16; i++) {
+        RtlZeroMemory(&ki, sizeof(ki));
+        if (!NT_SUCCESS(ZwEnumerateKey(dev, i, KeyBasicInformation, &ki, sizeof(ki) - sizeof(WCHAR), &len))) {
+            break;
+        }
+        us.Buffer = ki.b.Name;
+        us.Length = us.MaximumLength = (USHORT)ki.b.NameLength;
+        InitializeObjectAttributes(&oa, &us, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, dev, NULL);
+        if (!NT_SUCCESS(ZwOpenKey(&inst, KEY_ALL_ACCESS, &oa))) {
+            continue;
+        }
+        RtlInitUnicodeString(&vn, L"Service");
+        if (!NT_SUCCESS(ZwQueryValueKey(inst, &vn, KeyValuePartialInformation, vb, sizeof(vb), &len)) ||
+            ((PKEY_VALUE_PARTIAL_INFORMATION)vb)->DataLength <= sizeof(WCHAR)) {
+            SetSzValue(inst, L"DeviceDesc", Name);
+        }
+        ZwClose(inst);
+    }
+    ZwClose(dev);
 }
 
 /* FriendlyName of the device node of Pdo (what Device Manager shows) */

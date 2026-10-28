@@ -7,7 +7,9 @@
  *   A disk (partition) gets the letter it had last time if that letter is
  *   free.
  * - Mouse wheel on NT 3.x (no WM_MOUSEWHEEL there): wheel movements are
- *   sent to the window under the cursor as WM_VSCROLL.
+ *   sent to the window under the cursor as WM_VSCROLL.  The horizontal wheel
+ *   (tilt wheels, touch pads; no Windows before Vista has a message for it)
+ *   becomes WM_HSCROLL on every version.
  * - Requests a 1 ms system timer so that transfers finish without
  *   waiting for a 10-15 ms clock tick.
  * - Back / forward mouse buttons on NT 3.x / 4.0 (which have no X buttons):
@@ -509,6 +511,42 @@ static void Scroll(LONG Delta)
     PostMessageA(target, WM_VSCROLL, SB_ENDSCROLL, (LPARAM)bar);
 }
 
+static void ScrollH(LONG Delta)
+{
+    POINT pt;
+    HWND start;
+    HWND target;
+    HWND bar;
+    WPARAM code;
+    DWORD i;
+    DWORD n;
+
+    if (Target == 1) {
+        start = GetForegroundWindow();
+    } else {
+        GetCursorPos(&pt);
+        start = WindowFromPoint(pt);
+    }
+    if (start == NULL) {
+        return;
+    }
+    target = FindTargetDir(start, &bar, FALSE);
+    if (target == NULL) {
+        return;
+    }
+    code = (Delta > 0) ? SB_LINERIGHT : SB_LINELEFT;
+    n = (DWORD)((Delta > 0) ? Delta : -Delta) * Lines;
+    if (n > 200) {
+        n = 200;
+    }
+    for (i = 0; i < n; i++) {
+        PostMessageA(target, WM_HSCROLL, code, (LPARAM)bar);
+    }
+    PostMessageA(target, WM_HSCROLL, SB_ENDSCROLL, (LPARAM)bar);
+}
+
+static BOOL WheelVert;                  /* the vertical wheel too (NT 3.x, /wheel) */
+
 static DWORD WINAPI WheelLoop(LPVOID Param)
 {
     HANDLE dev = OpenUsbNt();
@@ -523,14 +561,19 @@ static DWORD WINAPI WheelLoop(LPVOID Param)
         Lines = 3;
     }
     for (;;) {
-        LONG delta = 0;
+        LONG delta[2];
         DWORD got = 0;
-        if (!DeviceIoControl(dev, IOCTL_USBNT_WHEEL_WAIT, NULL, 0, &delta, sizeof(delta), &got, NULL)) {
+        delta[0] = delta[1] = 0;
+        /* room for two: vertical and horizontal (a driver before 1.2 fills only the first) */
+        if (!DeviceIoControl(dev, IOCTL_USBNT_WHEEL_WAIT, NULL, 0, delta, sizeof(delta), &got, NULL)) {
             Sleep(500);
             continue;
         }
-        if (got == sizeof(delta) && delta != 0) {
-            Scroll(delta);
+        if (got >= sizeof(LONG) && delta[0] != 0 && WheelVert) {
+            Scroll(delta[0]);
+        }
+        if (got >= 2 * sizeof(LONG) && delta[1] != 0) {
+            ScrollH(delta[1]);
         }
     }
 }
@@ -1262,7 +1305,7 @@ static void MouseSetup(BOOL Driver)
 /* Start (waits for the driver) and the window                          */
 /* ------------------------------------------------------------------ */
 
-static BOOL Wheel;
+static BOOL Wheel, NoWheel;
 
 static DWORD WINAPI StartThread(LPVOID Param)
 {
@@ -1300,8 +1343,11 @@ static DWORD WINAPI StartThread(LPVOID Param)
         LettersOn = TRUE;
         CreateThread(NULL, 0, LetterThread, NULL, 0, &tid);
     }
-    if (Wheel) {
-        WheelOn = TRUE;
+    if (!NoWheel) {
+        /* the vertical wheel where Windows has no message for it (or /wheel), the horizontal
+           one always */
+        WheelOn = Wheel;
+        WheelVert = Wheel;
         CreateThread(NULL, 0, WheelLoop, NULL, 0, &tid);
     }
     MouseSetup(TRUE);
@@ -1324,7 +1370,7 @@ static void Refresh(void)
     wsprintfA(text + lstrlenA(text), "Drive letters of USB disks and SD cards: %s\r\n",
               LettersOn ? "follow the disks" : "fixed (DriveLetters = 0)");
     wsprintfA(text + lstrlenA(text), "Mouse wheel: %s\r\n", WheelOn ? "turned into scrolling for this NT version" :
-              "Windows handles it");
+              NoWheel ? "Windows handles it" : "Windows handles it; the horizontal wheel is WM_HSCROLL");
     wsprintfA(text + lstrlenA(text), "Wheel button: %s\r\n", MiddleMode == 0 ? "middle click (MiddleButton = 0)" :
               UseHook ? "autoscroll (mouse hook: every mouse)" : UseDriver ? "autoscroll (mice of usbnt.sys)" :
               "middle click (autoscroll not available)");
@@ -1454,7 +1500,8 @@ void __stdcall Entry(void)
     MSG msg;
     DWORD tid;
 
-    Wheel = (nt351 || HasArg(cmd, "/wheel")) && !HasArg(cmd, "/nowheel");
+    NoWheel = HasArg(cmd, "/nowheel");
+    Wheel = (nt351 || HasArg(cmd, "/wheel")) && !NoWheel;
     WinVer = GetVersion() & 0xFF;
     NoHook = HasArg(cmd, "/nohook");
     if (HasArg(cmd, "/restart")) {

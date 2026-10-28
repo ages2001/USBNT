@@ -37,6 +37,7 @@ static KEYBOARD_INDICATOR_PARAMETERS Indicators = { 0, 0 };
 static PDEVICE_OBJECT CtlDevice;
 static PIRP WheelIrp;
 static LONG WheelAccum;
+static LONG PanAccum;               /* horizontal wheel: usbmon turns it into WM_HSCROLL */
 static LONG WheelOpen;
 static ULONG WheelMode;
 
@@ -289,7 +290,9 @@ void OsKbdInput(const USB_KEY_EVENT *Events, ULONG Count)
         Deliver(&Lent, &data[0], &data[Count]);
         return;
     }
-    if (Kbd.Service == NULL || !SetupChecked) {
+    /* (text-mode setup: also when kbdclass is on our port - setup reads the keyboard it
+       started with; a search that came too early is tried again with the next key) */
+    if (Kbd.Service == NULL || !SetupChecked || InTextSetup) {
         if (Lent.Service == NULL && !LentWanted && LentTries < LENT_TRIES) {
             LentWanted = 1;                     /* the worker looks for a class driver (NtInputService) */
             OsWakeWorker();
@@ -492,11 +495,30 @@ void NtInputService(void)
     LentWanted = 0;
 }
 
-static void WheelChannel(LONG Delta)
+/* IOCTL_USBNT_WHEEL_WAIT: a LONG (vertical detents) or, with room for two, vertical and
+   horizontal (positive = right).  Called with the cancel spin lock held; FALSE: nothing
+   for this caller yet */
+static BOOLEAN WheelTake(PIRP Irp)
+{
+    LONG *out = (LONG *)Irp->AssociatedIrp.SystemBuffer;
+    BOOLEAN two = IoGetCurrentIrpStackLocation(Irp)->Parameters.DeviceIoControl.OutputBufferLength >= 2 * sizeof(LONG);
+    if (WheelAccum == 0 && (!two || PanAccum == 0)) {
+        return FALSE;
+    }
+    out[0] = WheelAccum;
+    WheelAccum = 0;
+    if (two) {
+        out[1] = PanAccum;
+        PanAccum = 0;
+    }
+    Irp->IoStatus.Information = two ? 2 * sizeof(LONG) : sizeof(LONG);
+    return TRUE;
+}
+
+static void WheelChannel(LONG Delta, LONG Pan)
 {
     KIRQL irql;
     PIRP irp = NULL;
-    LONG value = 0;
 
     IoAcquireCancelSpinLock(&irql);
     if (WheelOpen <= 0) {
@@ -504,18 +526,17 @@ static void WheelChannel(LONG Delta)
         return;
     }
     WheelAccum += Delta;
-    if (WheelIrp != NULL) {
+    PanAccum += Pan;
+    if (PanAccum > 50) PanAccum = 50;               /* nobody reads it (usbmon not running): stays small */
+    if (PanAccum < -50) PanAccum = -50;
+    if (WheelIrp != NULL && WheelTake(WheelIrp)) {
         irp = WheelIrp;
         WheelIrp = NULL;
         IoSetCancelRoutine(irp, NULL);
-        value = WheelAccum;
-        WheelAccum = 0;
     }
     IoReleaseCancelSpinLock(irql);
     if (irp != NULL) {
-        *(LONG *)irp->AssociatedIrp.SystemBuffer = value;
         irp->IoStatus.Status = STATUS_SUCCESS;
-        irp->IoStatus.Information = sizeof(LONG);
         IoCompleteRequest(irp, IO_MOUSE_INCREMENT);
     }
 }
@@ -613,6 +634,14 @@ static USHORT MouRoute(USHORT Flags)
     return taken;
 }
 
+/* a horizontal wheel movement only (the Windows 2000 / XP PS/2 filter): to usbmon */
+void OsMousePan(LONG Pan)
+{
+    if (Pan != 0) {
+        WheelChannel(0, Pan);
+    }
+}
+
 void OsMouseInput(const USB_MOUSE_EVENT *E)
 {
     MOUSE_INPUT_DATA d;
@@ -640,8 +669,8 @@ void OsMouseInput(const USB_MOUSE_EVENT *E)
     if (flags != 0 || E->X != 0 || E->Y != 0 || E->Absolute) {
         Deliver(&Mou, &d, &d + 1);
     }
-    if (channel && E->Wheel != 0) {
-        WheelChannel(E->Wheel);
+    if ((channel && E->Wheel != 0) || E->Pan != 0) {
+        WheelChannel(channel ? E->Wheel : 0, E->Pan);
     }
 }
 
@@ -1048,6 +1077,7 @@ void NtCtlCreateClose(PDEVICE_OBJECT Dev, PIRP Irp, BOOLEAN Create)
         WheelOpen--;
         if (WheelOpen == 0) {
             WheelAccum = 0;
+            PanAccum = 0;
         }
     }
     IoReleaseCancelSpinLock(irql);
@@ -1116,11 +1146,8 @@ NTSTATUS NtCtlIoctl(PDEVICE_OBJECT Dev, PIRP Irp)
             break;
         }
         IoAcquireCancelSpinLock(&irql);
-        if (WheelAccum != 0) {
-            *(LONG *)Irp->AssociatedIrp.SystemBuffer = WheelAccum;
-            WheelAccum = 0;
+        if (WheelTake(Irp)) {
             IoReleaseCancelSpinLock(irql);
-            Irp->IoStatus.Information = sizeof(LONG);
             st = STATUS_SUCCESS;
             break;
         }

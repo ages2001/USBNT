@@ -1,6 +1,6 @@
 """Back / forward buttons and autoscroll on Windows 2000 (x86) and XP x64.
 
-  python3 w5mouse.py [w2k|xp64 ...] [--keep]
+  python3 w5mouse.py [w2k|xp64 ...] [--keep] [--bat MS]
 
 usbinst /install puts the USB mouse (QEMU's usb-mouse: five buttons) on
 usbnt.sys (boot 1); after a restart usbmon and wheeltst (/center, kept on
@@ -16,6 +16,10 @@ top by fstest front) run and wheeltst logs to C:\\WHEEL.LOG.  Checked:
   - holding the USB mouse's wheel button and dragging up scrolls up, releasing
     it ends autoscroll
   - ordinary clicks reach the window before and after
+  - XP x64: the PS/2 mouse's wheel (i8042prt's, with usbnt.sys as its upper filter,
+    which resets the mouse to look for a touch pad and must give it back with its
+    wheel): two notches up, then three down scroll up, then down.  --bat MS: the
+    PS/2 mouse's reset self test takes MS ms (test/qemu/ps2-mouse-bat.patch)
 
 Work images: $W5_IMG/work-mouse-<guest>.raw (or $W5MOUSE_WORK).
 """
@@ -66,8 +70,9 @@ def white(png):
         return False
 
 
-def run(guest, keep=False):
+def run(guest, keep=False, batms=None):
     g = vm5.GUESTS[guest]
+    ps2 = guest != 'w2k'                            # the Windows 2000 image's PS/2 mouse does not work
     F = 'C:\\USBNT\\FSTEST.EXE'
     # boot 1: install; Windows starts mouclass for a mouse that was installed while it ran
     # only at the next boot ("System Settings Change")
@@ -86,6 +91,8 @@ def run(guest, keep=False):
     # those of -vga std (VGA 2, NIC 3, then the disk controller): no new hardware for Windows
     front = ['-vga', 'none', '-device', 'VGA,id=vga0,addr=0x2', '-nic', 'none', '-device', 'e1000,addr=0x3']
     extra = ['-device', 'qemu-xhci,id=xhci', '-device', 'usb-mouse,bus=xhci.0,display=vga0,id=um']
+    if batms:
+        extra += ['-global', 'ps2-mouse.bat-delay=%s' % batms]
     res = {}
     vm = vm5.VM(guest, work, extra=extra, name='mouse-' + guest, front=front)
     res['boot 1: installed'] = vm.wait_serial('##AGENT-DONE##', 900)
@@ -144,6 +151,11 @@ def run(guest, keep=False):
         time.sleep(0.5)
         click(vm, USB, 'right')
         time.sleep(1)
+        if ps2:
+            for b in ('wheel-up', 'wheel-up', 'wheel-down', 'wheel-down', 'wheel-down'):
+                click(vm, None, b)                  # no device: the unbound PS/2 mouse
+                time.sleep(0.4)
+            time.sleep(1)
         vm.shot('m4')
         res['agent finished'] = vm.wait_serial('##AGENT-DONE##', 300)
         time.sleep(2)
@@ -158,6 +170,9 @@ def run(guest, keep=False):
     print('\n'.join(l for l in log.splitlines() if 'mouse' in l or 'pointer' in l))
     c = parse(wl)
     print(c)
+    tail = wl[wl.rfind('RBUTTONDOWN'):] if 'RBUTTONDOWN' in wl else ''
+    seq = [('up' if int(w[1]) > 0 else 'down') for w in (l.split() for l in tail.splitlines())
+           if len(w) > 1 and w[0] == 'MOUSEWHEEL']
     back = wl.count('APPCOMMAND 1\r')
     fwd = wl.count('APPCOMMAND 2\r')
     res.update({
@@ -174,6 +189,9 @@ def run(guest, keep=False):
         'ending click held back, the others not': c['lbutton'] == 2,
         'right click afterwards': c['rbutton'] == 1,
     })
+    if ps2:
+        res['PS/2 wheel: up, then down %s' % seq] = bool(seq) and 'up' in seq and 'down' in seq and \
+            seq.index('down') > seq.index('up') and 'up' not in seq[seq.index('down'):]
     for k, v in res.items():
         print('%-40s %s' % (k, 'PASS' if v else 'FAIL'))
     if not keep:
@@ -186,6 +204,9 @@ def run(guest, keep=False):
 if __name__ == '__main__':
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     keep = '--keep' in sys.argv
-    res = {gname: run(gname, keep) for gname in (args or ['w2k', 'xp64'])}
+    batms = sys.argv[sys.argv.index('--bat') + 1] if '--bat' in sys.argv else None
+    if batms:
+        args = [a for a in args if a != batms]
+    res = {gname: run(gname, keep, batms) for gname in (args or ['w2k', 'xp64'])}
     print(res)
     sys.exit(0 if all(res.values()) else 1)

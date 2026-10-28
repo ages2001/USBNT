@@ -23,9 +23,9 @@ tablets, mass storage (including USB 3 SuperSpeed and UAS), USB audio
 devices (USB Audio Class 1.0 and 2.0), USB MIDI, USB cameras (USB Video
 Class), SD card readers (SDHCI, Realtek PCIe, Realtek USB), notebook touch
 pads (HID over I2C, SMBus and PS/2), touch screens and keyboards on the I2C
-bus, the PS/2 keyboard and mouse, and Thunderbolt 3 / 4 and USB4 docks and
-enclosures (it is the connection manager where the firmware is not; NVMe
-drives and USB controllers behind them work).
+bus, the PS/2 keyboard and mouse, and Thunderbolt 1 - 5 and USB4 (v1, v2)
+docks and enclosures (it is the connection manager where the firmware is
+not; NVMe drives and USB controllers behind them work).
 
 None of these NT versions has USB support of its own.
 
@@ -55,8 +55,8 @@ today's machines and add-in cards.
 
 - **Host controllers**: UHCI, OHCI, EHCI and xHCI (USB 3.0 - 3.2, up to
   20 Gbit/s), BIOS hand-off, isochronous transfers on all of them,
-  Thunderbolt 3 / 4 and USB4 (connection manager, PCIe and USB 3 tunnels,
-  hot plugged NVMe drives)
+  Thunderbolt 1, 2, 3, 4 and 5, USB4 and USB4 v2 (connection manager, PCIe
+  and USB 3 tunnels, 80 Gbit/s Gen 4 links, hot plugged NVMe drives)
 - **Input**: USB, PS/2 and I2C keyboards and mice, tablets, touch screens,
   touch pads with two-finger scrolling and tap-to-click, back / forward
   buttons and autoscroll on every NT version
@@ -101,8 +101,8 @@ Windows 2000 / XP drivers and INF files in `2kxp`, and the driver disks
   xHCI.
 - BIOS hand-off (legacy USB) for all four controller types
 - 64-bit BARs that UEFI firmware put above 4 GB are moved below 4 GB
-- **Thunderbolt 3 / 4 and USB4**: the driver takes the control channel of
-  the host interface (NHI, ring 0, polled):
+- **Thunderbolt 1 - 5 and USB4 / USB4 v2**: the driver takes the control
+  channel of the host interface (NHI, ring 0, polled):
   - Intel controllers with a firmware connection manager (Falcon, Alpine,
     Titan, Maple Ridge; Ice Lake, Tiger Lake, Alder / Raptor Lake, Meteor
     Lake when the BIOS leaves it on): "driver ready", then every device
@@ -111,14 +111,29 @@ Windows 2000 / XP drivers and INF files in `2kxp`, and the driver disks
     HMAC-SHA-256 challenge on later connections - level "secure"; a
     device that answers with another key is not connected. Ice Lake is
     force-powered first.
-  - USB4 hosts without one (AMD, Intel when the BIOS chose the OS
-    connection manager, others): **the driver is the connection
+  - USB4 hosts without one (AMD, Intel Lunar Lake, Panther Lake, Wildcat
+    Lake, the **Thunderbolt 5** controllers (Barlow Ridge, USB4 v2), Intel
+    when the BIOS chose the OS connection manager, others) and Thunderbolt
+    1 / 2 / 3 hosts whose firmware does not do it (**Apple Macs**: Light,
+    Cactus, Falcon, Alpine, Titan Ridge): **the driver is the connection
     manager**. It enumerates the routers (also chained ones and those
     that are there at boot), gives them routes, programs the hop tables
     of a PCIe tunnel and a USB 3 tunnel (with the host's USB 3 bandwidth
     handshake) to each of them, handles plug and unplug events and tears
     the tunnels down when a router goes away. Thunderbolt 3 devices on a
-    USB4 host get a PCIe tunnel too.
+    USB4 host get a PCIe tunnel too. Lanes are bonded (40 Gbit/s) through
+    the USB4 port or the Thunderbolt 2 / 3 link controller; Thunderbolt 1
+    links stay single.
+  - **Thunderbolt 5 / USB4 v2**: the routers are told that the connection
+    manager knows USB4 v2 (so they show their v2 features), Gen 4 links
+    (2 x 40 = 80 Gbit/s) come up bonded and their paths get the credits of
+    a bonded link, a PCIe tunnel between two USB4 v2 routers on a Gen 4
+    link uses extended encapsulation; USB4 v1 and Thunderbolt 3 devices on
+    a Thunderbolt 5 host work as before.
+  - Thunderbolt 1 / 2 controllers of PCs (Light, Cactus, Redwood, Win
+    Ridge) are run by the BIOS ("BIOS assist"): USBNT leaves them alone
+    (`TbtDriverCm`) and picks up the devices through PCIe hot plug. Alpine
+    Ridge in USB only mode needs nothing.
   - What comes through the PCIe tunnel arrives at a hot plug capable PCIe
     port, which is watched: the functions behind it get bus numbers,
     bridge windows and BARs inside the range the firmware reserved; USB
@@ -153,12 +168,15 @@ Windows 2000 / XP drivers and INF files in `2kxp`, and the driver disks
 - Tablet / absolute pointer (QEMU and VirtualBox "USB Tablet")
 - **PS/2 keyboard and mouse** are driven by usbnt.sys as well (the
   installer disables i8042prt), so every keyboard and pointer, PS/2, USB
-  and I2C, works at the same time; wheel and 5-button PS/2 mice
+  and I2C, works at the same time; wheel and 5-button PS/2 mice; slow
+  mice, trackpoints and touch pads (a reset self test of over 1 s, late
+  answers) are waited for
 - **HID over I2C** (notebooks and tablets): touch pads - Windows Precision
   Touchpads are switched to touch pad mode and get gestures: one finger
   moves the pointer, **two fingers scroll** (up/down = wheel, left/right =
   horizontal wheel), a tap clicks (one finger left, two fingers right,
-  three fingers middle), the pad button with two fingers on the pad is the
+  three fingers middle), **three fingers swiped right / left are back /
+  forward**, the pad button with two fingers on the pad is the
   right button; other pads in their mouse mode, or finger motion of pads
   without a mouse collection -, touch
   screens and pens (absolute pointer, tip = left button) and I2C
@@ -299,17 +317,18 @@ Plug and Play devices:
 
 | Device Manager shows | What |
 |---|---|
-| USBNT USB 3.x xHCI Host Controller | xHCI controllers (USB 3.0 - 3.2, 5 / 10 / 20 Gbit/s) |
-| USBNT USB 2.0 EHCI Host Controller | EHCI controllers where Windows has no EHCI driver (see the table below) |
-| USBNT USB 1.x UHCI / OHCI Host Controller | UHCI and OHCI controllers, only with `usbinst /install /all` |
-| USBNT USB4 Host Router, USBNT Thunderbolt 3 / 4 Host Router | USB4 / Thunderbolt host interfaces (connection manager, 40 Gbit/s links) |
+| *Chip* USB 3.x eXtensible Host Controller - *id* (USBNT) | xHCI controllers (USB 3.0 - 3.2, 5 / 10 / 20 Gbit/s); add-in chips by name ("Renesas uPD720202 USB 3.0 Host Controller (USBNT)") |
+| *Chip* USB 2.0 Enhanced Host Controller - *id* (USBNT) | EHCI controllers where Windows has no EHCI driver (see the table below) |
+| *Chip* USB 1.1 Universal / Open Host Controller - *id* (USBNT) | UHCI and OHCI controllers, only with `usbinst /install /all` |
+| USB 1.1 / 2.0 / 3.x Root Hub (USBNT), USB 1.1 / 2.0 / 3.x Hub (USBNT) | root hubs and hubs, by their USB version |
+| USBNT Thunderbolt 5 (Barlow Ridge 80G) Host Router, USBNT Thunderbolt 4 / USB4 (Meteor Lake) Host Router, ... | Thunderbolt 1 - 5 / USB4 host interfaces by their chip (connection manager, 40 / 80 Gbit/s links) |
 | USBNT SD Card Reader (SDHCI / Realtek PCIe) | card readers |
 | USBNT HID over I2C Controller | touch pads, touch screens, I2C keyboards |
 | USBNT Device Bus (USB keyboards, mice, disks, UAS) | the bus on which USBNT reports what it serves |
 | USBNT USB Keyboard, USBNT USB Mouse | every USB (and I2C) keyboard and pointer (kbdclass / mouclass) |
 | *Product name* (USB 3.x UAS), *product name* (USB) | USB disks, sticks, card reader cards, NVMe drives behind Thunderbolt / USB4 - with Windows' disk.sys, so NTFS, FAT32 and drive letters work as usual |
 | USBNT USB Audio | while a USB audio / MIDI device is connected: AUDIONT plays and records through it |
-| *USB device names* with ids `USB\VID_v&PID_p` | devices USBNT has no driver for, for Windows' drivers (below) |
+| *USB device names* with ids `USB\VID_v&PID_p` | devices USBNT has no driver for, for Windows' drivers (below): the product name; without one the manufacturer and the class ("USB Printer", "USB Vendor Specific Device (VID_0414 PID_A00B)"); a function of a composite device also says which interfaces it has ("Plugable UD-3900 - Audio Control (Interface 0)", `&MI_00`) |
 
 **USB devices for Windows' drivers.** A device (or one function of a
 composite device) that USBNT does not serve itself is reported with the
@@ -356,6 +375,10 @@ carry what is plugged into USBNT's controllers.
   goes to USBNT's xHCI, the USB 2.0 side of the ports stays with the EHCI, so
   USB 2.0 devices reach Windows' stack. Without it (USBNT drives the EHCI,
   or `/all`) every port goes to xHCI (`IntelRouteToXhci = 1`), as on NT 4.0.
+  Where usbinst did not run - text-mode setup, an install through Device
+  Manager - the default on Windows 2000 / XP is 2: text-mode setup reads the
+  USB keyboard (and the install media) through the EHCI, and moving them to
+  the xHCI left setup without a keyboard on Intel 7 series and later.
 - USBNT never hands a hub to Windows' hub driver (usbhub.sys cannot run on
   the USBNT bus; earlier test builds did that with a hub they could not set
   up, which showed a failed "USB hub" with no devices behind it).
@@ -671,6 +694,23 @@ USB CD / DVD drive can be read once setup runs; booting setup from it is the
 BIOS' business. Text-mode setup itself was run with a Windows 2000 (SP0)
 CD (see Testing).
 
+**The USB keyboard and mouse in text-mode setup of Windows XP and later.**
+Setup brings its own USB input drivers: its TXTSETUP.SIF loads hidusb,
+kbdhid and mouhid and binds `USB\Class_03`, `HID_DEVICE_SYSTEM_KEYBOARD`
+and `HID_DEVICE_SYSTEM_MOUSE` to them. So in text-mode setup of XP, XP x64
+and Server 2003 USBNT does not drive USB keyboards and mice itself: it hands
+them (and the HID functions of composite devices, split by USBNT itself) to
+those drivers through its USB bus interface, as a USB host controller driver
+does (xhci98 works this way), and setup reads the keys from them like from
+a keyboard on its own UHCI / EHCI. USB disks stay USBNT's. After text-mode
+setup USBNT drives the keyboard and mouse itself again. `TextSetupHid` (in
+the setup hive) chooses: 1 setup's drivers (XP and later), 0 USBNT's own
+keyboard (Windows 2000: its text-mode setup copies hidusb.sys to the new
+system without usbd.sys, hidclass.sys and hidparse.sys, and the first start
+stops with STOP c000026c). Tested in Windows 2000 text-mode setup with
+`TextSetupHid=1` (every key of the setup screens from the USB keyboard
+through setup's kbdhid) and with the default.
+
 **Windows 2000 with F6.** Windows 2000 setup loads usbnt.sys from the
 driver disk but does not use the disk's `[HardwareIds.scsi.*]` (XP's setup
 does; an exact controller id does not help either): the host controllers
@@ -727,14 +767,17 @@ off; `TouchpadSpeed` is the pointer speed in percent; `TouchpadGestures` 0
 leaves the pad in its mouse mode; `TouchpadScrollSpeed` (percent),
 `TouchpadAccel` 0 turns pointer acceleration off, `TouchpadEdgeScroll` 1 /
 0 turns scrolling at the right edge on / off (2: only on pads that see one
-finger).
+finger), `TouchpadSwipe` 0 turns the three finger back / forward swipes off.
 
 **PS/2 touch pads** (Synaptics, Elantech v2 - v4, ALPS v3 / v5 / v7) run in
 their native absolute mode with the same gestures: on NT 3.x / 4.0 through
 usbnt.sys' PS/2 driver, on Windows 2000 / XP through its filter on
-i8042prt's mouse. Horizontal scrolling of PS/2 pads reaches programs only
-on NT 3.x / 4.0 (usbmon); Windows 2000 / XP have no horizontal wheel.
-`Ps2Touchpad` 0 keeps every PS/2 pad a plain mouse. Older pads (Synaptics
+i8042prt's mouse. Horizontal scrolling (of pads, tilt wheels and USB mice
+with a horizontal wheel) reaches programs through usbmon as WM_HSCROLL on
+every version - no Windows before Vista has a horizontal wheel message.
+`Ps2Touchpad` 0 keeps every PS/2 pad a plain mouse. A finger that may
+still be a tap does not move the pointer, so a double tap stays inside
+Windows' double click rectangle and is a double click. Older pads (Synaptics
 with the old absolute format, Elantech v1, other ALPS versions) and other
 makes stay plain wheel mice.
 
@@ -900,7 +943,7 @@ key itself), REG_DWORD:
 | UseInterrupts | 0 | 1 = interrupts, 0 = polling |
 | TimerResolution | 1 | Ask the kernel for a 1 ms timer where it can (Windows 2000 and later; on NT 3.x/4.0 usbmon does it) |
 | DisableControllers | 0 | Bit mask: 1 = UHCI, 2 = OHCI, 4 = EHCI, 8 = xHCI |
-| IntelRouteToXhci | 1 | Intel EHCI / xHCI port switching: 1 = USB 2.0 and SuperSpeed to xHCI, 2 = only SuperSpeed to xHCI, USB 2.0 stays with the EHCI (Windows 2000 / XP: usbinst sets 2 when Windows' EHCI driver drives the EHCI, else 1), 0 = as the firmware set it |
+| IntelRouteToXhci | 1 (2000 / XP: 2) | Intel EHCI / xHCI port switching: 1 = USB 2.0 and SuperSpeed to xHCI, 2 = only SuperSpeed to xHCI, USB 2.0 stays with the EHCI (Windows 2000 / XP: usbinst sets 2 when Windows' EHCI driver drives the EHCI, else 1; without a value, as in text-mode setup, 2), 0 = as the firmware set it |
 | MaxPciBus | 255 | Highest PCI bus scanned |
 | WheelMode | 0 | 0 = automatic, 1 = MOUSE_WHEEL only, 2 = usbmon only |
 | ReportWheel | 1 | Report the mouse as a wheel mouse |
@@ -916,6 +959,7 @@ key itself), REG_DWORD:
 | TouchpadScrollSpeed | 100 | Touch pad scrolling speed in percent (10-1000) |
 | TouchpadAccel | 1 | Pointer acceleration of touch pads, 0 = off |
 | TouchpadEdgeScroll | 2 | Scrolling at the right edge: 1 = on, 0 = off, 2 = only on pads that see one finger |
+| TouchpadSwipe | 1 | Three fingers swiped right / left = back / forward (buttons 4 / 5), 0 = off |
 | Ps2Touchpad | 1 | PS/2 touch pads (Synaptics, Elantech, ALPS) in their native mode; 0 = plain mouse |
 | Smbus | 1 | Touch pads on SMBus: 1 = the pads Linux puts on SMBus (Synaptics with a listed ACPI id, newer Elan ICs), 2 = every pad with an SMBus side, 0 = no SMBus access |
 | SmbusTouchpad | 0 | Use a pad at these SMBus addresses without the PS/2 identification: bits 0-7 Synaptics RMI4 (e.g. 0x2C), bits 8-15 Elan (e.g. 0x1500); 0 = after the PS/2 switch only |
@@ -923,7 +967,9 @@ key itself), REG_DWORD:
 | DisableTbt | 0 | 1 = leave Thunderbolt / USB4 host interfaces alone |
 | TbtApprove | 1 | Devices behind Thunderbolt / USB4: 1 = connect (approve, pair), 2 = only paired devices (secure level), 0 = no PCIe tunnels |
 | TbtUsb3Tunnel | 1 | USB4: USB 3 tunnels to docks (0 = the dock's own xHCI over PCIe) |
-| TbtLaneBonding | 1 | Bond the two lanes of a Thunderbolt / USB4 link (40 Gb/s), 0 = one lane (20 Gb/s) |
+| TbtLaneBonding | 1 | Bond the two lanes of a Thunderbolt 2 / 3 / USB4 link (40 Gb/s), 0 = one lane (20 Gb/s); Thunderbolt 5 / USB4 v2 Gen 4 links (80 Gb/s) are bonded by the hardware |
+| TbtPcieExtEncap | 1 | Thunderbolt 5 / USB4 v2: PCIe tunnels between two USB4 v2 routers on a Gen 4 link with extended encapsulation, 0 = off |
+| TbtDriverCm | 2 | Thunderbolt hosts whose firmware does not manage connections: 2 = the driver does it, except Thunderbolt 1 / 2 controllers of PCs (the BIOS runs those; Macs: the driver), 1 = always the driver, 0 = never |
 | DisableNvme | 0 | 1 = do not drive hot plugged NVMe drives |
 | NvmeAtBoot | 0 | 1 = also drive the NVMe drives that are there at boot (otherwise nvme2k's) |
 | RelocateBars | 2 | PCI memory above 4 GB: 0 = leave it, 1 = move only the controllers USBNT drives, 2 = move every device's BARs below 4 GB (bridge windows opened, empty 64-bit windows closed, oversized BARs shrunk through Resizable BAR) when the kernel cannot map above 4 GB (NT 3.x / 4.0, 32-bit 2000 / XP without PAE), 3 = always |
@@ -933,6 +979,8 @@ key itself), REG_DWORD:
 | DebugLevel | 2 | 0 = off, 1 = errors, 2 = info, 3 = debug, 4 = verbose |
 | DebugPort | 0 | Serial port for the log (e.g. 0x2F8), 0 = DbgPrint |
 | UsbPdo | 1 | Windows 2000 / XP: devices for Windows' USB drivers - 1 those without a USBNT driver, 2 all but hubs, 0 none |
+| TextSetupHid | 1 (2000: 0) | Text-mode setup: 1 = USB keyboards and mice go to setup's own hidusb / kbdhid / mouhid (Windows XP and later), 0 = USBNT is the keyboard / mouse itself |
+| UsbInterfaceNames | 1 | Windows XP: the functions usbccgp makes of a composite device for Windows' drivers that have no driver get the name of their interfaces ("Plugable UD-3900 - Audio Control (Interface 0)" instead of several "USB Device"), 0 = off |
 | WindowsCamera | 0 | Windows 2000 / XP: 1 = USB cameras go to Windows' usbvideo.sys (with UsbPdo 1 or 2), not to USBNT's camera driver; usbinst sets 1 where Windows has usbvideo.sys (XP SP2 and later, XP x64, Server 2003 SP1), else 0 |
 | MaxPartitions | 8 | NT 3.1 - 4.0: partition devices (drive letters) per USB disk slot, 2-24; 1 = only the first partition (as before) |
 | RemovableAsFixed | 1 | Windows 2000 / XP: report a removable medium as a fixed disk, so that every partition gets a letter - 1 when it has more than one partition, 2 always, 0 never (also for the disks of Windows' usbstor, through the filter) |
@@ -972,7 +1020,7 @@ mktools
 
 The tools use no C run time library. Both steps build without warnings.
 The 1.0 release binaries were built this way inside an NT 3.51 VM; the
-1.1 binaries in `bin/` come from the MinGW build below. The interface that
+1.1 and 1.2 binaries in `bin/` come from the MinGW build below. The interface that
 other drivers use (`usbntaud.h`) is `__cdecl` throughout, so drivers built
 with either tool chain work together.
 
@@ -1016,14 +1064,20 @@ makes the driver disks `out/USBNTNT.IMG`, `USBNT2K.IMG`, `USBNT64.IMG`
   attention button, safe removal; a drive present at boot left alone) and
   `test/ttbt.py` (Thunderbolt / USB4: the driver as connection manager -
   routers plugged in, at boot, chained, Thunderbolt 3 device, unplug with
-  the host's tunnels removed, NVMe through the tunnel; firmware connection
+  the host's tunnels removed, NVMe through the tunnel; Thunderbolt 5 / USB4
+  v2 with a Gen 4 link, CM version 2 and PCIe extended encapsulation, a
+  USB4 v1 device on it; Thunderbolt 1 / 2 hosts of a Mac with the driver as
+  connection manager, a PC's left to the BIOS; firmware connection
   manager with the Falcon / Alpine / Titan Ridge and Ice Lake / Tiger Lake
   interfaces, security levels none / user / secure with new, stored, wrong
   and lost keys) run on the harness with the QEMU test devices below.
 - `test/tnt.py`, `tgui.py`, `tinst.py`, `tddk.py` boot real NT installs in
   QEMU (images in `$USBNT_NTIMG`); `ntinput.py` types and clicks with a
   PS/2 keyboard and mouse, two USB keyboards and mice and (with `--i2c`) an
-  I2C touch pad and keyboard into one window at the same time; `ntcam.py`
+  I2C touch pad and keyboard into one window at the same time (also: the
+  left and right shift keys let go, double clicks; `--bat 1500`: a PS/2
+  mouse whose self test takes 1.5 s, `test/qemu/ps2-mouse-bat.patch`);
+  `ntpad.py` / `w5pad.py` also double tap a PS/2 touch pad; `ntcam.py`
   takes photos and records video with usbcam (`allmodes`: every format and
   size, also with a 4:2:0 MJPEG camera, a camera that picks its own frame
   size and one that reports a too small frame size); `ntmsc.py` re-plugs
@@ -1215,10 +1269,11 @@ specification and Linux's thunderbolt driver (no code taken).
   (HD Audio codecs on SST systems in HDA mode work with AUDIONT).
 - Thunderbolt / USB4: tested against the QEMU model only (no real
   controller here). No DisplayPort tunnels (NT has no use for them), no
-  host-to-host (XDomain) networking, no NVM firmware updates. Apple
-  machines (firmware connection manager off) and discrete Thunderbolt 3
-  controllers that the BIOS powers off while nothing is connected are
-  not used. Hot plugged controllers and drives are polled (no interrupt
+  host-to-host (XDomain) networking, no NVM firmware updates, no
+  Thunderbolt 5 asymmetric links (120 / 40 Gbit/s, a DisplayPort feature).
+  Discrete Thunderbolt 3 controllers that the BIOS powers off while nothing
+  is connected are not used; Thunderbolt 1 / 2 controllers of PCs are left
+  to the BIOS. Hot plugged controllers and drives are polled (no interrupt
   line can be added at run time).
 - HID over I2C devices are polled every 8 ms (30 ms when idle); where the
   firmware describes a GpioInt "data ready" line the pad level is read first

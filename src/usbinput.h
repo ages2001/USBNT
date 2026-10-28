@@ -48,6 +48,7 @@ typedef struct _USB_MOUSE_EVENT {
 /* Implemented by the OS layer, called at DPC level */
 void    OsKbdInput(const USB_KEY_EVENT *Events, ULONG Count);
 void    OsMouseInput(const USB_MOUSE_EVENT *Event);
+void    OsMousePan(LONG Pan);                   /* horizontal wheel only, to usbmon (WM_HSCROLL) */
 
 /* Called by the OS layer */
 void    HidSetLeds(ULONG NtIndicators);
