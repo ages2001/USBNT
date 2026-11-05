@@ -1,1 +1,6 @@
 1 ICON "usbcam.ico"
+
+#define USBNT_FILE_TYPE VFT_APP
+#define USBNT_FILE_DESCRIPTION "USBNT camera viewer"
+#define USBNT_FILE_NAME "usbcam.exe"
+#include "../../src/version.rc"

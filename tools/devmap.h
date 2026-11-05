@@ -33,6 +33,8 @@ int     DevMapSlotLetters(const DEV_SLOT_MAP *M, char *Letters, int *Parts, int 
 char    DevMapLockSlot(const DEV_SLOT_MAP *M, BOOL Force, int Tries, DEV_LOCKED *L);
 void    DevMapUnlock(DEV_LOCKED *L);
 BOOL    DevMapLetterUsed(char Letter);
+BOOL    DevMapIsSlotTarget(const DEV_SLOT_MAP *Map, int Count, const char *T);
+BOOL    DevMapIsLocalStorage(const char *T);
 int     DevMapSame(const char *A, const char *B);
 BOOL    DevMapQueryTree(HANDLE Dev, USBNT_TREE *Tree);
 BOOL    DevMapQueryTree2(HANDLE Dev, USBNT_TREE2 *Tree);

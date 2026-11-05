@@ -111,6 +111,9 @@ typedef struct _UA_STREAM {
     ULONG           Current;
     ULONG           Acc;
     ULONG           Pending;
+    ULONG           Callbacks;
+    ULONG           Submitting;
+    ULONG           Starters;
     ULONG           LastDone;
     ULONG           FbLogged;
     ULONG           Measured;           /* capture: Q16.16 frames per packet the device delivers */
@@ -124,6 +127,10 @@ typedef struct _UA_MIDI {
     UCHAR           Cables;
     UCHAR           Busy;
     UCHAR           Opened;
+    ULONG           Callbacks;
+    ULONG           Submitting;
+    ULONG           Writers;
+    const UCHAR    *Ep;
     USB_PIPE        Pipe;
     USB_XFER        X;
     UCHAR          *Buf;
@@ -142,6 +149,11 @@ typedef struct _UA_DEV {
     USB_DEV        *Dev;
     ULONG           Id;
     UCHAR           Gone;
+    UCHAR           Resetting;
+    UCHAR           ResetOpen[2], ResetRun[2];
+    UA_STREAM_INFO  ResetInfo[2];
+    UA_STREAM_OPS   ResetOps[2];
+    UCHAR           VolKnown[2], SelKnown;
     UCHAR           Notified;
     UCHAR           AcIf;
     UCHAR           Uac;
@@ -202,12 +214,14 @@ static UA_DEV *Lookup(ULONG Id)
 ULONG UaDeviceCount(void)
 {
     ULONG i, n = 0;
+    OS_IRQL irql = OsLock();
 
     for (i = 0; i < UA_MAX_DEVS; i++) {
         if (UaDevs[i] != NULL && !UaDevs[i]->Gone) {
             n++;
         }
     }
+    OsUnlock(irql);
     return n;
 }
 
@@ -504,20 +518,20 @@ static int GetVolRange(UA_DEV *u, UCHAR Fu, UCHAR Ch, SHORT *Min, SHORT *Max, SH
     return USB_OK;
 }
 
-static void SetVol(UA_DEV *u, UCHAR Fu, UCHAR Ch, SHORT V)
+static int SetVol(UA_DEV *u, UCHAR Fu, UCHAR Ch, SHORT V)
 {
     UCHAR b[2];
 
     PUT16(b, (USHORT)V);
-    AcSet(u, u->Uac == 2 ? UAC2_CUR : UAC1_SET_CUR, Fu, 2, Ch, b, 2);
+    return AcSet(u, u->Uac == 2 ? UAC2_CUR : UAC1_SET_CUR, Fu, 2, Ch, b, 2);
 }
 
-static void SetMute(UA_DEV *u, UCHAR Fu, UCHAR Ch, BOOLEAN M)
+static int SetMute(UA_DEV *u, UCHAR Fu, UCHAR Ch, BOOLEAN M)
 {
     UCHAR b[1];
 
     b[0] = (UCHAR)(M ? 1 : 0);
-    AcSet(u, u->Uac == 2 ? UAC2_CUR : UAC1_SET_CUR, Fu, 1, Ch, b, 1);
+    return AcSet(u, u->Uac == 2 ? UAC2_CUR : UAC1_SET_CUR, Fu, 1, Ch, b, 1);
 }
 
 static SHORT Clamp(LONG v, SHORT Min, SHORT Max)
@@ -539,9 +553,10 @@ static SHORT Clamp(LONG v, SHORT Min, SHORT Max)
  * nearest value the unit has). The unit closest to the jack that has a
  * volume control becomes the hardware volume of the direction.
  */
-static void InitPath(UA_DEV *u, ULONG Dir)
+static int InitPath(UA_DEV *u, ULONG Dir)
 {
     ULONG k;
+    int r;
 
     for (k = 0; k < u->NFu[Dir]; k++) {
         UA_ENT *e = Ent(u, u->Fu[Dir][k]);
@@ -553,7 +568,8 @@ static void InitPath(UA_DEV *u, ULONG Dir)
         for (ch = 0; ch <= chans && ch <= 8; ch++) {
             ULONG c = FuControls(u, e, ch, &chans);
             if (HasMute(u, c)) {
-                SetMute(u, e->Id, (UCHAR)ch, FALSE);
+                r = SetMute(u, e->Id, (UCHAR)ch, FALSE);
+                if (r != USB_OK) return r;
                 if (Dir < 2) {
                     u->Info.HasMute[Dir] = 1;
                 }
@@ -561,7 +577,8 @@ static void InitPath(UA_DEV *u, ULONG Dir)
             if (HasVol(u, c)) {
                 SHORT mn = 0, mx = 0, rs = 0;
                 if (GetVolRange(u, e->Id, (UCHAR)ch, &mn, &mx, &rs) == USB_OK) {
-                    SetVol(u, e->Id, (UCHAR)ch, Clamp(0, mn, mx));
+                    r = SetVol(u, e->Id, (UCHAR)ch, Clamp(0, mn, mx));
+                    if (r != USB_OK) return r;
                     if (u->VolFu[Dir] == 0 || (u->VolFu[Dir] == e->Id && u->VolCh[Dir] != 0 && ch == 0)) {
                         u->VolFu[Dir] = e->Id;
                         u->VolCh[Dir] = (UCHAR)ch;
@@ -572,44 +589,52 @@ static void InitPath(UA_DEV *u, ULONG Dir)
                         u->Info.VolRes[Dir] = rs;
                     }
                 } else {
-                    SetVol(u, e->Id, (UCHAR)ch, 0);
+                    r = SetVol(u, e->Id, (UCHAR)ch, 0);
+                    if (r != USB_OK) return r;
                 }
             }
         }
     }
     for (k = 0; k < u->NSel[Dir]; k++) {
         UCHAR v = u->SelPin[Dir][k];
-        AcSet(u, u->Uac == 2 ? UAC2_CUR : UAC1_SET_CUR, u->SelUnit[Dir][k], (UCHAR)(u->Uac == 2 ? 1 : 0), 0, &v, 1);
+        r = AcSet(u, u->Uac == 2 ? UAC2_CUR : UAC1_SET_CUR, u->SelUnit[Dir][k], (UCHAR)(u->Uac == 2 ? 1 : 0), 0, &v, 1);
+        if (r != USB_OK) return r;
     }
     UsbLog(LOG_INFO, "audio %u: %s path: %u feature unit(s), volume unit %u (%d..%d/256 dB), %u selector(s)\n",
            u->Dev->Index, Dir == UA_PLAY ? "playback" : "capture", u->NFu[Dir], u->VolFu[Dir],
            u->Info.VolMin[Dir], u->Info.VolMax[Dir], u->NSel[Dir]);
+    return USB_OK;
 }
 
-static void ApplyVolume(UA_DEV *u, ULONG Dir)
+static int ApplyVolume(UA_DEV *u, ULONG Dir)
 {
     UA_ENT *e = Ent(u, u->VolFu[Dir]);
     ULONG chans = 0, ch;
+    int r;
     SHORT mn = u->Info.VolMin[Dir], mx = u->Info.VolMax[Dir];
 
     if (e == NULL) {
-        return;
+        return USB_OK;
     }
     if (u->VolCh[Dir] == 0) {
         LONG avg = ((LONG)u->VolL[Dir] + u->VolR[Dir]) / 2;
-        SetVol(u, e->Id, 0, Clamp(avg, mn, mx));
+        r = SetVol(u, e->Id, 0, Clamp(avg, mn, mx));
+        if (r != USB_OK) return r;
         if (HasMute(u, FuControls(u, e, 0, &chans))) {
-            SetMute(u, e->Id, 0, (BOOLEAN)u->VolMute[Dir]);
+            r = SetMute(u, e->Id, 0, (BOOLEAN)u->VolMute[Dir]);
+            if (r != USB_OK) return r;
         }
-        return;
+        return USB_OK;
     }
     for (ch = 1; ch <= u->VolChannels[Dir]; ch++) {
         SHORT v = (ch == 2) ? u->VolR[Dir] : u->VolL[Dir];
         if (u->VolMute[Dir]) {
             v = mn;
         }
-        SetVol(u, e->Id, (UCHAR)ch, Clamp(v, mn, mx));
+        r = SetVol(u, e->Id, (UCHAR)ch, Clamp(v, mn, mx));
+        if (r != USB_OK) return r;
     }
+    return USB_OK;
 }
 
 /* ------------------------------------------------------------------ */
@@ -664,7 +689,7 @@ static UCHAR ClockSource(UA_DEV *u, UCHAR Id, ULONG Rate, BOOLEAN Apply, int Dep
             if (s != 0) {
                 if (Apply) {
                     UCHAR pin = (UCHAR)(i + 1);
-                    AcSet(u, UAC2_CUR, Id, 1, 0, &pin, 1);
+                    if (AcSet(u, UAC2_CUR, Id, 1, 0, &pin, 1) != USB_OK) return 0;
                 }
                 return s;
             }
@@ -737,6 +762,7 @@ static int SetRate(UA_DEV *u, UA_STREAM *s, ULONG Rate)
         if (src == 0 && t != NULL) {
             src = ClockSource(u, t->Clock, 0, TRUE, 0);
         }
+        if (src == 0) return USB_ERR_IO;
         if (src != 0) {
             UA_ENT *cs = Ent(u, src);
             /* programmable frequency control (bits 0-1 == 3) */
@@ -885,6 +911,7 @@ static void ParseMidi(UA_DEV *u, const UCHAR *If, const UCHAR *End)
         return;
     }
     m->Opened = 1;
+    m->Ep = out;
     m->Iface = If[2];
     m->Cables = (UCHAR)(cables ? (cables > 16 ? 16 : cables) : 1);
     u->Midi = m;
@@ -1121,6 +1148,9 @@ static void XferDone(USB_XFER *X)
     BOOLEAN again;
     UA_XFER *grow = NULL;
 
+    irql = OsLock();
+    s->Callbacks++;
+    OsUnlock(irql);
     if (!x->IsFb && s->Pipe.IsoLate) {
         s->Pipe.IsoLate = 0;
         s->Stats.Late++;
@@ -1222,10 +1252,13 @@ static void XferDone(USB_XFER *X)
     OsUnlock(irql);
     if (again) {
         Submit(x);
-        if (grow != NULL && !grow->Busy) {
+        if (grow != NULL) {
             Submit(grow);
         }
     }
+    irql = OsLock();
+    s->Callbacks--;
+    OsUnlock(irql);                         /* final stream access */
 }
 
 /* fills (playback) or prepares (capture, feedback) a transfer and submits it */
@@ -1237,6 +1270,19 @@ static int Submit(UA_XFER *x)
     int r;
     OS_IRQL irql;
 
+    irql = OsLock();
+    if (!s->Open || !s->Running || s->Stopping || s->U->Gone || s->U->Dev->Gone) {
+        OsUnlock(irql);
+        return USB_ERR_NODEV;
+    }
+    if (x->Busy) {
+        OsUnlock(irql);
+        return USB_OK;
+    }
+    x->Busy = 1;
+    s->Pending++;
+    s->Submitting++;
+    OsUnlock(irql);
     if (x->IsFb) {
         for (i = 0; i < x->NPkt; i++) {
             x->Pkt[i].Offset = i * 8;
@@ -1293,10 +1339,6 @@ static int Submit(UA_XFER *x)
     x->X.IsoCount = x->NPkt;
     x->X.Complete = XferDone;
     x->X.Context = x;
-    irql = OsLock();
-    x->Busy = 1;
-    s->Pending++;
-    OsUnlock(irql);
     r = UsbSubmit(&x->X);
     if (r != USB_OK) {
         irql = OsLock();
@@ -1313,6 +1355,9 @@ static int Submit(UA_XFER *x)
         }
         s->Stats.Errors++;
     }
+    irql = OsLock();
+    s->Submitting--;
+    OsUnlock(irql);
     return r;
 }
 
@@ -1396,51 +1441,65 @@ static UA_ALT *ChooseAlt(UA_DEV *u, ULONG Dir, ULONG Rate, ULONG Channels, ULONG
 
 int UA_CALL UaGetInfo(ULONG Id, UA_INFO *Info)
 {
+    OS_IRQL guard = OsLock();
     UA_DEV *u = Lookup(Id);
 
     if (u == NULL) {
+        OsUnlock(guard);
         return USB_ERR_NODEV;
     }
     UsbMemCpy(Info, &u->Info, sizeof(*Info));
+    OsUnlock(guard);
     return USB_OK;
+}
+
+/* Close admission before waiting, then cancel only after all submitters leave.
+   Pending covers collected callbacks; Callbacks covers their client/rearm tail. */
+static void QuiesceStream(UA_STREAM *s)
+{
+    OS_IRQL irql;
+    ULONG busy;
+    irql = OsLock();
+    s->Open = 0;
+    s->Stopping = 1;
+    s->Running = 0;
+    s->Stats.Running = 0;
+    OsUnlock(irql);
+    for (;;) {
+        irql = OsLock();
+        busy = s->Submitting + s->Starters;
+        OsUnlock(irql);
+        if (!busy) break;
+        OsSleepMs(1);
+    }
+    UsbClosePipe(&s->Pipe);
+    if (s->HasFb) UsbClosePipe(&s->FbPipe);
+    for (;;) {
+        irql = OsLock();
+        busy = s->Pending + s->Callbacks;
+        OsUnlock(irql);
+        if (!busy) break;
+        UsbPollAll();
+        OsSleepMs(1);
+    }
 }
 
 static void CloseNow(ULONG Id, ULONG Dir)
 {
     UA_DEV *u = Lookup(Id);
     UA_STREAM *s;
-    ULONG start;
-
-    if (u == NULL || Dir > 1) {
-        return;
-    }
+    if (u == NULL || Dir > 1) return;
     s = &u->S[Dir];
-    if (!s->Open) {
-        return;
-    }
-    UaStop(Id, Dir);
-    start = OsTimeMs();
-    while (s->Pending != 0 && OsTimeMs() - start < 500) {
-        UsbPollAll();
-        OsSleepMs(5);
-    }
-    s->Open = 0;
-    UsbClosePipe(&s->Pipe);
-    if (s->HasFb) {
-        UsbClosePipe(&s->FbPipe);
-    }
-    s->Running = 0;
-    s->Pending = 0;
+    if (u->Resetting) { u->ResetOpen[Dir] = u->ResetRun[Dir] = 0; }
+    if (!s->Open) return;
+    QuiesceStream(s);
     FreeStreamBuffers(s);
-    if (!u->Dev->Gone && s->Alt != NULL) {
-        UsbSetInterface(u->Dev, s->Alt->Iface, 0);
-    }
+    if (!u->Dev->Gone && s->Alt != NULL) UsbSetInterface(u->Dev, s->Alt->Iface, 0);
 }
 
-static int OpenNow(ULONG Id, ULONG Dir, ULONG Rate, ULONG Channels, ULONG Bits, const UA_STREAM_OPS *Ops,
+static int OpenStream(UA_DEV *u, ULONG Dir, ULONG Rate, ULONG Channels, ULONG Bits, const UA_STREAM_OPS *Ops,
                    UA_STREAM_INFO *Out)
 {
-    UA_DEV *u = Lookup(Id);
     UA_STREAM *s;
     UA_ALT *a;
     ULONG rate = 0;
@@ -1453,7 +1512,8 @@ static int OpenNow(ULONG Id, ULONG Dir, ULONG Rate, ULONG Channels, ULONG Bits, 
     }
     s = &u->S[Dir];
     if (s->Open) {
-        CloseNow(Id, Dir);
+        QuiesceStream(s);
+        FreeStreamBuffers(s);
     }
     a = ChooseAlt(u, Dir, Rate, Channels, Bits, &rate);
     if (a == NULL) {
@@ -1468,7 +1528,8 @@ static int OpenNow(ULONG Id, ULONG Dir, ULONG Rate, ULONG Channels, ULONG Bits, 
         UsbLog(LOG_ERR, "audio %u: set interface %u alt %u failed (%d)\n", u->Dev->Index, a->Iface, a->Fmt.Alt, r);
         return r;
     }
-    SetRate(u, s, rate);
+    r = SetRate(u, s, rate);
+    if (r != USB_OK) { UsbSetInterface(u->Dev, a->Iface, 0); return r; }
     r = UsbOpenPipe(u->Dev, &s->Pipe, a->Ep);
     if (r != USB_OK) {
         UsbSetInterface(u->Dev, a->Iface, 0);
@@ -1476,9 +1537,13 @@ static int OpenNow(ULONG Id, ULONG Dir, ULONG Rate, ULONG Channels, ULONG Bits, 
     }
     s->HasFb = 0;
     if (a->Fb != NULL && Dir == UA_PLAY) {
-        if (UsbOpenPipe(u->Dev, &s->FbPipe, a->Fb) == USB_OK) {
-            s->HasFb = 1;
+        r = UsbOpenPipe(u->Dev, &s->FbPipe, a->Fb);
+        if (r != USB_OK) {
+            UsbClosePipe(&s->Pipe);
+            UsbSetInterface(u->Dev, a->Iface, 0);
+            return r;
         }
+        s->HasFb = 1;
     }
     s->FrameBytes = (ULONG)a->Fmt.Channels * a->Fmt.SubSize;
     s->Slots = s->Pipe.IsoSlots ? s->Pipe.IsoSlots : 8;
@@ -1536,7 +1601,11 @@ static int OpenNow(ULONG Id, ULONG Dir, ULONG Rate, ULONG Channels, ULONG Bits, 
             x->Buf = (UCHAR *)UsbDmaAlloc(64, &x->Phys);
             x->Pkt = (USB_ISO_PACKET *)OsAlloc(sizeof(USB_ISO_PACKET) * 8);
             if (x->Buf == NULL || x->Pkt == NULL) {
-                s->HasFb = 0;
+                UsbClosePipe(&s->FbPipe);
+                UsbClosePipe(&s->Pipe);
+                FreeStreamBuffers(s);
+                UsbSetInterface(u->Dev, a->Iface, 0);
+                return USB_ERR_NOMEM;
             }
         }
     }
@@ -1555,6 +1624,14 @@ static int OpenNow(ULONG Id, ULONG Dir, ULONG Rate, ULONG Channels, ULONG Bits, 
            u->Dev->Index, Dir == UA_PLAY ? "playback" : "capture", a->Fmt.Alt, rate, a->Fmt.Channels,
            a->Fmt.SubSize * 8, s->NX, s->PktPerXfer, s->Slots, s->HasFb ? ", feedback" : "");
     return USB_OK;
+}
+
+static int OpenNow(ULONG Id, ULONG Dir, ULONG Rate, ULONG Channels, ULONG Bits, const UA_STREAM_OPS *Ops,
+                   UA_STREAM_INFO *Out)
+{
+    UA_DEV *u = Lookup(Id);
+    if (u != NULL && u->Resetting) return USB_ERR_BUSY;
+    return OpenStream(u, Dir, Rate, Channels, Bits, Ops, Out);
 }
 
 /*
@@ -1673,23 +1750,27 @@ void UA_CALL UaClose(ULONG Id, ULONG Dir)
     CallWorker(&c);
 }
 
-int UA_CALL UaStart(ULONG Id, ULONG Dir)
+static int StartStream(UA_DEV *Target, ULONG Id, ULONG Dir)
 {
-    UA_DEV *u = Lookup(Id);
+    UA_DEV *u;
     UA_STREAM *s;
     OS_IRQL irql;
     ULONG i;
     BOOLEAN fresh;
+    int result = USB_OK, r;
 
-    if (u == NULL || Dir > 1) {
-        return USB_ERR_NODEV;
-    }
-    s = &u->S[Dir];
     irql = OsLock();
-    if (!s->Open) {
+    u = Target != NULL ? Target : Lookup(Id);
+    if (u == NULL || Dir > 1) {
         OsUnlock(irql);
         return USB_ERR_NODEV;
     }
+    s = &u->S[Dir];
+    if (!s->Open || (u->Resetting && Target == NULL)) {
+        OsUnlock(irql);
+        return USB_ERR_NODEV;
+    }
+    s->Starters++;
     fresh = (BOOLEAN)!s->Running;
     s->Running = 1;
     s->Stopping = 0;
@@ -1707,77 +1788,102 @@ int UA_CALL UaStart(ULONG Id, ULONG Dir)
                 Submit(&s->Fbx[i]);
             }
         }
-        return USB_OK;
+        result = USB_OK;
+        goto done;
     }
     s->Acc = 0;
     s->LastDone = 0;
     s->Measured = 0;
     s->Current = s->Nominal;
     for (i = 0; i < s->NX; i++) {
-        if (Submit(&s->Xf[i]) != USB_OK) {
-            break;
-        }
+        r = Submit(&s->Xf[i]);
+        if (r != USB_OK) { if (Target != NULL) result = r; break; }
     }
     if (s->HasFb) {
         for (i = 0; i < UA_NFB; i++) {
-            Submit(&s->Fbx[i]);
+            r = Submit(&s->Fbx[i]);
+            if (r != USB_OK && Target != NULL) result = r;
         }
     }
-    return s->Running ? USB_OK : USB_ERR_IO;
+    if (result == USB_OK) result = s->Running ? USB_OK : USB_ERR_IO;
+done:
+    irql = OsLock();
+    s->Starters--;
+    OsUnlock(irql);
+    return result;
+}
+
+int UA_CALL UaStart(ULONG Id, ULONG Dir)
+{
+    return StartStream(NULL, Id, Dir);
 }
 
 void UA_CALL UaStop(ULONG Id, ULONG Dir)
 {
+    OS_IRQL guard = OsLock();
     UA_DEV *u = Lookup(Id);
-    OS_IRQL irql;
 
     if (u == NULL || Dir > 1) {
+        OsUnlock(guard);
         return;
     }
-    irql = OsLock();
+    if (u->Resetting) u->ResetRun[Dir] = 0;
     if (u->S[Dir].Running) {
         u->S[Dir].Stopping = 1;
     }
     u->S[Dir].Stats.Running = 0;
-    OsUnlock(irql);
+    OsUnlock(guard);
 }
 
 void UA_CALL UaGetStats(ULONG Id, ULONG Dir, UA_STATS *Stats)
 {
+    OS_IRQL guard = OsLock();
     UA_DEV *u = Lookup(Id);
 
     if (u == NULL || Dir > 1) {
         UsbMemSet(Stats, 0, sizeof(*Stats));
+        OsUnlock(guard);
         return;
     }
     UsbMemCpy(Stats, &u->S[Dir].Stats, sizeof(*Stats));
     Stats->TickMaxGapMs = TickMaxGap;
+    OsUnlock(guard);
 }
 
 int UA_CALL UaSetVolume(ULONG Id, ULONG Dir, SHORT Left, SHORT Right, BOOLEAN Mute)
 {
+    OS_IRQL guard = OsLock();
     UA_DEV *u = Lookup(Id);
 
     if (u == NULL || Dir > 1 || !u->Info.HasVolume[Dir]) {
+        OsUnlock(guard);
         return USB_ERR_NODEV;
     }
+    if (u->Resetting) { OsUnlock(guard); return USB_ERR_BUSY; }
+    u->VolKnown[Dir] = 1;
     u->VolL[Dir] = Left;
     u->VolR[Dir] = Right;
     u->VolMute[Dir] = (UCHAR)(Mute ? 1 : 0);
     u->VolPending[Dir] = 1;
+    OsUnlock(guard);
     OsWakeWorker();
     return USB_OK;
 }
 
 int UA_CALL UaSelectInput(ULONG Id, ULONG Index)
 {
+    OS_IRQL guard = OsLock();
     UA_DEV *u = Lookup(Id);
 
     if (u == NULL || Index >= u->Info.NumInputs) {
+        OsUnlock(guard);
         return USB_ERR_PARAM;
     }
+    if (u->Resetting) { OsUnlock(guard); return USB_ERR_BUSY; }
+    u->SelKnown = 1;
     u->SelIndex = (UCHAR)Index;
     u->SelPending = 1;
+    OsUnlock(guard);
     OsWakeWorker();
     return USB_OK;
 }
@@ -1794,13 +1900,15 @@ static void MidiDone(USB_XFER *X)
     OS_IRQL irql;
 
     irql = OsLock();
-    if (u->Midi != NULL) {
-        u->Midi->Busy = 0;
-    }
+    u->Midi->Callbacks++;
+    u->Midi->Busy = 0;
     OsUnlock(irql);
     if (!u->Gone) {
         MidiKick(u);
     }
+    irql = OsLock();
+    u->Midi->Callbacks--;
+    OsUnlock(irql);
 }
 
 static void MidiKick(UA_DEV *u)
@@ -1818,7 +1926,7 @@ static void MidiKick(UA_DEV *u)
         maxn = 128;
     }
     irql = OsLock();
-    if (m->Busy || m->Head == m->Tail) {
+    if (u->Gone || u->Resetting || !m->Opened || m->Busy || m->Head == m->Tail) {
         OsUnlock(irql);
         return;
     }
@@ -1828,6 +1936,7 @@ static void MidiKick(UA_DEV *u)
         n++;
     }
     m->Busy = 1;
+    m->Submitting++;
     OsUnlock(irql);
     UsbMemSet(&m->X, 0, sizeof(m->X));
     m->X.Pipe = &m->Pipe;
@@ -1841,6 +1950,9 @@ static void MidiKick(UA_DEV *u)
         m->Busy = 0;
         OsUnlock(irql);
     }
+    irql = OsLock();
+    m->Submitting--;
+    OsUnlock(irql);
 }
 
 static void MidiPut(UA_MIDI *m, ULONG Cable, UCHAR Cin, const UCHAR *b, ULONG n)
@@ -1876,16 +1988,20 @@ static ULONG MidiLen(UCHAR St)
 /* MIDI byte stream (running status, sysex) into USB-MIDI event packets */
 int UA_CALL UaMidiOut(ULONG Id, ULONG Cable, const UCHAR *Data, ULONG Len)
 {
-    UA_DEV *u = Lookup(Id);
+    UA_DEV *u;
     UA_MIDI *m;
     ULONG i, c = Cable & 15;
     OS_IRQL irql;
 
+    irql = OsLock();
+    u = Lookup(Id);
     if (u == NULL || u->Midi == NULL) {
+        OsUnlock(irql);
         return USB_ERR_NODEV;
     }
+    if (u->Resetting) { OsUnlock(irql); return USB_ERR_BUSY; }
     m = u->Midi;
-    irql = OsLock();
+    m->Writers++;
     for (i = 0; i < Len; i++) {
         UCHAR b = Data[i];
         if (b >= 0xF8) {                                /* real time, anywhere */
@@ -1948,6 +2064,9 @@ int UA_CALL UaMidiOut(ULONG Id, ULONG Cable, const UCHAR *Data, ULONG Len)
     }
     OsUnlock(irql);
     MidiKick(u);
+    irql = OsLock();
+    m->Writers--;
+    OsUnlock(irql);
     return USB_OK;
 }
 
@@ -1991,7 +2110,7 @@ void AudioService(void)
 
     for (i = 0; i < UA_MAX_DEVS; i++) {
         UA_DEV *u = UaDevs[i];
-        if (u == NULL || u->Gone) {
+        if (u == NULL || u->Gone || u->Resetting) {
             continue;
         }
         if (!u->Notified && UaClientSet) {
@@ -2028,46 +2147,153 @@ void AudioTick(void)
     TickLast = now;
 }
 
+static void QuiesceMidi(UA_MIDI *m)
+{
+    OS_IRQL irql;
+    ULONG busy;
+    if (m == NULL) return;
+    irql = OsLock();
+    m->Opened = 0;
+    OsUnlock(irql);
+    for (;;) {
+        irql = OsLock();
+        busy = m->Submitting + m->Writers;
+        OsUnlock(irql);
+        if (!busy) break;
+        OsSleepMs(1);
+    }
+    UsbClosePipe(&m->Pipe);
+    for (;;) {
+        irql = OsLock();
+        busy = m->Busy + m->Callbacks;
+        OsUnlock(irql);
+        if (!busy) break;
+        UsbPollAll();
+        OsSleepMs(1);
+    }
+}
+
 void AudioDetach(USB_DEV *Dev)
 {
     UA_DEV *u = (UA_DEV *)Dev->Audio;
     ULONG i, d;
-
-    if (u == NULL) {
-        return;
-    }
+    OS_IRQL irql;
+    if (u == NULL) return;
+    irql = OsLock();
     u->Gone = 1;
-    if (u->Notified && UaClientSet && UaClient.Removal != NULL) {
-        UaClient.Removal(UaClient.Context, u->Id);
-    }
+    for (i = 0; i < UA_MAX_DEVS; i++) if (UaDevs[i] == u) UaDevs[i] = NULL;
+    OsUnlock(irql);
     for (d = 0; d < 2; d++) {
         UA_STREAM *s = &u->S[d];
-        if (s->Open) {
-            ULONG t0;
-            s->Open = 0;
-            UsbClosePipe(&s->Pipe);
-            if (s->HasFb) {
-                UsbClosePipe(&s->FbPipe);
-            }
-            /* a completion may still be running on another processor */
-            t0 = OsTimeMs();
-            while (s->Pending != 0 && OsTimeMs() - t0 < 100) {
-                OsSleepMs(1);
-            }
-            FreeStreamBuffers(s);
+        QuiesceStream(s);
+        FreeStreamBuffers(s);
+    }
+    if (u->Midi != NULL) {
+        UA_MIDI *m = u->Midi;
+        QuiesceMidi(m);
+        UsbDmaFree(m->Buf, 512);
+        OsFree(m);
+        u->Midi = NULL;
+    }
+    /* Clients may free their callback context on removal notification. */
+    if (u->Notified && UaClientSet && UaClient.Removal != NULL)
+        UaClient.Removal(UaClient.Context, u->Id);
+    Dev->Audio = NULL;
+    OsFree(u);
+}
+
+ULONG AudioResetInterfaces(USB_DEV *Dev)
+{
+    UA_DEV *u = (UA_DEV *)Dev->Audio;
+    ULONG mask = 0, d, a;
+    if (u == NULL || u->Gone) return 0;
+    if (u->AcIf < 32) mask |= 1UL << u->AcIf;
+    for (d = 0; d < 2; d++) for (a = 0; a < u->NAlt[d]; a++)
+        if (u->Alts[d][a].Iface < 32) mask |= 1UL << u->Alts[d][a].Iface;
+    if (u->Midi != NULL && u->Midi->Iface < 32) mask |= 1UL << u->Midi->Iface;
+    return mask;
+}
+
+void AudioBeginDeviceReset(USB_DEV *Dev)
+{
+    UA_DEV *u = (UA_DEV *)Dev->Audio;
+    ULONG d;
+    OS_IRQL irql;
+    if (u == NULL || u->Gone) return;
+    irql = OsLock();
+    if (!u->Resetting) for (d = 0; d < 2; d++) {
+        u->ResetInfo[d] = u->S[d].Info;
+        u->ResetOps[d] = u->S[d].Ops;
+        u->ResetOpen[d] = u->S[d].Open;
+        u->ResetRun[d] = (UCHAR)(u->S[d].Running && !u->S[d].Stopping);
+    }
+    u->Resetting = 1;
+    OsUnlock(irql);
+    for (d = 0; d < 2; d++) { QuiesceStream(&u->S[d]); FreeStreamBuffers(&u->S[d]); }
+    QuiesceMidi(u->Midi);
+}
+
+int AudioRestoreDevice(USB_DEV *Dev)
+{
+    UA_DEV *u = (UA_DEV *)Dev->Audio;
+    ULONG d;
+    int r;
+    if (u == NULL) return USB_OK;
+    if (u->Gone || Dev->Gone || !u->Resetting) return USB_ERR_NODEV;
+    for (d = 0; d < 2; d++) {
+        if (u->NAlt[d]) {
+            r = InitPath(u, d);
+            if (r != USB_OK) return r;
+        }
+        if (u->VolKnown[d]) {
+            r = ApplyVolume(u, d);
+            if (r != USB_OK) return r;
+        }
+        if (u->ResetOpen[d]) {
+            UA_STREAM_INFO info = u->ResetInfo[d];
+            UA_STREAM_OPS ops = u->ResetOps[d];
+            r = OpenStream(u, d, info.Rate, info.Channels, info.Bits, &ops, NULL);
+            if (r != USB_OK) return r;
+            if (u->S[d].Info.Rate != info.Rate || u->S[d].Info.Channels != info.Channels ||
+                u->S[d].Info.Bits != info.Bits || u->S[d].Info.Alt != info.Alt) return USB_ERR_IO;
+        }
+    }
+    if (u->SelKnown) {
+        ULONG k = u->SelIndex;
+        if (u->InSelUnit[k]) {
+            UCHAR pin = u->InSelPin[k];
+            r = AcSet(u, u->Uac == 2 ? UAC2_CUR : UAC1_SET_CUR, u->InSelUnit[k],
+                      (UCHAR)(u->Uac == 2 ? 1 : 0), 0, &pin, 1);
+            if (r != USB_OK) return r;
         }
     }
     if (u->Midi != NULL) {
-        UsbClosePipe(&u->Midi->Pipe);
-        UsbDmaFree(u->Midi->Buf, 512);
-        OsFree(u->Midi);
-        u->Midi = NULL;
+        r = UsbOpenPipe(Dev, &u->Midi->Pipe, u->Midi->Ep);
+        if (r != USB_OK) return r;
+        u->Midi->Opened = 1;
     }
-    for (i = 0; i < UA_MAX_DEVS; i++) {
-        if (UaDevs[i] == u) {
-            UaDevs[i] = NULL;
-        }
+    for (d = 0; d < 2; d++) if (u->ResetOpen[d] && u->ResetRun[d]) {
+        r = StartStream(u, u->Id, d);
+        if (r != USB_OK) return r;
     }
-    Dev->Audio = NULL;
-    OsFree(u);
+    return USB_OK;
+}
+
+void AudioEndDeviceReset(USB_DEV *Dev, int Result)
+{
+    UA_DEV *u = (UA_DEV *)Dev->Audio;
+    ULONG d;
+    OS_IRQL irql;
+    if (u == NULL) return;
+    if (Result != USB_OK) {
+        for (d = 0; d < 2; d++) { QuiesceStream(&u->S[d]); FreeStreamBuffers(&u->S[d]); }
+        QuiesceMidi(u->Midi);
+        return;                            /* preserve requested settings for retry */
+    }
+    irql = OsLock();
+    u->Resetting = 0;
+    u->ResetOpen[0] = u->ResetOpen[1] = u->ResetRun[0] = u->ResetRun[1] = 0;
+    OsUnlock(irql);
+    MidiKick(u);
+    OsWakeWorker();
 }

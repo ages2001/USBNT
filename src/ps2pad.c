@@ -228,6 +228,7 @@ static void Start(PS2PAD *P, ULONG Flags, PTP_OUT Out, void *Ctx)
 #define SYN_PASS            BIT(7)
 #define SYN_MULTIFINGER     BIT(1)
 #define SYN_X_CLICKPAD      BIT(20)     /* 0x0c */
+#define SYN_X_CLICKPAD2     BIT(8)      /* 0x0c: two button ClickPad */
 #define SYN_X_ADV_GESTURE   BIT(19)
 #define SYN_X_MAX           BIT(17)
 #define SYN_X_MIN           BIT(13)
@@ -308,7 +309,7 @@ static int Synaptics(PS2PAD *P, const PS2PAD_IO *Io, PTP_OUT Out, void *Ctx)
     if (P->Agm && (!Sliced(Io, 0x03) || !Arg(Io, 0xF3, 0xC8))) {
         P->Agm = 0;
     }
-    P->ClickPad = (UCHAR)((P->Ext0C & SYN_X_CLICKPAD) != 0);
+    P->ClickPad = (UCHAR)((P->Ext0C & (SYN_X_CLICKPAD | SYN_X_CLICKPAD2)) != 0);
     P->Stick = (UCHAR)((P->Caps & SYN_PASS) != 0);
     if (P->ClickPad) flags |= PTP_PAD_CLICKPAD;
     if (!(P->Caps & SYN_MULTIFINGER) && !P->Agm) flags |= PTP_PAD_ONEFINGER;
@@ -355,7 +356,9 @@ static void SynPacket(PS2PAD *P)
     mid = (UCHAR)((b[0] ^ b[3]) & 0x01);
     btn = (UCHAR)(b[0] & 0x03);
     if (P->ClickPad) {
-        btn = (UCHAR)((b[0] & 0x02) | mid);             /* the ClickPad's button comes as the middle bit */
+        /* the one button ClickPad's button comes as the middle bit, a two button one's as left /
+           right; some report it in the left bit too */
+        btn = (UCHAR)((b[0] & 0x03) | mid);
     } else if (P->Caps & SYN_MIDDLE) {
         btn |= (UCHAR)(mid << 2);
     }

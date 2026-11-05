@@ -180,6 +180,28 @@ static void HcStopW(void *A)
     UsbPnpStop(a->X->Bus, a->X->Dev, a->X->Fn, a->Gone);
 }
 
+static void HcSleepW(void *A)
+{
+    HC_ARG *a = (HC_ARG *)A;
+    a->Result = a->X->Bus == 0xFF ? USB_ERR_PARAM :
+        UsbdiControllerPower(a->X->Bus, a->X->Dev, a->X->Fn, 1, &a->X->Sleeping);
+}
+
+static void HcResumeW(void *A)
+{
+    HC_ARG *a = (HC_ARG *)A;
+    a->Result = a->X->Bus == 0xFF ? USB_ERR_PARAM :
+        UsbdiControllerPower(a->X->Bus, a->X->Dev, a->X->Fn, 2, &a->X->Sleeping);
+}
+
+static void HcQuerySleepW(void *A)
+{
+    HC_ARG *a = (HC_ARG *)A;
+    BOOLEAN sleeping;
+    a->Result = a->X->Bus == 0xFF ? USB_ERR_PARAM :
+        UsbdiControllerPower(a->X->Bus, a->X->Dev, a->X->Fn, 0, &sleeping);
+}
+
 static BOOLEAN PciAddress(PDEVICE_OBJECT Pdo, UCHAR *Bus, UCHAR *Dev, UCHAR *Fn)
 {
     ULONG bus = 0, addr = 0, len;
@@ -223,11 +245,14 @@ static NTSTATUS HcPnp(WDM_EXT *x, PIRP Irp)
                 a.Settle = TRUE;
                 WdmRunInWorker(HcStartW, &a);
                 UsbLog(LOG_INFO, "PnP: %02x:%02x.%u started (%d)\n", x->Bus, x->Dev, x->Fn, a.Result);
-                x->Started = TRUE;
-                st = STATUS_SUCCESS;
-                /* no USBNT\Bus device (text-mode setup made none): this controller is the device bus */
-                WdmBusOnController(x);
-                WdmTreeHcStarted(x);                /* Device Manager: which controller it is */
+                x->Started = (BOOLEAN)(a.Result == USB_OK);
+                st = x->Started ? STATUS_SUCCESS : STATUS_IO_DEVICE_ERROR;
+                if (x->Started) {
+                    x->Sleeping = FALSE;
+                    /* Only publish a bus whose controller actually started. */
+                    WdmBusOnController(x);
+                    WdmTreeHcStarted(x);
+                }
             }
         }
         return WdmComplete(Irp, st, 0);
@@ -310,64 +335,210 @@ void WdmInvalidateHcs(void)
 /* Power                                                                */
 /* ------------------------------------------------------------------ */
 
-static VOID NTAPI ResumeWork(PDEVICE_OBJECT Dev, PVOID Ctx)
-{
-    WDM_EXT *x = (WDM_EXT *)Dev->DeviceExtension;
-    HC_ARG a;
+/* Power IRPs may arrive at DISPATCH_LEVEL. Only device transitions run in
+ * a passive work item; system IRPs request the matching device IRP through
+ * the power manager. A remove lock covers every asynchronous continuation. */
+typedef struct _HC_POWER {
+    WDM_EXT *X;
+    PIRP Irp;
+    PIO_WORKITEM Work;
+    DEVICE_POWER_STATE State;
+} HC_POWER;
 
-    a.X = x;
-    a.Gone = FALSE;
-    a.Settle = FALSE;
-    if (x->Sleeping && !x->Removed) {
-        x->Sleeping = FALSE;
-        WdmRunInWorker(HcStartW, &a);
-        UsbLog(LOG_INFO, "PnP: %02x:%02x.%u running again after sleep (%d)\n", x->Bus, x->Dev, x->Fn, a.Result);
-    }
-    IoFreeWorkItem((PIO_WORKITEM)Ctx);
+static void HcPowerComplete(HC_POWER *P, NTSTATUS Status)
+{
+    WDM_EXT *x = P->X;
+    PIRP irp = P->Irp;
+
+    if (P->Work != NULL) IoFreeWorkItem(P->Work);
+    OsFree(P);
+    irp->IoStatus.Status = Status;
+    irp->IoStatus.Information = 0;
+    PoStartNextPowerIrp(irp);
+    IoReleaseRemoveLock(&x->PowerLock, irp);
+    IoCompleteRequest(irp, IO_NO_INCREMENT);
 }
 
-static NTSTATUS NTAPI PowerUpDone(PDEVICE_OBJECT Dev, PIRP Irp, PVOID Ctx)
+static NTSTATUS HcPowerForwardSync(WDM_EXT *X, PIRP Irp)
 {
-    WDM_EXT *x = (WDM_EXT *)Dev->DeviceExtension;
-    PIO_WORKITEM wi;
+    KEVENT done;
+    NTSTATUS st;
 
-    (void)Ctx;
-    if (Irp->PendingReturned) {
-        IoMarkIrpPending(Irp);
+    KeInitializeEvent(&done, NotificationEvent, FALSE);
+    IoCopyCurrentIrpStackLocationToNext(Irp);
+    IoSetCompletionRoutine(Irp, SyncDone, &done, TRUE, TRUE, TRUE);
+    st = PoCallDriver(X->Lower, Irp);
+    if (st == STATUS_PENDING) KeWaitForSingleObject(&done, Executive, KernelMode, FALSE, NULL);
+    return Irp->IoStatus.Status;
+}
+
+static VOID NTAPI HcDevicePowerWork(PDEVICE_OBJECT Dev, PVOID Ctx)
+{
+    HC_POWER *p = (HC_POWER *)Ctx;
+    WDM_EXT *x = p->X;
+    HC_ARG a;
+    NTSTATUS st;
+    BOOLEAN stopped = FALSE;
+    POWER_STATE state;
+
+    (void)Dev;
+    a.X = x;
+    a.Gone = FALSE;
+    a.Settle = TRUE;
+    if (x->Removed || x->Gone) {
+        HcPowerComplete(p, STATUS_NO_SUCH_DEVICE);
+        return;
     }
-    if (x->Sleeping) {
-        wi = IoAllocateWorkItem(Dev);
-        if (wi != NULL) {
-            IoQueueWorkItem(wi, ResumeWork, DelayedWorkQueue, wi);
+    if (IoGetCurrentIrpStackLocation(p->Irp)->MinorFunction == IRP_MN_QUERY_POWER) {
+        if (p->State == PowerDeviceD3) {
+            WdmRunInWorker(HcQuerySleepW, &a);
+            if (a.Result != USB_OK) {
+                HcPowerComplete(p, STATUS_DEVICE_BUSY);
+                return;
+            }
+        }
+        st = HcPowerForwardSync(x, p->Irp);
+        HcPowerComplete(p, st);
+        return;
+    }
+    if (p->State == PowerDeviceD3 && !x->Sleeping) {
+        /* Quiesce DMA while PCI is powered, retaining every child identity. */
+        WdmRunInWorker(HcSleepW, &a);
+        if (a.Result != USB_OK) {
+            if (x->Sleeping) WdmRunInWorker(HcResumeW, &a);
+            HcPowerComplete(p, STATUS_DEVICE_BUSY);
+            return;
+        }
+        stopped = TRUE;
+    }
+    st = HcPowerForwardSync(x, p->Irp);
+    if ((NT_SUCCESS(st) && p->State == PowerDeviceD0 && x->Sleeping) ||
+        (!NT_SUCCESS(st) && stopped)) {
+        /* Failed power-down must restore the previous running state. A
+         * failed lower power-up must never touch unpowered registers. */
+        WdmRunInWorker(HcResumeW, &a);
+        if (a.Result == USB_OK) x->Sleeping = FALSE;
+        else {
+            UsbLog(LOG_ERR, "PnP: controller resume failed (%d)\n", a.Result);
+            if (NT_SUCCESS(st)) st = STATUS_IO_DEVICE_ERROR;
         }
     }
-    PoStartNextPowerIrp(Irp);
+    if (NT_SUCCESS(st)) {
+        state.DeviceState = p->State;
+        PoSetPowerState(x->Nt.Self, DevicePowerState, state);
+    }
+    HcPowerComplete(p, st);
+}
+
+static VOID NTAPI HcSystemDeviceDone(PDEVICE_OBJECT Dev, UCHAR Minor,
+                                    POWER_STATE State, PVOID Ctx, PIO_STATUS_BLOCK Status)
+{
+    (void)Dev;
+    (void)Minor;
+    (void)State;
+    HcPowerComplete((HC_POWER *)Ctx, Status->Status);
+}
+
+static NTSTATUS NTAPI HcSystemPowerDone(PDEVICE_OBJECT Dev, PIRP Irp, PVOID Ctx)
+{
+    HC_POWER *p = (HC_POWER *)Ctx;
+    POWER_STATE state;
+    NTSTATUS st = Irp->IoStatus.Status;
+    UCHAR minor = IoGetCurrentIrpStackLocation(Irp)->MinorFunction;
+
+    (void)Dev;
+    if (NT_SUCCESS(st)) {
+        state.DeviceState = p->State;
+        /* Do not block an executive worker waiting for another power worker.
+         * The callback owns p once PoRequestPowerIrp accepts this request. */
+        st = PoRequestPowerIrp(p->X->Pdo, minor, state, HcSystemDeviceDone, p, NULL);
+        if (NT_SUCCESS(st)) return STATUS_MORE_PROCESSING_REQUIRED;
+    }
+    HcPowerComplete(p, st);
+    return STATUS_MORE_PROCESSING_REQUIRED;
+}
+
+static NTSTATUS NTAPI HcPowerPassDone(PDEVICE_OBJECT Dev, PIRP Irp, PVOID Ctx)
+{
+    WDM_EXT *x = (WDM_EXT *)Ctx;
+    (void)Dev;
+    if (Irp->PendingReturned) IoMarkIrpPending(Irp);
+    IoReleaseRemoveLock(&x->PowerLock, Irp);
     return STATUS_SUCCESS;
 }
 
 static NTSTATUS FdoPower(WDM_EXT *x, PIRP Irp)
 {
     PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(Irp);
+    HC_POWER *p;
+    NTSTATUS st;
+    DEVICE_POWER_STATE target;
 
-    if (x->Nt.Kind == EXT_HC && x->Started && sp->MinorFunction == IRP_MN_SET_POWER &&
-        sp->Parameters.Power.Type == SystemPowerState) {
-        SYSTEM_POWER_STATE s = sp->Parameters.Power.State.SystemState;
-        if (s > PowerSystemWorking && !x->Sleeping) {
-            HC_ARG a;
-            a.X = x;
-            a.Gone = FALSE;
-            a.Settle = FALSE;
-            x->Sleeping = TRUE;
-            WdmRunInWorker(HcStopW, &a);
-        } else if (s == PowerSystemWorking && x->Sleeping) {
-            IoCopyCurrentIrpStackLocationToNext(Irp);
-            IoSetCompletionRoutine(Irp, PowerUpDone, NULL, TRUE, TRUE, TRUE);
-            return PoCallDriver(x->Lower, Irp);
-        }
+    if (x->Nt.Kind != EXT_HC) {
+        PoStartNextPowerIrp(Irp);
+        IoSkipCurrentIrpStackLocation(Irp);
+        return PoCallDriver(x->Lower, Irp);
     }
+    st = IoAcquireRemoveLock(&x->PowerLock, Irp);
+    if (!NT_SUCCESS(st)) {
+        PoStartNextPowerIrp(Irp);
+        return WdmComplete(Irp, st, 0);
+    }
+    if (x->Removed || x->Gone) {
+        st = STATUS_NO_SUCH_DEVICE;
+        goto fail;
+    }
+    if (!x->Started || (sp->MinorFunction != IRP_MN_SET_POWER && sp->MinorFunction != IRP_MN_QUERY_POWER)) {
+        PoStartNextPowerIrp(Irp);
+        IoCopyCurrentIrpStackLocationToNext(Irp);
+        IoSetCompletionRoutine(Irp, HcPowerPassDone, x, TRUE, TRUE, TRUE);
+        return PoCallDriver(x->Lower, Irp);
+    }
+    if (sp->Parameters.Power.Type == SystemPowerState) {
+        SYSTEM_POWER_STATE state = sp->Parameters.Power.State.SystemState;
+        if (state <= PowerSystemUnspecified || state >= PowerSystemMaximum) {
+            st = STATUS_INVALID_PARAMETER;
+            goto fail;
+        }
+        target = state == PowerSystemWorking ? PowerDeviceD0 : PowerDeviceD3;
+    } else if (sp->Parameters.Power.Type == DevicePowerState) {
+        target = sp->Parameters.Power.State.DeviceState;
+        if (target != PowerDeviceD0 && target != PowerDeviceD3) {
+            st = STATUS_NOT_SUPPORTED;
+            goto fail;
+        }
+    } else {
+        st = STATUS_INVALID_PARAMETER;
+        goto fail;
+    }
+    p = (HC_POWER *)OsAlloc(sizeof(*p));
+    if (p == NULL) {
+        st = STATUS_INSUFFICIENT_RESOURCES;
+        goto fail;
+    }
+    p->X = x;
+    p->Irp = Irp;
+    p->State = target;
+    if (sp->Parameters.Power.Type == DevicePowerState) {
+        p->Work = IoAllocateWorkItem(x->Nt.Self);
+        if (p->Work == NULL) {
+            OsFree(p);
+            st = STATUS_INSUFFICIENT_RESOURCES;
+            goto fail;
+        }
+        IoMarkIrpPending(Irp);
+        IoQueueWorkItem(p->Work, HcDevicePowerWork, DelayedWorkQueue, p);
+    } else {
+        IoMarkIrpPending(Irp);
+        IoCopyCurrentIrpStackLocationToNext(Irp);
+        IoSetCompletionRoutine(Irp, HcSystemPowerDone, p, TRUE, TRUE, TRUE);
+        PoCallDriver(x->Lower, Irp);
+    }
+    return STATUS_PENDING;
+fail:
     PoStartNextPowerIrp(Irp);
-    IoSkipCurrentIrpStackLocation(Irp);
-    return PoCallDriver(x->Lower, Irp);
+    IoReleaseRemoveLock(&x->PowerLock, Irp);
+    return WdmComplete(Irp, st, 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -389,7 +560,16 @@ static NTSTATUS NTAPI DispatchPnp(PDEVICE_OBJECT Dev, PIRP Irp)
     case EXT_DFLT:
         return WdmFltPnp(Dev, Irp);
     case EXT_HC:
-        return HcPnp(x, Irp);
+        st = IoAcquireRemoveLock(&x->PowerLock, Irp);
+        if (!NT_SUCCESS(st)) return WdmComplete(Irp, st, 0);
+        if (sp->MinorFunction == IRP_MN_REMOVE_DEVICE) {
+            x->Removed = TRUE;
+            IoReleaseRemoveLockAndWait(&x->PowerLock, Irp);
+            return HcPnp(x, Irp);
+        }
+        st = HcPnp(x, Irp);
+        IoReleaseRemoveLock(&x->PowerLock, Irp);
+        return st;
     case EXT_BUS:
         return WdmBusPnp(Dev, Irp);
     case EXT_PDO: {
@@ -598,6 +778,8 @@ static NTSTATUS NTAPI DispatchInternal(PDEVICE_OBJECT Dev, PIRP Irp)
     }
     case EXT_AUDIO:
         return NtAudioInternal(Dev, Irp);
+    case EXT_CLIENT:
+        return NtCliInternal(Dev, Irp);
     case EXT_SCSI:
         return NtScsiSrb(Dev, Irp);
     case EXT_HC:
@@ -676,6 +858,7 @@ static NTSTATUS NTAPI AddDevice(PDRIVER_OBJECT Drv, PDEVICE_OBJECT Pdo)
         return STATUS_NO_SUCH_DEVICE;
     }
     if (kind == EXT_HC) {
+        IoInitializeRemoveLock(&x->PowerLock, 0x70425355UL, 0, 0);
         for (i = 0; i < USB_MAX_HC; i++) {
             if (HcList[i] == NULL) {
                 HcList[i] = fdo;
@@ -899,6 +1082,7 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT Drv, PUNICODE_STRING RegistryPath)
     if (!OsGetConfig("DisableAudio", 0)) {
         NtAudioCreate(Drv);
     }
+    NtCliCreate(Drv);
     KeInitializeDpc(&PollDpc, PollDpcRoutine, NULL);
     KeInitializeTimer(&PollTimer);
     if (OsGetConfig("TimerResolution", 1)) {

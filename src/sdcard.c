@@ -28,6 +28,7 @@ struct _SD_CARD {
     ULONG       MaxClock;
     BOOLEAN     Present;            /* card detect switch */
     BOOLEAN     Ready;              /* initialised */
+    BOOLEAN     Resetting;
     BOOLEAN     Failed;             /* initialisation failed for this insertion */
     BOOLEAN     Wp;
     UCHAR       Type;               /* CARD_* */
@@ -354,6 +355,10 @@ static int SdScsi(void *Ctx, const UCHAR *Cdb, UCHAR CdbLen, UCHAR Dir, ULONG Le
     (void)CdbLen; (void)Dir;
 
     *Done = 0;
+    if (c->Resetting && Cdb[0] != 0x12) {
+        BlkSense(Sense, SENSE_NOT_READY, 0x04, 0x02);
+        return BLK_FAILED;
+    }
     switch (Cdb[0]) {
     case 0x12: {                                    /* INQUIRY */
         int i;
@@ -497,6 +502,7 @@ BOOLEAN SdPoll(SD_CARD *c)
     if (c == NULL) {
         return FALSE;
     }
+    if (c->Resetting) return c->Present;
     if (c->LastPoll && OsTimeMs() - c->LastPoll < 500) {
         return c->Present;
     }
@@ -523,4 +529,43 @@ BOOLEAN SdPoll(SD_CARD *c)
         MscVirtMediaChange(c->Target);
     }
     return c->Present;
+}
+
+/* Worker-only reset coordination. Keep the removable SCSI target and its
+   identity alive while rebuilding the SD protocol session after port reset. */
+void SdBeginReset(SD_CARD *c)
+{
+    if (c == NULL) return;
+    c->Resetting = TRUE;
+    c->Ready = FALSE;
+}
+
+int SdRestoreReset(SD_CARD *c)
+{
+    BOOLEAN present = FALSE, wp = FALSE;
+    int r;
+    if (c == NULL || !c->Resetting) return SD_ENODEV;
+    r = c->Ops->Status(c->Ctx, &present, &wp);
+    if (r != SD_OK) return r;
+    c->Present = present;
+    c->Wp = wp;
+    c->Failed = FALSE;
+    c->Ready = FALSE;
+    c->LastPoll = OsTimeMs();
+    if (!present) return SD_OK;
+    r = CardInit(c);
+    if (r != SD_OK) {
+        c->Failed = TRUE;
+        c->Ops->SetIos(c->Ctx, FALSE, 0, SD_WIDTH_1, FALSE);
+    }
+    return r;
+}
+
+void SdEndReset(SD_CARD *c, int Result)
+{
+    if (c == NULL) return;
+    if (Result != SD_OK) { c->Ready = FALSE; return; }
+    c->Resetting = FALSE;
+    /* A card may have been exchanged while the port was unavailable. */
+    MscVirtMediaChange(c->Target);
 }

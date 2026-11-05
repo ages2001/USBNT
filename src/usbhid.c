@@ -19,9 +19,13 @@ typedef struct _HID_DEV {
     UCHAR               Kind;
     UCHAR               BootMode;
     UCHAR               Active;
+    ULONG               Submitting;
+    ULONG               Callbacks;
     UCHAR               NeedService;
     UCHAR               LedSent;
     UCHAR               Gone;
+    UCHAR               Paused;
+    UCHAR               Subclass;
     UCHAR               PrevButtons;
     ULONG               Errors;
     USB_PIPE            In;
@@ -358,15 +362,22 @@ static void MouseReport(HID_DEV *h, const UCHAR *Rep, ULONG Len)
     OsMouseInput(&e);
 }
 
-static void HidArm(HID_DEV *h);
+static void HidArm(HID_DEV *h, BOOLEAN FromDone);
 
 static void HidDone(USB_XFER *X)
 {
     HID_DEV *h = (HID_DEV *)X->Context;
 
+    OS_IRQL irql;
+    BOOLEAN gone;
+
+    irql = OsLock();
+    h->Callbacks++;
     h->Active = 0;
-    if (h->Gone) {
-        return;
+    gone = (BOOLEAN)(h->Gone || h->Paused);
+    OsUnlock(irql);
+    if (gone) {
+        goto done;
     }
     if (X->Status == USB_OK) {
         h->Errors = 0;
@@ -382,22 +393,36 @@ static void HidDone(USB_XFER *X)
                 MouseReport(h, h->Buf, X->Actual);
             }
         }
-        HidArm(h);
-        return;
+        HidArm(h, TRUE);
+        goto done;
     }
     if (X->Status == USB_ERR_ABORTED || X->Status == USB_ERR_NODEV) {
-        return;
+        goto done;
     }
     h->Errors++;
     h->NeedService = 1;
     OsWakeWorker();
+done:
+    /* Active can already be clear while this callback still uses h. */
+    irql = OsLock();
+    h->Callbacks--;
+    OsUnlock(irql);
 }
 
-static void HidArm(HID_DEV *h)
+static void HidArm(HID_DEV *h, BOOLEAN FromDone)
 {
-    if (h->Active || h->Gone || !h->In.Opened) {
+    OS_IRQL irql;
+    int r;
+
+    irql = OsLock();
+    if (h->Active || h->Gone || h->Paused || !h->In.Opened || h->Submitting ||
+        h->Callbacks != (ULONG)(FromDone ? 1 : 0)) {
+        OsUnlock(irql);
         return;
     }
+    h->Active = 1;
+    h->Submitting++;
+    OsUnlock(irql);
     UsbMemSet(&h->Xfer, 0, sizeof(h->Xfer));
     h->Xfer.Pipe = &h->In;
     h->Xfer.Buf = h->Buf;
@@ -406,10 +431,44 @@ static void HidArm(HID_DEV *h)
     h->Xfer.DirIn = 1;
     h->Xfer.Complete = HidDone;
     h->Xfer.Context = h;
-    h->Active = 1;
-    if (UsbSubmit(&h->Xfer) != USB_OK) {
+    r = UsbSubmit(&h->Xfer);
+    irql = OsLock();
+    if (r != USB_OK) {
         h->Active = 0;
     }
+    h->Submitting--;
+    OsUnlock(irql);
+}
+
+/* Worker context. Closing a pipe cancels hardware ownership, but a poller
+ * may already have removed its completion from the shared completion list.
+ * Keep h and its DMA buffer alive until that callback and any submitter
+ * have returned. No timeout permits freeing an outstanding owner. */
+static void HidQuiesce(HID_DEV *h, BOOLEAN Removing)
+{
+    OS_IRQL irql;
+    BOOLEAN busy;
+
+    irql = OsLock();
+    if (Removing) h->Gone = 1;
+    h->Paused = 1; /* gates both worker and completion-driven submissions */
+    OsUnlock(irql);
+    do {
+        irql = OsLock();
+        busy = (BOOLEAN)(h->Submitting != 0);
+        OsUnlock(irql);
+        if (busy) OsSleepMs(1);
+    } while (busy);
+    UsbClosePipe(&h->In);
+    do {
+        irql = OsLock();
+        busy = (BOOLEAN)(h->Active || h->Callbacks != 0);
+        OsUnlock(irql);
+        if (busy) {
+            UsbPollAll();
+            OsSleepMs(1);
+        }
+    } while (busy);
 }
 
 static int HidClassReq(USB_DEV *Dev, UCHAR Req, USHORT Value, UCHAR Iface, USHORT Len, void *Data)
@@ -431,6 +490,7 @@ int HidAttach(USB_DEV *Dev, const UCHAR *If, const UCHAR *End)
     UCHAR boot = 0;
     UCHAR useKbd = 0;
     int slot;
+    int devslot;
     int r;
 
     while ((ep = UsbFindDesc(ep, End, USB_DT_ENDPOINT)) != NULL) {
@@ -485,6 +545,17 @@ int HidAttach(USB_DEV *Dev, const UCHAR *If, const UCHAR *End)
     if (slot == HID_MAX) {
         return USB_ERR_NOMEM;
     }
+    /* Every published HID must be reachable by HidDetach. A composite
+       device can have more HID interfaces than this per-device table.
+       Refuse the extra interface before allocating or opening a pipe. */
+    for (devslot = 0; devslot < (int)(sizeof(Dev->Hid) / sizeof(Dev->Hid[0])); devslot++) {
+        if (Dev->Hid[devslot] == NULL) {
+            break;
+        }
+    }
+    if (devslot == (int)(sizeof(Dev->Hid) / sizeof(Dev->Hid[0]))) {
+        return USB_ERR_NOMEM;
+    }
     h = (HID_DEV *)OsAlloc(sizeof(HID_DEV));
     if (h == NULL) {
         return USB_ERR_NOMEM;
@@ -493,6 +564,7 @@ int HidAttach(USB_DEV *Dev, const UCHAR *If, const UCHAR *End)
     h->Iface = iface;
     h->Kind = kind;
     h->BootMode = boot;
+    h->Subclass = sub;
     h->Layout = layout;
     h->Kbd = kbd;
     h->UseKbd = useKbd;
@@ -506,7 +578,27 @@ int HidAttach(USB_DEV *Dev, const UCHAR *If, const UCHAR *End)
     }
     HidClassReq(Dev, HID_REQ_SET_IDLE, 0, iface, 0, NULL);
 
-    r = UsbOpenPipe(Dev, &h->In, ep);
+    {
+        /* UsbMouseInterval: poll a mouse every N ms (1..32) instead of the interval it asks for */
+        ULONG ms = kind == HID_MOUSE ? OsGetConfig("UsbMouseInterval", 0) : 0;
+        UCHAR epc[16];
+        if (ms != 0 && ep[0] >= 7 && ep[0] <= sizeof(epc)) {
+            UCHAR b;
+            UsbMemCpy(epc, ep, ep[0]);
+            if (ms > 32) ms = 32;
+            if (Dev->Speed == USB_SPEED_HIGH || Dev->Speed == USB_SPEED_SUPER) {
+                for (b = 4; b < 9 && (1UL << (b - 4)) < ms; b++) {
+                }
+            } else {
+                b = (UCHAR)ms;
+            }
+            epc[6] = b;
+            UsbLog(LOG_INFO, "device %u: mouse polled every %u ms (UsbMouseInterval)\n", Dev->Index, ms);
+            r = UsbOpenPipe(Dev, &h->In, epc);
+        } else {
+            r = UsbOpenPipe(Dev, &h->In, ep);
+        }
+    }
     if (r != USB_OK) {
         OsFree(h);
         return r;
@@ -521,12 +613,7 @@ int HidAttach(USB_DEV *Dev, const UCHAR *If, const UCHAR *End)
         OsFree(h);
         return USB_ERR_NOMEM;
     }
-    for (r = 0; r < 4; r++) {
-        if (Dev->Hid[r] == NULL) {
-            Dev->Hid[r] = h;
-            break;
-        }
-    }
+    Dev->Hid[devslot] = h;
     HidDevs[slot] = h;
     Dev->Function |= (kind == HID_KBD) ? USB_FUNC_KEYBOARD : (!boot && !layout.X.Relative && layout.Kind != HID_PTR_TOUCHPAD) ? USB_FUNC_TABLET : USB_FUNC_MOUSE;
 
@@ -540,42 +627,122 @@ int HidAttach(USB_DEV *Dev, const UCHAR *If, const UCHAR *End)
                HidButtonCount(&layout),
                layout.Wheel.Valid ? ", wheel" : "", layout.Pan.Valid ? ", pan" : "");
     }
-    HidArm(h);
+    HidArm(h, FALSE);
     OsWakeWorker();
     return USB_OK;
+}
+
+/* Called only after transfer/callback rundown on the worker. */
+static void HidReleaseInput(HID_DEV *h)
+{
+    OS_IRQL irql;
+    if (h->Kind == HID_KBD) {
+        irql = OsLock();
+        RepActive = 0;
+        OsUnlock(irql);
+        {
+            UCHAR empty[8];
+            UsbMemSet(empty, 0, sizeof(empty));
+            KbdReport(h, empty, 8);
+        }
+    } else if (h->PrevButtons != 0) {
+        USB_MOUSE_EVENT e;
+        UsbMemSet(&e, 0, sizeof(e));
+        if (h->PrevButtons & 1) e.ButtonFlags |= UMOU_LEFT_UP;
+        if (h->PrevButtons & 2) e.ButtonFlags |= UMOU_RIGHT_UP;
+        if (h->PrevButtons & 4) e.ButtonFlags |= UMOU_MIDDLE_UP;
+        if (h->PrevButtons & 8) e.ButtonFlags |= UMOU_B4_UP;
+        if (h->PrevButtons & 16) e.ButtonFlags |= UMOU_B5_UP;
+        OsMouseInput(&e);
+    }
+    h->PrevButtons = h->PrevTip = 0;
+    h->RemX = h->RemY = 0;
+}
+
+/* Identify the interfaces owned by HID before a shared physical reset.
+ * Other native owners require their own rundown/restore implementation. */
+ULONG HidResetInterfaces(USB_DEV *Dev)
+{
+    ULONG mask = 0;
+    int i;
+    for (i = 0; i < 4; i++) {
+        HID_DEV *h = (HID_DEV *)Dev->Hid[i];
+        if (h != NULL && !h->Gone && !h->Ext && h->Iface < 32)
+            mask |= 1UL << h->Iface;
+    }
+    return mask;
+}
+
+void HidBeginDeviceReset(USB_DEV *Dev)
+{
+    int i;
+    for (i = 0; i < 4; i++) {
+        HID_DEV *h = (HID_DEV *)Dev->Hid[i];
+        if (h == NULL) continue;
+        HidQuiesce(h, FALSE);
+        HidReleaseInput(h);
+    }
+}
+
+/* Restore while all owners remain gated; only End can admit new transfers. */
+int HidRestoreDevice(USB_DEV *Dev)
+{
+    int i, r;
+    for (i = 0; i < 4; i++) {
+        HID_DEV *h = (HID_DEV *)Dev->Hid[i];
+        if (h == NULL) continue;
+        if (h->Gone || !h->Paused) return USB_ERR_NODEV;
+        if (h->Subclass == 1) {
+            r = HidClassReq(Dev, HID_REQ_SET_PROTOCOL,
+                            (USHORT)(h->BootMode ? 0 : 1), h->Iface, 0, NULL);
+            if (r != USB_OK) return r;
+        }
+        r = HidClassReq(Dev, HID_REQ_SET_IDLE, 0, h->Iface, 0, NULL);
+        if (r != USB_OK) return r;
+        h->In.Toggle = h->In.Halted = 0;
+        h->In.IsoNext = 0;
+        r = Dev->Hc->Ops->PipeOpen(&h->In);
+        if (r != USB_OK) {
+            Dev->Hc->Ops->PipeClose(&h->In);
+            return r;
+        }
+        h->In.Opened = 1;
+        h->LedSent = 0xFF;
+        h->Errors = h->NeedService = 0;
+    }
+    return USB_OK;
+}
+
+void HidEndDeviceReset(USB_DEV *Dev, int Result)
+{
+    int i;
+    OS_IRQL irql;
+    for (i = 0; i < 4; i++) {
+        HID_DEV *h = (HID_DEV *)Dev->Hid[i];
+        if (h == NULL) continue;
+        if (Result != USB_OK) {
+            UsbClosePipe(&h->In);
+            continue; /* retain pause until a successful retry or removal */
+        }
+        irql = OsLock();
+        h->Paused = 0;
+        OsUnlock(irql);
+        HidArm(h, FALSE);
+    }
+    OsWakeWorker();
 }
 
 void HidDetach(USB_DEV *Dev)
 {
     int i, j;
-    OS_IRQL irql;
 
     for (i = 0; i < 4; i++) {
         HID_DEV *h = (HID_DEV *)Dev->Hid[i];
         if (h == NULL) {
             continue;
         }
-        h->Gone = 1;
-        UsbClosePipe(&h->In);
-        if (h->Kind == HID_KBD) {
-            irql = OsLock();
-            RepActive = 0;
-            OsUnlock(irql);
-            if (h->Prev[0] != 0 || h->Prev[2] != 0) {
-                UCHAR empty[8];
-                UsbMemSet(empty, 0, sizeof(empty));
-                KbdReport(h, empty, 8);
-            }
-        } else if (h->PrevButtons != 0) {
-            USB_MOUSE_EVENT e;
-            UsbMemSet(&e, 0, sizeof(e));
-            if (h->PrevButtons & 1) e.ButtonFlags |= UMOU_LEFT_UP;
-            if (h->PrevButtons & 2) e.ButtonFlags |= UMOU_RIGHT_UP;
-            if (h->PrevButtons & 4) e.ButtonFlags |= UMOU_MIDDLE_UP;
-            if (h->PrevButtons & 8) e.ButtonFlags |= UMOU_B4_UP;
-            if (h->PrevButtons & 16) e.ButtonFlags |= UMOU_B5_UP;
-            OsMouseInput(&e);
-        }
+        HidQuiesce(h, TRUE);
+        HidReleaseInput(h);
         for (j = 0; j < HID_MAX; j++) {
             if (HidDevs[j] == h) {
                 HidDevs[j] = NULL;
@@ -596,7 +763,7 @@ void HidService(void)
     hidLeds = (UCHAR)(((want & ULED_NUM) ? 1 : 0) | ((want & ULED_CAPS) ? 2 : 0) | ((want & ULED_SCROLL) ? 4 : 0));
     for (i = 0; i < HID_MAX; i++) {
         HID_DEV *h = HidDevs[i];
-        if (h == NULL || h->Gone) {
+        if (h == NULL || h->Gone || h->Paused) {
             continue;
         }
         if (h->Ext) {
@@ -617,7 +784,7 @@ void HidService(void)
             if (h->Errors > 20) {
                 OsSleepMs(100);
             }
-            HidArm(h);
+            HidArm(h, FALSE);
         }
         if (h->Kind == HID_KBD && h->LedSent != hidLeds && h->UseKbd) {
             UCHAR rep[8];
@@ -635,7 +802,7 @@ void HidService(void)
             }
         }
         if (!h->Active && !h->NeedService) {
-            HidArm(h);
+            HidArm(h, FALSE);
         }
     }
 }

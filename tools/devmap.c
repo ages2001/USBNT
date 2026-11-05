@@ -294,6 +294,38 @@ void DevMapUnlock(DEV_LOCKED *L)
     L->Count = 0;
 }
 
+/* the NT path T is a disk or CD-ROM device of one of the usbnt slots in Map (Count of them) */
+BOOL DevMapIsSlotTarget(const DEV_SLOT_MAP *Map, int Count, const char *T)
+{
+    int i;
+
+    for (i = 0; i < Count; i++) {
+        if (Map[i].Path[0] != 0 && DevMapSame(T, Map[i].Path)) {
+            return TRUE;
+        }
+        if (Map[i].Disk >= 0 && PartOf(T, Map[i].Disk) > 0) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+/* the NT path T is a local disk, volume or CD-ROM (not a network drive, subst or floppy) */
+BOOL DevMapIsLocalStorage(const char *T)
+{
+    static const char hd[] = "\\device\\harddisk", cd[] = "\\device\\cdrom";
+    int i;
+
+    for (i = 0; hd[i] && Lower(T[i]) == hd[i]; i++) {
+    }
+    if (hd[i] == 0) {
+        return TRUE;
+    }
+    for (i = 0; cd[i] && Lower(T[i]) == cd[i]; i++) {
+    }
+    return cd[i] == 0;
+}
+
 BOOL DevMapLetterUsed(char Letter)
 {
     char name[4];

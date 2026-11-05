@@ -31,5 +31,9 @@ int UA_CALL UaMidiOut(ULONG Id, ULONG Cable, const UCHAR *Data, ULONG Len);
 
 /* number of audio devices present (for diagnostics) */
 ULONG   UaDeviceCount(void);
+ULONG   AudioResetInterfaces(USB_DEV *Dev);
+void    AudioBeginDeviceReset(USB_DEV *Dev);
+int     AudioRestoreDevice(USB_DEV *Dev);
+void    AudioEndDeviceReset(USB_DEV *Dev, int Result);
 
 #endif

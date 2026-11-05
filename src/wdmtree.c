@@ -226,27 +226,47 @@ static const WCHAR *DevKind(USB_DEV *D)
     return L"USB Composite Device";
 }
 
-static USB_HC *HcOf(PDEVICE_OBJECT Fdo)
+/* PnP queries may run outside the USB worker. Copy controller metadata
+ * while holding the publication/polling lock, so replacement can retire the
+ * old allocation after the copy. A NULL snapshot returns identity only;
+ * callers must not dereference that pointer after releasing the lock. */
+static USB_HC *HcOf(PDEVICE_OBJECT Fdo, USB_HC *Snapshot)
 {
     WDM_EXT *h = (WDM_EXT *)Fdo->DeviceExtension;
+    USB_HC *result = NULL;
+    OS_IRQL irql = OsLock();
     int i;
 
     for (i = 0; i < UsbHcCount; i++) {
         USB_HC *c = UsbHcs[i];
         if (c != NULL && !c->Removed && c->Bus == h->Bus && c->Dev == h->Dev && c->Fn == h->Fn) {
-            return c;
+            if (Snapshot != NULL) {
+                UsbMemCpy(Snapshot, c, sizeof(*Snapshot));
+                result = Snapshot;
+            } else result = c;
+            break;
         }
     }
-    return NULL;
+    OsUnlock(irql);
+    return result;
 }
 
-/* the controller a node's devices hang off */
-static USB_HC *NodeHc(WDM_EXT *x)
+static USB_HC *NodeHc(WDM_EXT *x, USB_HC *Snapshot)
 {
     if (x->TDev != NULL) {
-        return x->TDev->Hc;
+        USB_DEV *d = x->TDev;
+        USB_HC *result = NULL;
+        OS_IRQL irql = OsLock();
+        if (d->InUse && !d->Gone && d->Gen == x->TGen && d->Hc != NULL && !d->Hc->Removed) {
+            if (Snapshot != NULL) {
+                UsbMemCpy(Snapshot, d->Hc, sizeof(*Snapshot));
+                result = Snapshot;
+            } else result = d->Hc;
+        }
+        OsUnlock(irql);
+        return result;
     }
-    return x->TOwner != NULL ? HcOf(x->TOwner) : NULL;
+    return x->TOwner != NULL ? HcOf(x->TOwner, Snapshot) : NULL;
 }
 
 static void NodeName(WDM_EXT *x, WCHAR *Out)
@@ -256,7 +276,8 @@ static void NodeName(WDM_EXT *x, WCHAR *Out)
 
     *p = 0;
     if (x->Child == PDO_HUB && d == NULL) {
-        USB_HC *h = NodeHc(x);
+        USB_HC snapshot;
+        USB_HC *h = NodeHc(x, &snapshot);
         p = WCat(p, h == NULL ? L"USB Root Hub" : h->Type == HC_XHCI ? L"USB 3.x Root Hub" :
                     h->Type == HC_EHCI ? L"USB 2.0 Root Hub" : L"USB 1.1 Root Hub");
         WCat(p, L" (USBNT)");
@@ -612,24 +633,24 @@ static NTSTATUS Merge(PIRP Irp, WDM_EXT **Add, ULONG N)
 /* a host controller's bus relations: its root hub */
 NTSTATUS WdmTreeHcRelations(WDM_EXT *Hc, PIRP Irp)
 {
-    USB_HC *h;
+    USB_HC snapshot, *h;
     WDM_EXT *x, *root = NULL;
     KIRQL irql;
 
     Init();
-    h = Hc->Bus == 0xFF ? NULL : HcOf(Hc->Nt.Self);
+    h = Hc->Bus == 0xFF ? NULL : HcOf(Hc->Nt.Self, &snapshot);
     KeAcquireSpinLock(&TreeLock, &irql);
     for (x = Nodes; x != NULL; x = x->TNext) {
         if (x->TOwner == Hc->Nt.Self && x->TDev == NULL) {
             x->Reported = FALSE;
-            if (root == NULL && h != NULL && h->Running && Hc->Started && !x->Gone) {
+            if (root == NULL && h != NULL && !h->Removed && (h->Running || h->Sleeping) && Hc->Started && !x->Gone) {
                 root = x;
                 x->Reported = TRUE;
             }
         }
     }
     KeReleaseSpinLock(&TreeLock, irql);
-    if (h == NULL || !h->Running || !Hc->Started) {
+    if (h == NULL || h->Removed || (!h->Running && !h->Sleeping) || !Hc->Started) {
         return STATUS_SUCCESS;                  /* no USB host controller (card reader, I2C ...) or not running */
     }
     if (root == NULL && (root = NewNode(PDO_HUB, Hc->Nt.Self, NULL, NULL)) != NULL) {
@@ -643,7 +664,7 @@ NTSTATUS WdmTreeHcRelations(WDM_EXT *Hc, PIRP Irp)
 static NTSTATUS HubRelations(WDM_EXT *Hub, PIRP Irp)
 {
     WDM_EXT *x, *add[USB_MAX_DEVICES];
-    USB_HC *hc = NodeHc(Hub);
+    USB_HC *hc = NodeHc(Hub, NULL); /* compare identity only */
     ULONG n = 0, i;
     KIRQL irql;
 
@@ -686,7 +707,8 @@ static NTSTATUS HubRelations(WDM_EXT *Hub, PIRP Irp)
 
 void WdmTreeHcStarted(WDM_EXT *Hc)
 {
-    USB_HC *h = HcOf(Hc->Nt.Self);
+    USB_HC snapshot;
+    USB_HC *h = HcOf(Hc->Nt.Self, &snapshot);
     WCHAR name[128];
 
     if (h == NULL) {
@@ -746,7 +768,7 @@ void WdmTreeService(void)
     }
     for (i = 0; i < (ULONG)UsbHcCount; i++) {
         if (UsbHcs[i] != NULL) {
-            sig = (sig ^ (UsbHcs[i]->Running + 2 * UsbHcs[i]->Removed + 7 * i)) * 16777619UL;
+            sig = (sig ^ ((UsbHcs[i]->Running || UsbHcs[i]->Sleeping) + 2 * UsbHcs[i]->Removed + 7 * i)) * 16777619UL;
         }
     }
     if (sig == TreeSig) {
@@ -802,7 +824,8 @@ static WCHAR *BuildId(WDM_EXT *x, BUS_QUERY_ID_TYPE Type, WCHAR *Buf)
         break;
     case BusQueryHardwareIDs:
         if (d == NULL) {
-            USB_HC *h = NodeHc(x);
+            USB_HC snapshot;
+            USB_HC *h = NodeHc(x, &snapshot);
             p = WCat(p, L"USBNT\\ROOT_HUB&VID");
             p = HexCat(p, h != NULL ? h->VendorId : 0, 4);
             p = WCat(p, L"&PID");
@@ -836,7 +859,8 @@ static WCHAR *BuildId(WDM_EXT *x, BUS_QUERY_ID_TYPE Type, WCHAR *Buf)
         UCHAR ports[8];
         int n = 0;
         USB_DEV *e;
-        USB_HC *h = NodeHc(x);
+        USB_HC snapshot;
+        USB_HC *h = NodeHc(x, &snapshot);
         p = HexCat(p, h != NULL ? h->Bus : 0, 2);
         p = HexCat(p, h != NULL ? h->Dev : 0, 2);
         p = HexCat(p, h != NULL ? h->Fn : 0, 1);

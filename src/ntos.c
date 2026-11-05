@@ -103,6 +103,16 @@ static CFG_ENTRY Config[] = {
     { "TextSetupHid",      L"TextSetupHid",      0, FALSE },
     { "WindowsCamera",     L"WindowsCamera",     0, FALSE },
     { "MaxPartitions",     L"MaxPartitions",     0, FALSE },
+    { "MouseSpeed",         L"MouseSpeed",         0, FALSE },
+    { "MouseAccel",         L"MouseAccel",         0, FALSE },
+    { "MouseInvertWheel",   L"MouseInvertWheel",   0, FALSE },
+    { "MouseSwapButtons",   L"MouseSwapButtons",   0, FALSE },
+    { "Ps2MouseRate",       L"Ps2MouseRate",       0, FALSE },
+    { "Ps2MouseResolution", L"Ps2MouseResolution", 0, FALSE },
+    { "UsbMouseInterval",   L"UsbMouseInterval",   0, FALSE },
+    { "TouchpadTapTime",    L"TouchpadTapTime",    0, FALSE },
+    { "ClockCheck",         L"ClockCheck",         0, FALSE },
+    { "UsbVendorConfig",    L"UsbVendorConfig",    0, FALSE },
     { "RemovableAsFixed",  L"RemovableAsFixed",  0, FALSE },
     { NULL, NULL, 0, FALSE }
 };
@@ -833,6 +843,70 @@ PVOID NtKernelExport(const char *Name)
     return ImageExport(KernelBase, Name);
 }
 
+#endif
+
+#ifndef USB_WDM
+/* NT 3.1 - 4.0: the clock tick is checked once against the real time clock.  A HAL whose
+   clock interrupt does not come at the rate KeQueryTimeIncrement reports (MPS HALs that
+   program the local APIC timer from a wrong calibration) made every USBNT timeout too long
+   or too short - port reset and enumeration timed out, hot plug did not work, while the
+   devices present at boot (enumerated with stall loops) did.  The measured rate is used
+   then.  Called by the worker thread (PASSIVE_LEVEL). */
+typedef BOOLEAN (NTAPI *HAL_RTC_FN)(PTIME_FIELDS);
+static HAL_RTC_FN ClockRtc;
+static ULONG ClockRtc0, ClockTick0;
+static UCHAR ClockState;
+
+static ULONG RtcSeconds(void)
+{
+    TIME_FIELDS t;
+    RtlZeroMemory(&t, sizeof(t));
+    ClockRtc(&t);
+    return (ULONG)t.Hour * 3600 + (ULONG)t.Minute * 60 + (ULONG)t.Second;
+}
+
+void NtClockCheck(void)
+{
+    ULONG now, ticks, ms, inc;
+    KIRQL old;
+
+    if (ClockState == 2 || KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return;
+    }
+    if (ClockState == 0) {
+        ClockRtc = (HAL_RTC_FN)NtHalExport("HalQueryRealTimeClock");
+        if (ClockRtc == NULL || !OsGetConfig("ClockCheck", 1)) {
+            ClockState = 2;
+            return;
+        }
+        ClockRtc0 = RtcSeconds();
+        ClockTick0 = TickCountLow();
+        ClockState = 1;
+        return;
+    }
+    now = RtcSeconds();
+    if (now < ClockRtc0) {
+        ClockState = 2;                         /* midnight passed: not measured */
+        return;
+    }
+    if (now - ClockRtc0 < 12) {
+        return;
+    }
+    ticks = TickCountLow() - ClockTick0;
+    ms = (now - ClockRtc0) * 1000;
+    ClockState = 2;
+    if (ticks == 0) {
+        return;
+    }
+    inc = ms / ticks * 10000 + (ms % ticks) * 10000 / ticks;   /* (no 64 bit division: no runtime) */
+    if (inc > TickIncrement * 2 || inc < TickIncrement / 2) {
+        UsbLog(LOG_INFO, "clock: %u ticks in %u s, the HAL says %u.%u ms per tick: %u.%u ms measured and used\n",
+               ticks, ms / 1000, TickIncrement / 10000, (TickIncrement / 1000) % 10, inc / 10000, (inc / 1000) % 10);
+        KeAcquireSpinLock(&TimeLock, &old);
+        TickIncrement = inc;
+        KeReleaseSpinLock(&TimeLock, old);
+    }
+}
 #endif
 
 void OsWakeWorker(void)

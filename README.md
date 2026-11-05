@@ -1,18 +1,48 @@
-# USBNT - USB Driver for Windows NT 3.1 / 3.50 / 3.51 / 4.0, 2000 and XP (x86, x64)
+<div align="center">
 
-A complete USB stack for Windows NT 3.1 - 4.0 (which have no USB support at
-all), and a Plug and Play USB 3.x / USB4 / card reader driver for Windows
-2000, XP and XP x64 (which have no xHCI support) - one code base, from the
-host controller registers up to the keyboard, mouse, disk, sound and camera
-devices.
+# USBNT
+
+**USB for Windows NT 3.1 / 3.50 / 3.51 / 4.0, and USB 3 / USB4 for Windows 2000 and XP (x86, x64)**
+
+![Version](https://img.shields.io/badge/version-1.3-blue)
+![Windows NT](https://img.shields.io/badge/Windows%20NT-3.1%20%7C%203.5%20%7C%203.51%20%7C%204.0-informational)
+![Windows](https://img.shields.io/badge/Windows-2000%20%7C%20XP%20%7C%20XP%20x64-informational)
+![Controllers](https://img.shields.io/badge/controllers-UHCI%20%7C%20OHCI%20%7C%20EHCI%20%7C%20xHCI%20%7C%20USB4-success)
+![License](https://img.shields.io/badge/license-GPL--3.0-green)
+
+</div>
+
+A complete USB stack for Windows NT 3.1 to 4.0, which have no USB support at
+all. On Windows 2000, XP and XP x64, which have no xHCI support, the same
+code base is a Plug and Play USB 3.x / USB4 / card reader driver. It covers
+everything from the host controller registers up to keyboards, mice, disks,
+sound and cameras.
+
+> [!NOTE]
+> USBNT 1.3 is a validation candidate. The regression checks pass for the
+> documented QEMU fixtures. Support for every device and OS, and on physical
+> hardware, is not verified. [RELEASE-1.3-STATUS.md](RELEASE-1.3-STATUS.md)
+> lists what was tested. The feature list below describes the source
+> architecture, not a hardware certification.
 
 ## Contents
 
-- [Overview](#overview) - [Highlights](#highlights) - [Supported systems](#supported-systems) - [Quick start](#quick-start)
-- [Features](#features) - [Windows 2000 and XP](#windows-2000-and-xp) - [Architecture](#architecture)
-- [Installation](#installation) - [Installing Windows with USBNT (text-mode setup)](#installing-windows-with-usbnt-text-mode-setup)
-- [Usage](#usage) - [Configuration](#configuration) - [Building from source](#building-from-source)
-- [Testing](#testing) - [Known limitations](#known-limitations) - [Changelog](#changelog) - [License](#license)
+- [Overview](#overview)
+- [Highlights](#highlights)
+- [Quick start](#quick-start)
+- [Features](#features)
+- [Supported systems](#supported-systems)
+- [Windows 2000 and XP](#windows-2000-and-xp)
+- [Architecture](#architecture)
+- [Installation](#installation)
+- [Installing Windows with USBNT (text-mode setup)](#installing-windows-with-usbnt-text-mode-setup)
+- [Usage](#usage)
+- [Configuration](#configuration)
+- [Building from source](#building-from-source)
+- [Testing](#testing)
+- [Known limitations](#known-limitations)
+- [Changelog](#changelog)
+- [License](#license)
 
 ## Overview
 
@@ -67,6 +97,9 @@ today's machines and add-in cards.
 - **Multimedia**: USB Audio Class 1.0 / 2.0 sound cards and USB MIDI (with
   [AUDIONT](https://github.com/ages2001/AUDIONT)), UVC cameras with a
   viewer and a Video for Windows / DirectShow capture driver
+- **Network**: Realtek USB Ethernet (RTL8150, RTL8152 - RTL8159 and the
+  docks built on them) with **RLTKLANT**,
+  through a generic client interface that other drivers can use as well
 - **Windows 2000 / XP**: Plug and Play driver for x86 and x64, Device
   Manager tree with the controllers named after their chips, a USB bus
   interface for Windows' own class drivers, text-mode setup driver disks
@@ -820,9 +853,10 @@ with their drive letters, the last things it did; *Hide* keeps it running,
 *Stop the monitor* ends it.
 
 **Drive letters.** At boot NT reserves a letter for every USB disk slot.
-`usbmon` removes the letters of empty slots, gives a disk a letter when it
-is plugged in - every partition of it one - (the letter it had last time if
-that one is free) and takes them back when the disk is removed. NT 4.0 Explorer updates itself; the
+`usbmon` takes those back (a CD-ROM that NT put after them moves down into the
+gap, so it has the letter it would have without USBNT), gives a disk a letter when it
+is plugged in - every partition of it one - after the last internal partition and
+CD / DVD drive (the letter it had last time if that one is free and comes after them) and takes them back when the disk is removed. NT 4.0 Explorer updates itself; the
 File Manager of NT 3.x reads its drive list only when it starts, so new
 letters show up there after File Manager is reopened. Set
 `HKLM\Software\UsbNt\DriveLetters` to 0 to keep the fixed boot letters.
@@ -936,7 +970,7 @@ key itself), REG_DWORD:
 
 | Value | Default | Meaning |
 |---|---|---|
-| MaxDisks | 4 | USB disk slots, 1-8 |
+| MaxDisks | 4 (2000 / XP: 8) | USB disk slots, 1-8 |
 | MaxTransferKB | 0 | Upper limit for one SCSI command in KB, 0 = automatic |
 | UseUas | 1 | Use UAS when a disk offers it, 0 = Bulk-Only |
 | Usb3Hubs | 1 | Use the SuperSpeed side of USB 3 hubs |
@@ -955,6 +989,16 @@ key itself), REG_DWORD:
 | TouchpadGestures | 1 | Precision touch pads in touch pad mode with gestures, 0 = mouse mode |
 | TouchpadScroll | 1 | Two finger scrolling: 1 = content follows the fingers, 2 = reversed, 0 = off |
 | TouchpadTap | 1 | Tap to click |
+| TouchpadTapTime | 250 | Longest touch that is still a tap, in ms (80-1000) |
+| MouseSpeed | 100 | Pointer speed of every mouse and touch pad in percent (10-1000), on top of Windows' own setting |
+| MouseAccel | 0 | 1 = the driver's own pointer acceleration (faster motion goes up to twice as far) |
+| MouseInvertWheel | 0 | 1 = reversed wheel and horizontal wheel |
+| MouseSwapButtons | 0 | 1 = left and right buttons swapped |
+| Ps2MouseRate | 100 | PS/2 mouse reports per second: 10, 20, 40, 60, 80, 100 or 200 |
+| Ps2MouseResolution | 2 | PS/2 mouse resolution: 0 = 1, 1 = 2, 2 = 4, 3 = 8 counts/mm |
+| UsbMouseInterval | 0 | USB mice polled every N ms (1-32), 0 = the interval the mouse asks for |
+| ClockCheck | 1 | NT 3.1 - 4.0: compare the clock tick with the real time clock once and use the measured rate when the HAL's is wrong |
+| UsbVendorConfig | 1 | A network adapter whose first configuration is CDC Ethernet (ECM / NCM) runs in its vendor-specific configuration when it has one (Realtek RTL815x and others); 0 = always the first configuration |
 | TouchpadSpeed | 100 | Touch pad pointer speed in percent (10-1000) |
 | TouchpadScrollSpeed | 100 | Touch pad scrolling speed in percent (10-1000) |
 | TouchpadAccel | 1 | Pointer acceleration of touch pads, 0 = off |
@@ -986,7 +1030,7 @@ key itself), REG_DWORD:
 | RemovableAsFixed | 1 | Windows 2000 / XP: report a removable medium as a fixed disk, so that every partition gets a letter - 1 when it has more than one partition, 2 always, 0 never (also for the disks of Windows' usbstor, through the filter) |
 | OemSetup | - | Set to 1 by text-mode setup (TXTSETUP.OEM): Windows 2000 / XP usbinst then makes no USBNT device bus (the first host controller is the bus) |
 
-`usbmon`: `HKLM\Software\UsbNt` `DriveLetters` (1), `TimerResolution` (1);
+`usbmon`: `HKLM\Software\UsbNt` `DriveLetters` (1), `LettersAfterLast` (1: USB disks get letters after the last internal partition / CD-DVD drive), `CompactBootLetters` (1: NT 3.x / 4.0 take back the boot letters of the USB slots and move a CD-ROM that came after them down), `TimerResolution` (1);
 `HKCU\Software\UsbNt`, REG_DWORD unless noted:
 
 | Value | Default | Meaning |
@@ -1328,6 +1372,7 @@ The changes of every release are in [CHANGELOG.md](CHANGELOG.md).
 
 GPL-3.0, see [LICENSE](LICENSE).
 
-**USE AT YOUR OWN RISK.** This driver talks directly to USB host
-controllers and storage devices on operating systems that never
-supported USB. Keep backups of the data on the disks you use with it.
+> [!CAUTION]
+> **Use at your own risk.** This driver talks directly to USB host
+> controllers and storage devices on operating systems that never
+> supported USB. Keep backups of the data on the disks you use with it.

@@ -28,12 +28,15 @@
 #include "usbinput.h"
 #include "ptp.h"
 
-#define TAP_MS          200
+#define TAP_MS          250     /* default TouchpadTapTime: real fingers often stay 200 ms or more */
 #define CLICK_MS        40
 
 static void Settings(PTP_STATE *S)
 {
     S->Tap = (UCHAR)OsGetConfig("TouchpadTap", 1);
+    S->TapMs = OsGetConfig("TouchpadTapTime", TAP_MS);
+    if (S->TapMs < 80) S->TapMs = 80;
+    if (S->TapMs > 1000) S->TapMs = 1000;
     S->ScrollMode = (UCHAR)OsGetConfig("TouchpadScroll", 1);
     S->Speed = OsGetConfig("TouchpadSpeed", 100);
     if (S->Speed < 10 || S->Speed > 1000) {
@@ -295,7 +298,7 @@ static void Frame(PTP_STATE *S, void *Mouse, ULONG Now)
         if (my < 0) my = -my;
         if (mx + my > S->TapMove) S->TapMove = mx + my;
     }
-    if (n == 0 && S->PrevN > 0 && S->Tap && S->TapPossible && Now - S->TapStart <= TAP_MS &&
+    if (n == 0 && S->PrevN > 0 && S->Tap && S->TapPossible && Now - S->TapStart <= S->TapMs &&
         S->TapMove < S->RangeX / 30 && !S->ClickButtons) {
         UCHAR b = (UCHAR)(S->TapMax >= 3 ? 4 : S->TapMax == 2 ? 2 : 1);
         S->TapButtons = b;
@@ -303,12 +306,12 @@ static void Frame(PTP_STATE *S, void *Mouse, ULONG Now)
         Emit(S, Mouse, 0, 0, 0, 0);                         /* down; up after CLICK_MS (PtpTick) */
     }
     if (n == 0) {
-        S->TapPossible = S->TapPossible && Now - S->TapStart <= TAP_MS;
+        S->TapPossible = S->TapPossible && Now - S->TapStart <= S->TapMs;
     }
     /* a finger that may still be a tap does not move the pointer: the jitter of a
        tap moved it a few pixels, and the second tap of a double tap then fell outside
        Windows' double click rectangle (two clicks instead of a double click) */
-    if (n == 1 && S->Tap && S->TapPossible && Now - S->TapStart <= TAP_MS && S->TapMove < S->RangeX / 30) {
+    if (n == 1 && S->Tap && S->TapPossible && Now - S->TapStart <= S->TapMs && S->TapMove < S->RangeX / 30) {
         dx = dy = 0;
         S->RemX = S->RemY = 0;
     }

@@ -35,6 +35,7 @@ typedef struct _WDM_EXT {
     BOOLEAN         Removed;            /* REMOVE_DEVICE seen */
     BOOLEAN         Reported;           /* PDO: in the last bus relations */
     BOOLEAN         Gone;               /* surprise removal */
+    IO_REMOVE_LOCK  PowerLock;          /* HC: pending power IRPs versus removal */
     BOOLEAN         Sleeping;           /* HC: stopped for a sleep state */
     ULONG           Child;              /* PDO_* */
     int             Slot;               /* PDO_DISK: disk slot */
@@ -122,6 +123,7 @@ NTSTATUS UsbdiQueryId(struct _UD_FUNC *F, PIRP Irp, BUS_QUERY_ID_TYPE Type);
 NTSTATUS UsbdiQueryText(struct _UD_FUNC *F, PIRP Irp, DEVICE_TEXT_TYPE Type);
 NTSTATUS UsbdiPnp(struct _UD_FUNC *F, PIRP Irp, BOOLEAN Reported, BOOLEAN *Free);
 NTSTATUS UsbdiPower(struct _UD_FUNC *F, PIRP Irp);
+int UsbdiControllerPower(UCHAR Bus, UCHAR Dev, UCHAR Fn, int Operation, BOOLEAN *Sleeping);
 NTSTATUS UsbdiInternal(struct _UD_FUNC *F, PIRP Irp);
 const char *UsbClassName(UCHAR C, UCHAR S, UCHAR P);     /* "Audio Control", "Mass Storage" (usbdi.c) */
 WCHAR  *UsbClassDevice(WCHAR *P, const char *ClassName); /* "USB Mass Storage Device" (usbdi.c) */

@@ -1,0 +1,4 @@
+#define USBNT_FILE_TYPE VFT_DRV
+#define USBNT_FILE_DESCRIPTION "USBNT USB host controller and device driver"
+#define USBNT_FILE_NAME "usbnt.sys"
+#include "version.rc"

@@ -270,8 +270,19 @@ static BOOLEAN MouseInit(void)
             if (SetRate(200) && SetRate(200) && SetRate(80) && MouseId() == 4) Ps.MouseId = 4;
         }
     }
-    SetRate(100);
-    Send(TRUE, 0xE8); Send(TRUE, 0x02);                   /* 4 counts/mm */
+    {
+        /* Ps2MouseRate: reports per second (10, 20, 40, 60, 80, 100, 200);
+           Ps2MouseResolution: 0..3 = 1, 2, 4, 8 counts/mm */
+        static const UCHAR rates[] = { 10, 20, 40, 60, 80, 100, 200 };
+        ULONG want = OsGetConfig("Ps2MouseRate", 100), res = OsGetConfig("Ps2MouseResolution", 2);
+        UCHAR rate = 100;
+        int k;
+        for (k = 0; k < (int)sizeof(rates); k++) {
+            if (rates[k] <= want) rate = rates[k];
+        }
+        SetRate(rate);
+        Send(TRUE, 0xE8); Send(TRUE, (UCHAR)(res > 3 ? 3 : res));
+    }
     Send(TRUE, 0xE6);                                     /* 1:1 scaling */
     Ps.PktLen = 0;
     return Send(TRUE, 0xF4);                              /* data reporting */

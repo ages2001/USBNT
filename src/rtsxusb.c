@@ -196,6 +196,8 @@
 
 typedef struct _RTSX_USB {
     USB_DEV    *Dev;
+    const UCHAR *EpOut, *EpIn;
+    UCHAR       Iface, Alt, Resetting;
     USB_PIPE    Out, In;
     UCHAR      *Cmd;
     ULONG       CmdPhys;
@@ -736,6 +738,8 @@ int RtsxUsbAttach(USB_DEV *Dev, const UCHAR *If, const UCHAR *End)
     u = (RTSX_USB *)OsAlloc(sizeof(RTSX_USB));
     if (u == NULL) return USB_ERR_NOMEM;
     u->Dev = Dev;
+    u->Iface = If[2]; u->Alt = If[3];
+    u->EpOut = epOut; u->EpIn = epIn;
     u->Cmd = (UCHAR *)OsDmaAlloc(IOBUF_SIZE, &u->CmdPhys);
     u->Rsp = (UCHAR *)OsDmaAlloc(IOBUF_SIZE, &u->RspPhys);
     u->Data = (UCHAR *)OsDmaAlloc(XFER_MAX, &u->DataPhys);
@@ -786,6 +790,65 @@ void RtsxUsbService(void)
 {
     int i;
     for (i = 0; i < MAX_READERS; i++) {
-        if (Readers[i] != NULL && !Readers[i]->Dev->Gone) SdPoll(Readers[i]->Card);
+        if (Readers[i] != NULL && !Readers[i]->Resetting && !Readers[i]->Dev->Gone) SdPoll(Readers[i]->Card);
+    }
+}
+
+ULONG RtsxUsbResetInterfaces(USB_DEV *Dev)
+{
+    ULONG mask = 0;
+    int i;
+    for (i = 0; i < MAX_READERS; i++) {
+        RTSX_USB *u = Readers[i];
+        if (u != NULL && u->Dev == Dev && u->Iface < 32) mask |= 1UL << u->Iface;
+    }
+    return mask;
+}
+
+void RtsxUsbBeginDeviceReset(USB_DEV *Dev)
+{
+    int i;
+    /* All card requests are synchronous and serialized by the USB worker. */
+    for (i = 0; i < MAX_READERS; i++) {
+        RTSX_USB *u = Readers[i];
+        if (u == NULL || u->Dev != Dev) continue;
+        u->Resetting = 1;
+        SdBeginReset(u->Card);
+        UsbClosePipe(&u->Out);
+        UsbClosePipe(&u->In);
+    }
+}
+
+int RtsxUsbRestoreDevice(USB_DEV *Dev)
+{
+    int i, r;
+    for (i = 0; i < MAX_READERS; i++) {
+        RTSX_USB *u = Readers[i];
+        if (u == NULL || u->Dev != Dev) continue;
+        if (Dev->Gone || !u->Resetting) return USB_ERR_NODEV;
+        if (u->Alt && UsbSetInterface(Dev, u->Iface, u->Alt) != USB_OK) return USB_ERR_IO;
+        r = UsbOpenPipe(Dev, &u->Out, u->EpOut);
+        if (r == USB_OK) r = UsbOpenPipe(Dev, &u->In, u->EpIn);
+        if (r != USB_OK) return r;
+        u->Power = 0;
+        u->CurClk = 0;
+        /* USB reset does not promise that the removable card lost power. */
+        if (InitChip(u) != SD_OK || RxPowerOff(u) != SD_OK ||
+            SdRestoreReset(u->Card) != SD_OK) return USB_ERR_IO;
+    }
+    return USB_OK;
+}
+
+void RtsxUsbEndDeviceReset(USB_DEV *Dev, int Result)
+{
+    int i;
+    for (i = 0; i < MAX_READERS; i++) {
+        RTSX_USB *u = Readers[i];
+        if (u == NULL || u->Dev != Dev) continue;
+        if (Result != USB_OK) {
+            UsbClosePipe(&u->Out);
+            UsbClosePipe(&u->In);
+        } else u->Resetting = 0;
+        SdEndReset(u->Card, Result == USB_OK ? SD_OK : SD_EIO);
     }
 }

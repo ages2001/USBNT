@@ -556,6 +556,71 @@ static int Install(const char *Cmd)
     return 0;
 }
 
+/* everything an installation left: the tools, the driver file (in use until the restart: removed
+   then) and HKLM\Software\UsbNt (remembered drive letters, settings) */
+static void DeleteLater(const char *Dir, const char *Name)
+{
+    char p[MAX_PATH];
+    wsprintfA(p, "%s\\%s", Dir, Name);
+    if (GetFileAttributesA(p) == 0xFFFFFFFF) {
+        return;
+    }
+    if (DeleteFileA(p)) {
+        Print("  %s deleted\r\n", p);
+    } else if (MoveFileExA(p, NULL, MOVEFILE_DELAY_UNTIL_REBOOT)) {
+        Print("  %s is deleted at the restart\r\n", p);
+    }
+}
+
+static void DeleteKeyTree(HKEY Root, const char *Path)
+{
+    HKEY k;
+    char sub[256], full[512];
+    DWORD n;
+    if (RegOpenKeyExA(Root, Path, 0, KEY_ALL_ACCESS, &k) != ERROR_SUCCESS) {
+        return;
+    }
+    for (;;) {
+        n = sizeof(sub);
+        if (RegEnumKeyExA(k, 0, sub, &n, NULL, NULL, NULL, NULL) != ERROR_SUCCESS) {
+            break;
+        }
+        wsprintfA(full, "%s\\%s", Path, sub);
+        DeleteKeyTree(Root, full);
+    }
+    RegCloseKey(k);
+    RegDeleteKeyA(Root, Path);
+}
+
+static void RemoveLeftovers(BOOL Driver)
+{
+    static const char *tools[] = { "usbeject.exe", "usbtree.exe", "usbmon.exe", "usbcam.exe", "usbntcap.dll" };
+    char sys[MAX_PATH], drv[MAX_PATH];
+    char self[MAX_PATH];
+    int i;
+    GetSystemDirectoryA(sys, sizeof(sys));
+    wsprintfA(drv, "%s\\drivers", sys);
+    for (i = 0; i < (int)(sizeof(tools) / sizeof(tools[0])); i++) {
+        DeleteLater(sys, tools[i]);
+    }
+    /* usbinst.exe itself when it runs from System32 */
+    GetModuleFileNameA(NULL, self, sizeof(self));
+    {
+        char mine[MAX_PATH];
+        wsprintfA(mine, "%s\\usbinst.exe", sys);
+        if (lstrcmpiA(self, mine) == 0) {
+            MoveFileExA(mine, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+        } else {
+            DeleteLater(sys, "usbinst.exe");
+        }
+    }
+    if (Driver) {
+        DeleteLater(drv, "usbnt.sys");
+    }
+    DeleteKeyTree(HKEY_LOCAL_MACHINE, "Software\\UsbNt");
+    Print("  HKLM\\Software\\UsbNt removed\r\n");
+}
+
 static int Remove(void)
 {
     SC_HANDLE scm = OpenSCManagerA(NULL, NULL, SC_MANAGER_ALL_ACCESS);
@@ -580,10 +645,12 @@ static int Remove(void)
     if (!DeleteService(svc)) {
         Print("Cannot remove the service (error %lu)\r\n", GetLastError());
     } else {
-        Print("The usbnt service was removed. Restart Windows NT.\r\n");
+        Print("The usbnt service was removed.\r\n");
     }
     CloseServiceHandle(svc);
     CloseServiceHandle(scm);
+    RemoveLeftovers(TRUE);
+    Print("Restart Windows NT.\r\n");
     return 0;
 }
 
@@ -761,6 +828,9 @@ static int Remove5(void)
         ToolDir(sys, sizeof(sys));
         SetRunEntry(sys, FALSE);
         Progman("[DeleteGroup(USBNT)]");
+        if (rc == 0) {
+            RemoveLeftovers(!PnpWow64());
+        }
     }
     return rc;
 }

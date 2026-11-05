@@ -8,6 +8,9 @@
 #include "../src/usbinput.h"
 #include "harness.h"
 #include "../src/tbt.h"
+#include "../src/sdcard.h"
+#include "../src/usbvideo.h"
+#include "../src/usbaudio.h"
 
 void AudioHarnessInit(void);
 int AudioCommand(const char *c);
@@ -232,6 +235,151 @@ static void Command(const char *c)
     UsbMemSet(cdb, 0, sizeof(cdb));
     if (StartsWith(c, "ls")) {
         CmdList();
+    } else if (StartsWith(c, "hidreset")) {
+        ULONG index;
+        int result = USB_ERR_PARAM;
+        p = c + 8;
+        index = ParseNum(&p);
+        if (index < USB_MAX_DEVICES) {
+            USB_DEV *d = &UsbDevs[index];
+            if (d->InUse && !d->Gone && !d->IsHub && d->NativeIf &&
+                (d->NativeIf & ~HidResetInterfaces(d)) == 0) {
+                HidBeginDeviceReset(d);
+                result = UsbResetDevice(d);
+                if (result == USB_OK)
+                    result = UsbControl(d, USB_RT_OUT | USB_RT_STD | USB_RT_DEVICE,
+                                        USB_REQ_SET_CONFIGURATION, d->ConfigValue,
+                                        0, 0, NULL, 1000, NULL);
+                if (result == USB_OK) result = HidRestoreDevice(d);
+                HidEndDeviceReset(d, result);
+            }
+        }
+        HarnessPrintf("HIDRESET index=%u result=%d\n", index, result);
+    } else if (StartsWith(c, "mscreset")) {
+        ULONG index;
+        int result = USB_ERR_PARAM;
+        p = c + 8;
+        index = ParseNum(&p);
+        if (index < USB_MAX_DEVICES) {
+            USB_DEV *d = &UsbDevs[index];
+            if (d->InUse && !d->Gone && !d->IsHub && d->Msc &&
+                (d->NativeIf & ~(MscResetInterfaces(d) | HidResetInterfaces(d))) == 0) {
+                HidBeginDeviceReset(d);
+                MscBeginDeviceReset(d);
+                result = UsbResetDevice(d);
+                if (result == USB_OK)
+                    result = UsbControl(d, USB_RT_OUT | USB_RT_STD | USB_RT_DEVICE,
+                                        USB_REQ_SET_CONFIGURATION, d->ConfigValue,
+                                        0, 0, NULL, 1000, NULL);
+                if (result == USB_OK) result = HidRestoreDevice(d);
+                if (result == USB_OK) result = MscRestoreDevice(d);
+                MscEndDeviceReset(d, result);
+                HidEndDeviceReset(d, result);
+            }
+        }
+        HarnessPrintf("MSCRESET index=%u result=%d\n", index, result);
+    } else if (StartsWith(c, "crwreset")) {
+        ULONG index;
+        int result = USB_ERR_PARAM;
+        p = c + 8;
+        index = ParseNum(&p);
+        if (index < USB_MAX_DEVICES) {
+            USB_DEV *d = &UsbDevs[index];
+            if (d->InUse && !d->Gone && !d->IsHub && RtsxUsbResetInterfaces(d) &&
+                (d->NativeIf & ~(MscResetInterfaces(d) | HidResetInterfaces(d) | RtsxUsbResetInterfaces(d))) == 0) {
+                HidBeginDeviceReset(d);
+                MscBeginDeviceReset(d);
+                RtsxUsbBeginDeviceReset(d);
+                result = UsbResetDevice(d);
+                if (result == USB_OK)
+                    result = UsbControl(d, USB_RT_OUT | USB_RT_STD | USB_RT_DEVICE,
+                                        USB_REQ_SET_CONFIGURATION, d->ConfigValue,
+                                        0, 0, NULL, 1000, NULL);
+                if (result == USB_OK) result = HidRestoreDevice(d);
+                if (result == USB_OK) result = MscRestoreDevice(d);
+                if (result == USB_OK) result = RtsxUsbRestoreDevice(d);
+                RtsxUsbEndDeviceReset(d, result);
+                MscEndDeviceReset(d, result);
+                HidEndDeviceReset(d, result);
+            }
+        }
+        HarnessPrintf("CRWRESET index=%u result=%d\n", index, result);
+    } else if (StartsWith(c, "vreset")) {
+        ULONG index;
+        int result = USB_ERR_PARAM;
+        p = c + 6;
+        index = ParseNum(&p);
+        if (index < USB_MAX_DEVICES) {
+            USB_DEV *d = &UsbDevs[index];
+            if (d->InUse && !d->Gone && !d->IsHub && UvcResetInterfaces(d) &&
+                (d->NativeIf & ~(MscResetInterfaces(d) | HidResetInterfaces(d) | RtsxUsbResetInterfaces(d) | UvcResetInterfaces(d))) == 0) {
+                HidBeginDeviceReset(d);
+                MscBeginDeviceReset(d);
+                RtsxUsbBeginDeviceReset(d);
+                UvcBeginDeviceReset(d);
+                result = UsbResetDevice(d);
+                if (result == USB_OK)
+                    result = UsbControl(d, USB_RT_OUT | USB_RT_STD | USB_RT_DEVICE,
+                                        USB_REQ_SET_CONFIGURATION, d->ConfigValue,
+                                        0, 0, NULL, 1000, NULL);
+                if (result == USB_OK) result = HidRestoreDevice(d);
+                if (result == USB_OK) result = MscRestoreDevice(d);
+                if (result == USB_OK) result = RtsxUsbRestoreDevice(d);
+                if (result == USB_OK) result = UvcRestoreDevice(d);
+                UvcEndDeviceReset(d, result);
+                RtsxUsbEndDeviceReset(d, result);
+                MscEndDeviceReset(d, result);
+                HidEndDeviceReset(d, result);
+            }
+        }
+        HarnessPrintf("VRESET index=%u result=%d\n", index, result);
+    } else if (StartsWith(c, "areset")) {
+        ULONG index;
+        int result = USB_ERR_PARAM;
+        p = c + 6;
+        index = ParseNum(&p);
+        if (index < USB_MAX_DEVICES) {
+            USB_DEV *d = &UsbDevs[index];
+            if (d->InUse && !d->Gone && !d->IsHub && AudioResetInterfaces(d) &&
+                (d->NativeIf & ~(MscResetInterfaces(d) | HidResetInterfaces(d) | RtsxUsbResetInterfaces(d) | UvcResetInterfaces(d) | AudioResetInterfaces(d))) == 0) {
+                HidBeginDeviceReset(d);
+                MscBeginDeviceReset(d);
+                RtsxUsbBeginDeviceReset(d);
+                UvcBeginDeviceReset(d);
+                AudioBeginDeviceReset(d);
+                result = UsbResetDevice(d);
+                if (result == USB_OK)
+                    result = UsbControl(d, USB_RT_OUT | USB_RT_STD | USB_RT_DEVICE,
+                                        USB_REQ_SET_CONFIGURATION, d->ConfigValue,
+                                        0, 0, NULL, 1000, NULL);
+                if (result == USB_OK) result = HidRestoreDevice(d);
+                if (result == USB_OK) result = MscRestoreDevice(d);
+                if (result == USB_OK) result = RtsxUsbRestoreDevice(d);
+                if (result == USB_OK) result = UvcRestoreDevice(d);
+                if (result == USB_OK) result = AudioRestoreDevice(d);
+                AudioEndDeviceReset(d, result);
+                UvcEndDeviceReset(d, result);
+                RtsxUsbEndDeviceReset(d, result);
+                MscEndDeviceReset(d, result);
+                HidEndDeviceReset(d, result);
+            }
+        }
+        HarnessPrintf("ARESET index=%u result=%d\n", index, result);
+    } else if (StartsWith(c, "hcreset")) {
+        ULONG index;
+        UCHAR bus, dev, fn;
+        int result = USB_ERR_PARAM;
+        p = c + 7;
+        index = ParseNum(&p);
+        if (index < (ULONG)UsbHcCount) {
+            bus = UsbHcs[index]->Bus;
+            dev = UsbHcs[index]->Dev;
+            fn = UsbHcs[index]->Fn;
+            UsbPnpStop(bus, dev, fn, FALSE);
+            result = UsbPnpStart(bus, dev, fn);
+            if (result == USB_OK) UsbPnpSettle(bus, dev, fn, 2000);
+        }
+        HarnessPrintf("HCRESET index=%u result=%d count=%u\n", index, result, UsbHcCount);
     } else if (StartsWith(c, "work")) {
         UsbWorkerIteration();
     } else if (StartsWith(c, "tur")) {

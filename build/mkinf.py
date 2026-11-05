@@ -24,7 +24,11 @@ import os, re, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, '..', 'src')
 OUT = os.path.join(HERE, 'out', '2kxp')
-VER = '06/01/1999,1.2.0.0'
+version_header = open(os.path.join(SRC, 'usbntver.h')).read()
+version = re.search(r'^#define USBNT_VERSION_FULL "([0-9.]+)"$', version_header, re.M)
+if not version:
+    raise ValueError('USBNT_VERSION_FULL is missing from usbntver.h')
+VER = '06/01/1999,' + version.group(1)
 os.makedirs(OUT, exist_ok=True)
 
 lpss = re.findall(r'\{ 0x([0-9a-f]{4}),', open(os.path.join(SRC, 'lpssids.h')).read())

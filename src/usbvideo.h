@@ -9,6 +9,10 @@
 
 int     UvcAttach(USB_DEV *Dev, const UCHAR *If, const UCHAR *End);
 void    UvcDetach(USB_DEV *Dev);
+ULONG   UvcResetInterfaces(USB_DEV *Dev);
+void    UvcBeginDeviceReset(USB_DEV *Dev);
+int     UvcRestoreDevice(USB_DEV *Dev);
+void    UvcEndDeviceReset(USB_DEV *Dev, int Result);
 void    UvcService(void);                   /* worker */
 void    UvcList(USBNT_CAMERAS *Out);
 int     UvcStart(const USBNT_VID_START *In, USBNT_VID_STATUS *Out);

@@ -642,11 +642,64 @@ void OsMousePan(LONG Pan)
     }
 }
 
+/* pointer settings for every mouse and touch pad (USB, PS/2, I2C, SMBus): MouseSpeed (percent),
+   MouseAccel (the driver's own acceleration, on top of Windows'), MouseInvertWheel, MouseSwapButtons
+   (left / right, for the buttons only this driver sees: NT 3.x has no such setting for the second
+   mouse it may not know) */
+static LONG MouSpeed = -1, MouAccel, MouInvWheel, MouSwap, MouRemX, MouRemY;
+
+static void MouseSettings(void)
+{
+    if (MouSpeed < 0) {
+        LONG s = (LONG)OsGetConfig("MouseSpeed", 100);
+        MouAccel = (LONG)OsGetConfig("MouseAccel", 0);
+        MouInvWheel = (LONG)OsGetConfig("MouseInvertWheel", 0);
+        MouSwap = (LONG)OsGetConfig("MouseSwapButtons", 0);
+        MouSpeed = s < 10 ? 10 : s > 1000 ? 1000 : s;
+    }
+}
+
+static LONG MouseScale(LONG V, LONG Gain, LONG *Rem)
+{
+    LONG t = V * MouSpeed * Gain + *Rem;            /* in 1/10000 counts */
+    LONG q = t / 10000;
+    *Rem = t - q * 10000;
+    return q;
+}
+
 void OsMouseInput(const USB_MOUSE_EVENT *E)
 {
     MOUSE_INPUT_DATA d;
     USHORT flags = E->ButtonFlags;
     BOOLEAN channel = FALSE;
+    USB_MOUSE_EVENT ev;
+
+    MouseSettings();
+    if (!E->Absolute && (MouSpeed != 100 || MouAccel || MouInvWheel || MouSwap)) {
+        LONG gain = 100;
+        ev = *E;
+        if (MouAccel) {
+            /* faster motion goes further: x1 up to 4 counts per report, up to x2 at 20 */
+            LONG v = (ev.X < 0 ? -ev.X : ev.X) + (ev.Y < 0 ? -ev.Y : ev.Y);
+            gain = v <= 4 ? 100 : v >= 20 ? 200 : 100 + (v - 4) * 100 / 16;
+        }
+        if (MouSpeed != 100 || gain != 100) {
+            ev.X = MouseScale(ev.X, gain, &MouRemX);
+            ev.Y = MouseScale(ev.Y, gain, &MouRemY);
+        }
+        if (MouInvWheel) {
+            ev.Wheel = (SHORT)-ev.Wheel;
+            ev.Pan = (SHORT)-ev.Pan;
+        }
+        if (MouSwap) {
+            USHORT f = ev.ButtonFlags, l = UMOU_LEFT_DOWN | UMOU_LEFT_UP, r = UMOU_RIGHT_DOWN | UMOU_RIGHT_UP;
+            ev.ButtonFlags = (USHORT)((f & ~(l | r)) | ((f & UMOU_LEFT_DOWN) ? UMOU_RIGHT_DOWN : 0) |
+                                      ((f & UMOU_LEFT_UP) ? UMOU_RIGHT_UP : 0) | ((f & UMOU_RIGHT_DOWN) ? UMOU_LEFT_DOWN : 0) |
+                                      ((f & UMOU_RIGHT_UP) ? UMOU_LEFT_UP : 0));
+        }
+        E = &ev;
+        flags = E->ButtonFlags;
+    }
 
     flags &= ~MouRoute(flags);
     RtlZeroMemory(&d, sizeof(d));

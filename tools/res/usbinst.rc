@@ -1,2 +1,7 @@
 1 ICON "usbinst.ico"
 2 ICON "usbinst2.ico"
+
+#define USBNT_FILE_TYPE VFT_APP
+#define USBNT_FILE_DESCRIPTION "USBNT installer"
+#define USBNT_FILE_NAME "usbinst.exe"
+#include "../../src/version.rc"

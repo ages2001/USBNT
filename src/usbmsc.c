@@ -111,6 +111,7 @@ typedef struct _SCSI_SLOT {
 typedef struct _UAS_TAG {
     MSC_DEV    *Msc;
     UCHAR       Busy;
+    ULONG       Callbacks;     /* includes completion clients after Busy clears */
     UCHAR       Sync;           /* issued by the worker, which reads the result */
     UCHAR       Left;           /* transfers still running */
     UCHAR       Failed;         /* a transfer ended with an error */
@@ -139,7 +140,9 @@ struct _MSC_DEV {
     UCHAR       Proto;
     UCHAR       MaxLun;
     UCHAR       Gone;
+    UCHAR       Resetting;     /* failed restore remains gated until retry */
     UCHAR       CdbPad12;
+    UCHAR       IgnoreResidue;  /* the CSW data residue is garbage (many card readers): data moved counts */
     UCHAR       NumTags;        /* UAS: tags in use at most */
     UCHAR       Streams;        /* UAS: bulk streams in use */
     UCHAR       Recover;        /* UAS: pipes need an abort and halt clear */
@@ -339,6 +342,18 @@ static int BotCheckCsw(MSC_DEV *m, int r, ULONG Got, ULONG Len, ULONG Moved, ULO
         BotResetRecovery(m);
         return MSC_ERROR;
     }
+    /* a full INQUIRY (36) or READ CAPACITY (8) with a residue: the device's residues are bogus,
+       which many card readers and cheap sticks have (Linux finds them the same way); trusting
+       them turned complete inquiries into "inquiry failed" and full reads into short ones */
+    if (residue != 0 && !m->IgnoreResidue && csw[12] == 0 && Moved == Len &&
+        ((m->Cbw[15] == SCSIOP_INQUIRY && Len == 36) || (m->Cbw[15] == SCSIOP_READ_CAPACITY && Len == 8))) {
+        m->IgnoreResidue = 1;
+        UsbLog(LOG_INFO, "msc %u: bogus CSW data residue (%u for %u bytes): ignored from now on\n",
+               m->Dev->Index, residue, Len);
+    }
+    if (m->IgnoreResidue) {
+        residue = 0;
+    }
     if (residue <= Len && Len - residue < Moved) {
         Moved = Len - residue;
     }
@@ -390,28 +405,76 @@ typedef struct _BOT_Q {
     USB_XFER    Cbw;
     USB_XFER    Data;
     USB_XFER    Csw;
+    ULONG       Pending;      /* submitted completions, including collected callbacks */
+    ULONG       Submitting;
+    UCHAR       Stopping;
     volatile LONG CswQueued;    /* 1 queued, -1 could not be queued */
 } BOT_Q;
 
-/*
- * Completion of the last stage before the CSW: the CSW is queued right
- * away instead of after a round trip through the worker.
- */
+/* A transfer is owned until its callback has stopped using this stack frame,
+ * not merely until its Busy bit clears in a controller poller. */
+static int BotQSubmit(BOT_Q *q, USB_XFER *x)
+{
+    OS_IRQL irql = OsLock();
+    int r;
+    if (q->Stopping) { OsUnlock(irql); return USB_ERR_ABORTED; }
+    q->Pending++;
+    q->Submitting++;
+    OsUnlock(irql);
+    r = UsbSubmit(x);
+    irql = OsLock();
+    if (r != USB_OK) q->Pending--;
+    q->Submitting--;
+    OsUnlock(irql);
+    return r;
+}
+
+static void BotQDone(BOT_Q *q)
+{
+    OS_IRQL irql;
+    OsEventSet(&q->Ev);
+    irql = OsLock();
+    q->Pending--;
+    OsUnlock(irql); /* no access to q after releasing the last owner */
+}
+
 static void BotStageDone(USB_XFER *X)
 {
     BOT_Q *q = (BOT_Q *)X->Context;
-
-    if (X->Status == USB_OK && q->CswQueued == 0) {
-        q->CswQueued = (UsbSubmit(&q->Csw) == USB_OK) ? 1 : -1;
+    OS_IRQL irql = OsLock();
+    BOOLEAN submit = (BOOLEAN)(X->Status == USB_OK && q->CswQueued == 0 && !q->Stopping);
+    if (submit) q->CswQueued = -2; /* reserve exactly one status submission */
+    OsUnlock(irql);
+    if (submit) {
+        int r = BotQSubmit(q, &q->Csw);
+        irql = OsLock();
+        q->CswQueued = r == USB_OK ? 1 : -1;
+        OsUnlock(irql);
     }
-    OsEventSet(&q->Ev);
+    BotQDone(q);
 }
 
 static void BotCswDone(USB_XFER *X)
 {
-    BOT_Q *q = (BOT_Q *)X->Context;
+    BotQDone((BOT_Q *)X->Context);
+}
 
-    OsEventSet(&q->Ev);
+static void BotQDrain(BOT_Q *q, MSC_DEV *m)
+{
+    OS_IRQL irql = OsLock();
+    BOOLEAN busy;
+    q->Stopping = 1;
+    OsUnlock(irql);
+    do {
+        irql = OsLock(); busy = (BOOLEAN)(q->Submitting != 0); OsUnlock(irql);
+        if (busy) OsSleepMs(1);
+    } while (busy);
+    UsbCancelPipe(&m->Out);
+    UsbCancelPipe(&m->In);
+    do {
+        irql = OsLock(); busy = (BOOLEAN)(q->Pending != 0); OsUnlock(irql);
+        if (busy) { UsbPollAll(); OsSleepMs(1); }
+    } while (busy);
 }
 
 /* Bulk-Only command with CBW and data queued together and the CSW queued from their completion */
@@ -448,12 +511,12 @@ static int BotCommandQueued(MSC_DEV *m, UCHAR Lun, const UCHAR *Cdb, UCHAR CdbLe
     q.Data.Complete = BotStageDone;
     q.Csw.Complete = BotCswDone;
 
-    r = UsbSubmit(&q.Cbw);
+    r = BotQSubmit(&q, &q.Cbw);
     if (r == USB_OK && data) {
-        r = UsbSubmit(&q.Data);
+        r = BotQSubmit(&q, &q.Data);
     }
     if (r != USB_OK) {
-        UsbCancelPipe(&m->Out);
+        BotQDrain(&q, m);
         if (r == USB_ERR_NODEV || m->Dev->Gone) {
             return MSC_NODEV;
         }
@@ -466,7 +529,7 @@ static int BotCommandQueued(MSC_DEV *m, UCHAR Lun, const UCHAR *Cdb, UCHAR CdbLe
         if (q.CswQueued == 1 && !q.Csw.Busy) {
             break;
         }
-        if (q.CswQueued < 0 || (!q.Cbw.Busy && q.Cbw.Status != USB_OK) ||
+        if (q.CswQueued == -1 || (!q.Cbw.Busy && q.Cbw.Status != USB_OK) ||
             (data && !q.Data.Busy && q.Data.Status != USB_OK)) {
             break;
         }
@@ -475,13 +538,7 @@ static int BotCommandQueued(MSC_DEV *m, UCHAR Lun, const UCHAR *Cdb, UCHAR CdbLe
         }
         OsEventWait(&q.Ev, 1000);
     }
-    {
-        int tries = 0;
-        while ((q.Cbw.Busy || q.Data.Busy || q.Csw.Busy) && tries++ < 5) {
-            UsbCancelPipe(&m->Out);
-            UsbCancelPipe(&m->In);
-        }
-    }
+    BotQDrain(&q, m);
     if (m->Dev->Gone) {
         return MSC_NODEV;
     }
@@ -661,6 +718,7 @@ static void UasXferDone(USB_XFER *X)
     BOOLEAN last;
 
     irql = OsLock();
+    t->Callbacks++;
     if (X->Status != USB_OK) {
         t->Failed = 1;
     }
@@ -674,6 +732,28 @@ static void UasXferDone(USB_XFER *X)
         OsEventSet(&MscKick);
         OsWakeWorker();
     }
+    irql = OsLock();
+    t->Callbacks--;
+    OsUnlock(irql); /* no tag/device access after releasing callback ownership */
+    OsEventSet(&MscKick);
+    OsWakeWorker();
+}
+
+/* Worker context, after cancelling every UAS endpoint. A completion already
+ * collected by another CPU still owns the tag and its device. */
+static void UasDrainTransfers(MSC_DEV *m)
+{
+    OS_IRQL irql;
+    BOOLEAN busy;
+    int i;
+    do {
+        busy = FALSE;
+        irql = OsLock();
+        for (i = 0; i < UAS_MAX_TAGS; i++)
+            if (m->Tags[i].Left || m->Tags[i].Callbacks) busy = TRUE;
+        OsUnlock(irql);
+        if (busy) { UsbPollAll(); OsSleepMs(1); }
+    } while (busy);
 }
 
 static UAS_TAG *UasAllocTag(MSC_DEV *m, BOOLEAN Sync)
@@ -683,7 +763,7 @@ static UAS_TAG *UasAllocTag(MSC_DEV *m, BOOLEAN Sync)
 
     for (i = 0; i < m->NumTags; i++) {
         UAS_TAG *t = &m->Tags[i];
-        if (!t->Busy) {
+        if (!t->Busy && !t->Left && !t->Callbacks) {
             t->Busy = 1;
             t->Sync = (UCHAR)Sync;
             t->Failed = 0;
@@ -921,6 +1001,7 @@ static void UasRecover(MSC_DEV *m)
     UsbCancelPipe(&m->In);
     UsbCancelPipe(&m->Out);
     UsbCancelPipe(&m->Cmd);
+    UasDrainTransfers(m);
     if (m->Gone || m->Dev->Gone) {
         return;
     }
@@ -993,6 +1074,7 @@ static int MscCommandD(MSC_DEV *m, UCHAR Lun, const UCHAR *Cdb, UCHAR CdbLen, UC
     if (m->Gone || m->Dev->Gone) {
         return MSC_NODEV;
     }
+    if (m->Resetting) return MSC_ERROR;
     if (Dir == SCSI_DIR_NONE) {
         Len = 0;
     }
@@ -1779,6 +1861,11 @@ static BOOLEAN ExecuteOnSlot(SCSI_REQ *r, SCSI_SLOT *s)
     UCHAR cdb[16];
     int st;
 
+    if (s->Msc != NULL && s->Msc->Resetting) {
+        ReqCheck(r, s, SENSE_NOT_READY, 0x04, 0x02);
+        return TRUE;
+    }
+
     switch (op) {
     case SCSIOP_INQUIRY:
         if (r->Cdb[1] & 1) {
@@ -1952,7 +2039,7 @@ static void UasService(void)
 
     for (i = 0; i < USB_MAX_DEVICES; i++) {
         MSC_DEV *m = (MSC_DEV *)UsbDevs[i].Msc;
-        if (!UsbDevs[i].InUse || m == NULL || m->Proto != MSC_PROTO_UAS || m->Gone) {
+        if (!UsbDevs[i].InUse || m == NULL || m->Proto != MSC_PROTO_UAS || m->Gone || m->Resetting) {
             continue;
         }
         for (k = 0; k < m->NumTags && !m->Recover; k++) {
@@ -2083,7 +2170,7 @@ static void MscMediaService(void)
         SCSI_SLOT *s = &Slots[i];
         MSC_DEV *m = s->Msc;
         UCHAR fixed;
-        if (!s->Present || m == NULL || m->Gone || m->Dev->Gone || !IsDiskType(s->Type) || m->WaitHead != NULL ||
+        if (!s->Present || m == NULL || m->Gone || m->Resetting || m->Dev->Gone || !IsDiskType(s->Type) || m->WaitHead != NULL ||
             (s->Ph && Frozen)) {
             continue;
         }
@@ -2151,7 +2238,13 @@ void MscService(void)
 
 void UsbScsiInit(void)
 {
+#ifdef USB_WDM
+    /* Windows 2000 / XP make a disk for a slot only while it is used: room for a multi slot card
+       reader (four or more LUNs) next to other USB disks */
+    ULONG n = OsGetConfig("MaxDisks", SCSI_MAX_SLOTS);
+#else
     ULONG n = OsGetConfig("MaxDisks", 4);
+#endif
 
     if (n < 1) {
         n = 1;
@@ -2517,10 +2610,10 @@ static int UasSetup(MSC_DEV *m, const UCHAR *If, const UCHAR *End)
         UAS_TAG *t = &m->Tags[i];
         t->Msc = m;
         t->Tag = (USHORT)(i + 1);
-        OsEventInit(&t->Done);
-        t->Iu = (UCHAR *)UsbDmaAlloc(UAS_IU_SIZE, &t->IuPhys);
         if (t->Iu == NULL) {
-            return USB_ERR_NOMEM;
+            OsEventInit(&t->Done);
+            t->Iu = (UCHAR *)UsbDmaAlloc(UAS_IU_SIZE, &t->IuPhys);
+            if (t->Iu == NULL) return USB_ERR_NOMEM;
         }
     }
     m->Proto = MSC_PROTO_UAS;
@@ -2536,6 +2629,12 @@ static void MscClosePipes(MSC_DEV *m)
         UsbCancelPipe(&m->InS[i]);
         UsbCancelPipe(&m->OutS[i]);
     }
+    UsbCancelPipe(&m->Cmd);
+    UsbCancelPipe(&m->Stat);
+    UsbCancelPipe(&m->In);
+    UsbCancelPipe(&m->Out);
+    UsbCancelPipe(&m->Intr);
+    UasDrainTransfers(m);
     UsbClosePipe(&m->Cmd);
     UsbClosePipe(&m->Stat);
     UsbClosePipe(&m->In);
@@ -2610,12 +2709,14 @@ int MscAttach(USB_DEV *Dev, const UCHAR *If, const UCHAR *End)
         return USB_ERR_NOMEM;
     }
     Dev->Msc = m;
+    m->Alt = If[3];
 
     if (uas != NULL) {
         r = UasSetup(m, uas, End);
         if (r != USB_OK) {
             MscClosePipes(m);
             m->Proto = proto;
+            m->Alt = If[3];
             if (uas != If && (proto == MSC_PROTO_BOT || proto == MSC_PROTO_CBI || proto == MSC_PROTO_CBI_INT)) {
                 UsbControl(Dev, USB_RT_OUT | USB_RT_STD | USB_RT_INTERFACE, USB_REQ_SET_INTERFACE, If[3], If[2],
                            0, NULL, 1000, NULL);
@@ -2675,6 +2776,73 @@ int MscAttach(USB_DEV *Dev, const UCHAR *If, const UCHAR *End)
     return USB_OK;
 }
 
+/* Physical resets preserve logical SCSI slots and their media identity.
+ * Worker serialization excludes synchronous BOT/CBI commands; UAS must be
+ * cancelled and drained explicitly before changing the shared USB port. */
+ULONG MscResetInterfaces(USB_DEV *Dev)
+{
+    MSC_DEV *m = (MSC_DEV *)Dev->Msc;
+    return m != NULL && !m->Gone && m->Proto != MSC_PROTO_VIRT && m->Iface < 32
+        ? 1UL << m->Iface : 0;
+}
+
+void MscBeginDeviceReset(USB_DEV *Dev)
+{
+    MSC_DEV *m = (MSC_DEV *)Dev->Msc;
+    if (m == NULL) return;
+    m->Resetting = 1;
+    MscClosePipes(m);
+    /* WaitHead requests have not reached hardware and remain queued until
+       the worker resumes. Their slot identity must not be replaced. */
+}
+
+int MscRestoreDevice(USB_DEV *Dev)
+{
+    MSC_DEV *m = (MSC_DEV *)Dev->Msc;
+    const UCHAR *d, *end;
+    int r;
+    if (m == NULL) return USB_OK;
+    if (m->Gone || !m->Resetting || Dev->Gone) return USB_ERR_NODEV;
+    if (ReadIdentity(Dev) != m->Identity) return USB_ERR_NODEV;
+    end = Dev->Config + Dev->ConfigLen;
+    d = Dev->Config;
+    while ((d = UsbNextDesc(d, end)) != NULL) {
+        if (d[1] == USB_DT_INTERFACE && d[0] >= 9 && d[2] == m->Iface &&
+            d[3] == m->Alt && d[5] == USB_CLASS_MSC && d[6] == m->SubClass && d[7] == m->Proto) break;
+    }
+    if (d == NULL) return USB_ERR_NODEV;
+    if (m->Proto == MSC_PROTO_UAS) return UasSetup(m, d, end);
+    if (m->Alt != 0) {
+        r = UsbSetInterface(Dev, m->Iface, m->Alt);
+        if (r != USB_OK) return r;
+    }
+    return BotCbiSetup(m, d, end);
+}
+
+void MscEndDeviceReset(USB_DEV *Dev, int Result)
+{
+    MSC_DEV *m = (MSC_DEV *)Dev->Msc;
+    if (m == NULL) return;
+    if (Result != USB_OK) {
+        MscClosePipes(m);
+        while (m->WaitHead != NULL) {
+            SCSI_REQ *r = m->WaitHead;
+            m->WaitHead = r->Next;
+            if (m->WaitHead == NULL) m->WaitTail = NULL;
+            r->Transferred = 0;
+            r->SenseLength = 0;
+            r->ScsiStatus = SCSIST_GOOD;
+            r->SrbStatus = SRBST_ERROR;
+            if (r->Complete != NULL) r->Complete(r);
+        }
+        return;
+    }
+    m->Recover = 0;
+    m->Resetting = 0;
+    OsEventSet(&MscKick);
+    OsWakeWorker();
+}
+
 void MscDetach(USB_DEV *Dev)
 {
     MSC_DEV *m = (MSC_DEV *)Dev->Msc;
@@ -2684,6 +2852,7 @@ void MscDetach(USB_DEV *Dev)
         return;
     }
     m->Gone = 1;
+    MscClosePipes(m);
     for (i = 0; i < SCSI_MAX_SLOTS; i++) {
         if (Slots[i].Msc == m) {
             Slots[i].Present = 0;
@@ -2695,7 +2864,6 @@ void MscDetach(USB_DEV *Dev)
             OsScsiMediaChange(i);
         }
     }
-    MscClosePipes(m);
     while (m->WaitHead != NULL) {
         SCSI_REQ *r = m->WaitHead;
         m->WaitHead = r->Next;

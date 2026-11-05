@@ -226,19 +226,238 @@ static void RememberLetter(ULONG Identity, int Part, char Letter)
     }
 }
 
+static BOOL IsNt5(void)
+{
+    return (GetVersion() & 0x80000000) == 0 && (GetVersion() & 0xFF) >= 5;
+}
+
+/* Windows 2000 / XP: the bus of the disk or CD-ROM behind drive letter C (-1 unknown) */
+static int LetterBus(char C)
+{
+    char path[8];
+    STORAGE_PROPERTY_QUERY q;
+    union { STORAGE_DEVICE_DESCRIPTOR d; char b[512]; } u;
+    DWORD got = 0;
+    HANDLE h;
+    int bus = -1;
+
+    wsprintfA(path, "\\\\.\\%c:", C);
+    h = CreateFileA(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        return -1;
+    }
+    q.AdditionalParameters[0] = 0;
+    q.PropertyId = StorageDeviceProperty;
+    q.QueryType = PropertyStandardQuery;
+    if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q, sizeof(q), &u, sizeof(u), &got, NULL) &&
+        got >= 32) {
+        bus = (int)u.d.BusType;
+    }
+    CloseHandle(h);
+    return bus;
+}
+
+/* drive letter C names a USB disk: a usbnt slot (NT 3.x / 4.0) or a volume on a USB disk */
+static BOOL LetterIsUsb(char C, const char *Target)
+{
+    if (!IsNt5()) {
+        return DevMapIsSlotTarget(Map, USBNT_MAX_SLOTS, Target);
+    }
+    return LetterBus(C) == BusTypeUsb;
+}
+
+/* the last letter of a local disk partition or CD / DVD drive that is not a USB disk ('B' if none):
+   USB disks get letters after it (HKLM\Software\UsbNt LettersAfterLast = 0: the lowest free one) */
+static char LetterFloor(void)
+{
+    char name[4], target[256], c, floor = 'B';
+
+    if (!RegDword(HKEY_LOCAL_MACHINE, "Software\\UsbNt", "LettersAfterLast", 1)) {
+        return 'C';
+    }
+    name[1] = ':';
+    name[2] = 0;
+    for (c = 'C'; c <= 'Z'; c++) {
+        name[0] = c;
+        if (QueryDosDeviceA(name, target, sizeof(target)) != 0 && DevMapIsLocalStorage(target) &&
+            !LetterIsUsb(c, target)) {
+            floor = c;
+        }
+    }
+    return floor;
+}
+
 static char FreeLetter(char Want)
 {
+    char floor = LetterFloor();
     char c;
 
-    if (Want != 0 && !DevMapLetterUsed(Want)) {
+    if (Want > floor && !DevMapLetterUsed(Want)) {
         return Want;
     }
+    for (c = (char)(floor < 'C' ? 'D' : floor + 1); c <= 'Z'; c++) {
+        if (!DevMapLetterUsed(c)) {
+            return c;
+        }
+    }
+    /* nothing free after the last internal drive: the lowest free one */
     for (c = 'D'; c <= 'Z'; c++) {
         if (!DevMapLetterUsed(c)) {
             return c;
         }
     }
     return 0;
+}
+
+/* NT 3.1 - 4.0, once after boot: NT gave the USB slots letters at boot (removable disks come
+   before CD-ROMs), which pushed the CD / DVD drives up.  The slots' boot letters are taken back
+   and a CD-ROM that came right after them moves down into the gap (not one with a letter set in
+   Disk Administrator, HKLM\SYSTEM\DISK), so that it has the letter it would have without USBNT
+   and USB disks come after it (HKLM\Software\UsbNt CompactBootLetters = 0: leave them). */
+static BOOL StickyLetter(const char *Target)
+{
+    HKEY key;
+    char val[16];
+    DWORD type = 0, len = sizeof(val);
+    BOOL sticky = FALSE;
+
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SYSTEM\\DISK", 0, KEY_READ, &key) == ERROR_SUCCESS) {
+        sticky = RegQueryValueExA(key, Target, NULL, &type, (BYTE *)val, &len) == ERROR_SUCCESS;
+        RegCloseKey(key);
+    }
+    return sticky;
+}
+
+static void CompactBootLetters(void)
+{
+    char name[4], target[256], c, f, lo = 0, hi = 0;
+
+    if (!RegDword(HKEY_LOCAL_MACHINE, "Software\\UsbNt", "CompactBootLetters", 1) ||
+        !RegDword(HKEY_LOCAL_MACHINE, "Software\\UsbNt", "LettersAfterLast", 1)) {
+        return;
+    }
+    name[1] = ':';
+    name[2] = 0;
+    for (c = 'C'; c <= 'Z'; c++) {
+        name[0] = c;
+        if (QueryDosDeviceA(name, target, sizeof(target)) != 0 && DevMapIsSlotTarget(Map, USBNT_MAX_SLOTS, target)) {
+            if (DefineDosDeviceA(DDD_RAW_TARGET_PATH | DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE, name,
+                                 target)) {
+                Broadcast(c, FALSE);
+                if (lo == 0) {
+                    lo = c;
+                }
+                hi = c;
+            }
+        }
+    }
+    if (lo == 0) {
+        return;
+    }
+    Event("boot letters %c: - %c: of the USB slots taken back", lo, hi);
+    for (c = (char)(hi + 1); c <= 'Z'; c++) {
+        char from[4], low[16];
+        int i;
+        name[0] = c;
+        if (QueryDosDeviceA(name, target, sizeof(target)) == 0) {
+            continue;
+        }
+        for (i = 0; i < 13 && target[i]; i++) {
+            low[i] = (char)((target[i] >= 'A' && target[i] <= 'Z') ? target[i] + 32 : target[i]);
+        }
+        low[i] = 0;
+        if (lstrcmpA(low, "\\device\\cdrom") != 0 || DevMapIsSlotTarget(Map, USBNT_MAX_SLOTS, target) ||
+            StickyLetter(target)) {
+            break;                              /* only the CD-ROMs right after the slots */
+        }
+        for (f = lo; f < c && DevMapLetterUsed(f); f++) {
+        }
+        if (f >= c) {
+            break;
+        }
+        from[0] = c;
+        from[1] = ':';
+        from[2] = 0;
+        name[0] = f;
+        if (DefineDosDeviceA(DDD_RAW_TARGET_PATH, name, target)) {
+            DefineDosDeviceA(DDD_RAW_TARGET_PATH | DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE, from, target);
+            Broadcast(c, FALSE);
+            Broadcast(f, TRUE);
+            Event("CD-ROM %c: moved to %c:", c, f);
+        }
+    }
+}
+
+/* Windows 2000 / XP: the mount manager gives a new volume the lowest free letter, which may be
+   one before the CD / DVD drive.  A USB volume that got a letter before the last internal drive
+   is moved after it, once (the mount manager keeps the new one; a letter changed later in Disk
+   Management stays).  HKLM\Software\UsbNt\Placed lists the volumes already looked at. */
+typedef BOOL (WINAPI *GVN_FN)(LPCSTR, LPSTR, DWORD);
+typedef BOOL (WINAPI *DVM_FN)(LPCSTR);
+typedef BOOL (WINAPI *SVM_FN)(LPCSTR, LPCSTR);
+
+static void PlaceNt5Letters(void)
+{
+    static GVN_FN gvn;
+    static DVM_FN dvm;
+    static SVM_FN svm;
+    static BOOL looked;
+    char name[4], root[4], to[4], target[256], vol[64], c, f, floor = 0;
+    HKEY key;
+
+    if (!looked) {
+        HMODULE k = GetModuleHandleA("kernel32.dll");
+        looked = TRUE;
+        gvn = (GVN_FN)GetProcAddress(k, "GetVolumeNameForVolumeMountPointA");
+        dvm = (DVM_FN)GetProcAddress(k, "DeleteVolumeMountPointA");
+        svm = (SVM_FN)GetProcAddress(k, "SetVolumeMountPointA");
+    }
+    if (gvn == NULL || dvm == NULL || svm == NULL ||
+        !RegDword(HKEY_LOCAL_MACHINE, "Software\\UsbNt", "LettersAfterLast", 1)) {
+        return;
+    }
+    if (RegCreateKeyExA(HKEY_LOCAL_MACHINE, "Software\\UsbNt\\Placed", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &key,
+                        NULL) != ERROR_SUCCESS) {
+        return;
+    }
+    name[1] = root[1] = to[1] = ':';
+    name[2] = 0;
+    root[2] = to[2] = '\\';
+    root[3] = to[3] = 0;
+    for (c = 'C'; c <= 'Z'; c++) {
+        DWORD type = 0, val = 0, len = sizeof(val);
+        name[0] = root[0] = c;
+        if (QueryDosDeviceA(name, target, sizeof(target)) == 0 || !DevMapIsLocalStorage(target) ||
+            LetterBus(c) != BusTypeUsb || !gvn(root, vol, sizeof(vol))) {
+            continue;
+        }
+        if (RegQueryValueExA(key, vol, NULL, &type, (BYTE *)&val, &len) == ERROR_SUCCESS) {
+            continue;                           /* looked at before */
+        }
+        if (floor == 0) {
+            floor = LetterFloor();
+        }
+        val = (DWORD)(UCHAR)c;
+        if (c < floor) {
+            for (f = (char)(floor + 1); f <= 'Z' && DevMapLetterUsed(f); f++) {
+            }
+            if (f <= 'Z') {
+                to[0] = f;
+                if (dvm(root)) {
+                    if (svm(to, vol)) {
+                        val = (DWORD)(UCHAR)f;
+                        Broadcast(c, FALSE);
+                        Broadcast(f, TRUE);
+                        Event("USB volume %c: moved to %c: (after the internal drives)", c, f);
+                    } else {
+                        svm(root, vol);         /* keep the old letter */
+                    }
+                }
+            }
+        }
+        RegSetValueExA(key, vol, 0, REG_DWORD, (const BYTE *)&val, sizeof(val));
+    }
+    RegCloseKey(key);
 }
 
 /* gives the NT device Path a drive letter if it has none: the one remembered for (Identity, Part) if free */
@@ -328,6 +547,12 @@ static void ManageLetters(HANDLE Dev)
     if (!MapDone) {
         DevMapSlots(tree.ScsiPort, Map, USBNT_MAX_SLOTS);
         MapDone = TRUE;
+        if (!nt5) {
+            CompactBootLetters();
+        }
+    }
+    if (nt5) {
+        PlaceNt5Letters();
     }
     /* the letters of empty slots are taken back first: a disk that came gets the lowest free ones */
     for (pass = 0; pass < 2; pass++) {
@@ -390,6 +615,14 @@ static DWORD WINAPI LetterThread(LPVOID Param)
             continue;
         }
         count = now;
+        if (IsNt5()) {
+            /* the mount manager gives the letter a moment after the disk came */
+            int k;
+            for (k = 0; k < 8; k++) {
+                Sleep(1000);
+                PlaceNt5Letters();
+            }
+        }
     }
 }
 

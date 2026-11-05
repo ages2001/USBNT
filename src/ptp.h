@@ -69,7 +69,7 @@ typedef struct _PTP_STATE {
     ULONG   PrevId;
     LONG    PrevX, PrevY, RemX, RemY;
     LONG    PrevCx, PrevCy, AccX, AccY;
-    ULONG   TapStart, TapUntil;
+    ULONG   TapStart, TapUntil, TapMs;
     LONG    TapX0, TapY0, TapMove;
     LONG    SwX0, SwY0;                 /* where a three finger swipe started */
     PTP_OUT Out;

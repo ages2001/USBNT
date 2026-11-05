@@ -260,7 +260,8 @@ static void Functions(char *Out, const USBNT_DEV_INFO *d)
     if (d->Functions & USBNT_FUNC_MIDI) lstrcatA(Out, "MIDI, ");
     if (d->Functions & USBNT_FUNC_VIDEO) lstrcatA(Out, "Camera, ");
     if (Out[0] == 0) {
-        lstrcpyA(Out, "No driver");
+        /* Class flags do not describe external generic clients (for example, a NIC). */
+        lstrcpyA(Out, "No built-in driver");
     } else {
         Out[lstrlenA(Out) - 2] = 0;
     }

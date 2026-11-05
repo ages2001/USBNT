@@ -1216,6 +1216,23 @@ static void EhciDevFree(USB_DEV *Dev)
     (void)Dev;
 }
 
+/* Called only after every device/pipe is detached. Verify that DMA is
+ * halted before returning private allocations; retain them on uncertainty. */
+static int EhciRelease(USB_HC *Hc)
+{
+    EHC *e = EHCP(Hc);
+    if (e == NULL) return USB_OK;
+    if (Hc->Running || !(OpRd(e, EOP_USBSTS) & STS_HALTED) || OpRd(e, EOP_USBSTS) == 0xFFFFFFFF) return USB_ERR_IO;
+    if (e->AsyncHead.Next != NULL || e->IntHead.Next != NULL || e->IsoList != NULL) return USB_ERR_BUSY;
+    QhFree(&e->AsyncHead);
+    QhFree(&e->IntHead);
+    UsbDmaFree(e->Frames, 4096);
+    OsFree(e->IsoFirst);
+    OsFree(e);
+    Hc->Priv = NULL;
+    return USB_OK;
+}
+
 const HCD_OPS EhciOps = {
     "EHCI",
     EhciStart,
@@ -1234,5 +1251,7 @@ const HCD_OPS EhciOps = {
     EhciCancel,
     EhciPipeReset,
     EhciPoll,
-    EhciInterrupt
+    EhciInterrupt,
+    NULL,
+    EhciRelease
 };

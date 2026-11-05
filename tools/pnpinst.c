@@ -39,6 +39,7 @@
 
 #include <windows.h>
 #include <setupapi.h>
+#include <cfgmgr32.h>
 
 void PnpPrint(const char *Fmt, ...);
 #define Print PnpPrint
@@ -86,6 +87,8 @@ static P_CallClassInstaller CallClassInstaller;
 static P_DestroyList DestroyList;
 static P_UninstallOEMInf UninstallOEMInf;
 static P_LocateDevNode LocateDevNode;
+typedef CONFIGRET (WINAPI *P_NodeStatus)(PULONG, PULONG, DEVINST, ULONG);
+static P_NodeStatus NodeStatus;
 static P_Reenumerate Reenumerate;
 static P_BuildDrivers BuildDrivers;
 static P_EnumDriver EnumDriver;
@@ -115,8 +118,9 @@ static BOOL Load(void)
 {
     HMODULE s = LoadLibraryA("setupapi.dll");
     HMODULE n = LoadLibraryA("newdev.dll");
+    HMODULE c = LoadLibraryA("cfgmgr32.dll");
 
-    if (s == NULL || n == NULL) {
+    if (s == NULL || n == NULL || c == NULL) {
         Print("SetupAPI is not available (error %lu)\r\n", GetLastError());
         return FALSE;
     }
@@ -133,6 +137,7 @@ static BOOL Load(void)
     UninstallOEMInf = (P_UninstallOEMInf)GetProcAddress(s, "SetupUninstallOEMInfA");    /* XP and later */
     LocateDevNode = (P_LocateDevNode)GetProcAddress(s, "CM_Locate_DevNodeA");
     Reenumerate = (P_Reenumerate)GetProcAddress(s, "CM_Reenumerate_DevNode");
+    NodeStatus = (P_NodeStatus)GetProcAddress(c, "CM_Get_DevNode_Status");
     BuildDrivers = (P_BuildDrivers)GetProcAddress(s, "SetupDiBuildDriverInfoList");
     EnumDriver = (P_EnumDriver)GetProcAddress(s, "SetupDiEnumDriverInfoA");
     DriverParams = (P_DriverParams)GetProcAddress(s, "SetupDiGetDriverInstallParamsA");
@@ -146,7 +151,7 @@ static BOOL Load(void)
         GetDevRegProp == NULL || SetDevRegProp == NULL || CreateList == NULL || CreateInfo == NULL ||
         CallClassInstaller == NULL || DestroyList == NULL || BuildDrivers == NULL || EnumDriver == NULL ||
         DriverParams == NULL || DriverDetail == NULL || SelectDriver == NULL || DestroyDrivers == NULL ||
-        GetDevParams == NULL) {
+        GetDevParams == NULL || NodeStatus == NULL) {
         Print("SetupAPI lacks a function this program needs\r\n");
         return FALSE;
     }
@@ -782,6 +787,7 @@ int PnpInstall(const char *Dir, const char *Cmd)
     SP_DEVINFO_DATA d;
     DWORD i, type, maj, min, sp;
     BOOL reboot = FALSE, ehciOs, running, ehciWin = FALSE, cam;
+    BOOL controllerBus = FALSE, rootBus;
     int k, done = 0, pol = Policy(Cmd);
     char *seen[64];
     int nseen = 0;
@@ -854,6 +860,18 @@ int PnpInstall(const char *Dir, const char *Cmd)
             continue;
         }
         kinds[i] = (UCHAR)KindOf(hw, cp);
+        /* A started USBNT HCD already supplies the bus when no root bus is
+           installed. Creating one during upgrade would reparent every child
+           at the next boot, losing existing network and input bindings. */
+        if (running && kinds[i] >= K_UHCI && kinds[i] <= K_XHCI) {
+            ULONG status = 0, problem = 0;
+            svc[0] = 0;
+            if (GetDevRegProp(h, &d, SPDRP_SERVICE, &type, (PBYTE)svc, sizeof(svc), NULL) &&
+                SameNoCase(svc, "usbnt") && NodeStatus(&status, &problem, d.DevInst, 0) == CR_SUCCESS &&
+                (status & DN_STARTED) && problem == 0) {
+                controllerBus = TRUE;
+            }
+        }
         if (kinds[i] == K_UHCI || kinds[i] == K_OHCI || kinds[i] == K_EHCI) {
             win = WindowsDriver(h, &d, winf, wdesc);
         }
@@ -880,12 +898,11 @@ int PnpInstall(const char *Dir, const char *Cmd)
     Print("  WindowsCamera = %d (%s)\r\n", cam ? 1 : 0,
           cam ? "USB cameras go to Windows' usbvideo.sys" : "USB cameras on USBNT's controllers: USBNT's camera driver");
 
-    if (!BusExists() && FromTextSetup()) {
-        /* no USBNT\Bus device: usbnt.sys makes the first host controller the bus, the disks
-           are there at boot then; a root device now would be the bus from the next start on */
-        Print("  USBNT device bus: on the first host controller (installed by text-mode setup)\r\n");
+    rootBus = BusExists();
+    if (!rootBus && (controllerBus || FromTextSetup())) {
+        Print("  USBNT device bus: preserving the existing host-controller parent\r\n");
     } else {
-        if (!BusExists() && !MakeBus()) {
+        if (!rootBus && !MakeBus()) {
             DestroyList(h);
             return 1;
         }

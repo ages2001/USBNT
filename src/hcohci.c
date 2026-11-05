@@ -1004,6 +1004,23 @@ static void OhciDevFree(USB_DEV *Dev)
     (void)Dev;
 }
 
+/* Called only after every device/pipe is detached. Verify that DMA is
+ * halted before returning private allocations; retain them on uncertainty. */
+static int OhciRelease(USB_HC *Hc)
+{
+    OHC *o = OHCP(Hc);
+    int i;
+    if (o == NULL) return USB_OK;
+    if (Hc->Running || (Rd(o, OR_CONTROL) & CTL_HCFS_MASK) != CTL_HCFS_RESET || Rd(o, OR_CONTROL) == 0xFFFFFFFF) return USB_ERR_IO;
+    if (o->IsoList != NULL) return USB_ERR_BUSY;
+    for (i = 0; i < 4; i++) if (o->Head[i].Next != NULL) return USB_ERR_BUSY;
+    for (i = 0; i < 4; i++) UsbDmaFree(o->Head[i].Ed, 32);
+    UsbDmaFree(o->Hcca, 256);
+    OsFree(o);
+    Hc->Priv = NULL;
+    return USB_OK;
+}
+
 const HCD_OPS OhciOps = {
     "OHCI",
     OhciStart,
@@ -1022,5 +1039,7 @@ const HCD_OPS OhciOps = {
     OhciCancel,
     OhciPipeReset,
     OhciPoll,
-    OhciInterrupt
+    OhciInterrupt,
+    NULL,
+    OhciRelease
 };

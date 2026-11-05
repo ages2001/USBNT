@@ -8,7 +8,7 @@
 
 #include "usbos.h"
 
-#define USBNT_VERSION_STR "1.2"
+#include "usbntver.h"
 
 /* ------------------------------------------------------------------ */
 /* Utilities (usbutil.c)                                                */
@@ -221,7 +221,9 @@ struct _USB_DEV {
     char            Serial[32];
     ULONG           NativeIf;       /* interfaces USBNT's own class drivers serve (bit = number) */
     UCHAR           Ready;          /* enumerated and bound */
-    UCHAR           Pad4[3];
+    UCHAR           Sleeping;      /* controller sleep retains this device and its owners */
+    UCHAR           SleepConfig;
+    UCHAR           ConfigIndex;    /* descriptor index of Config (ChooseConfig) */
     ULONG           Gen;            /* differs for every attach of a device in this slot */
 };
 
@@ -268,6 +270,7 @@ typedef struct _HCD_OPS {
     void    (*Poll)(USB_HC *Hc);
     BOOLEAN (*Interrupt)(USB_HC *Hc);
     int     (*StreamsOpen)(USB_PIPE *Pipe, USB_PIPE *Child, int Count);
+    int     (*Release)(USB_HC *Hc); /* detached, stopped controller; refuse unsafe DMA release */
 } HCD_OPS;
 
 #define HC_UHCI     0
@@ -296,7 +299,8 @@ struct _USB_HC {
     UCHAR           IsoOk;          /* isochronous transfers implemented */
     UCHAR           Hot;            /* found after the start (PCIe hot plug: Thunderbolt / USB4 dock) */
     UCHAR           Removed;        /* the PCI function went away */
-    UCHAR           Pad3[3];
+    UCHAR           Sleeping;      /* retained children; suppress root/companion polling */
+    UCHAR           Pad3[2];
     USHORT          VendorId;
     USHORT          DeviceId;
     USB_HC         *Ehci;           /* EHCI owning this companion */
@@ -318,6 +322,7 @@ extern USB_DEV  UsbDevs[USB_MAX_DEVICES];
 int     UsbInit(void);
 void    UsbShutdown(void);
 void    UsbPollAll(void);
+int     UsbReleaseController(USB_HC *Hc);
 BOOLEAN UsbInterruptAll(void);
 void    UsbWorkerIteration(void);
 void    UsbTick(void);
@@ -345,6 +350,10 @@ int     UsbOpenStreams(USB_PIPE *Pipe, USB_PIPE *Child, int Count);
 #define USB_ISO_RESTART_FRAMES  8
 
 int     UsbSetInterface(USB_DEV *Dev, UCHAR Interface, UCHAR Alt);
+/* Worker only, all non-control pipes closed and clients quiesced. */
+int     UsbResetDevice(USB_DEV *Dev);
+int     UsbCheckDeviceStrings(USB_DEV *Dev);
+int     HubResetChild(USB_DEV *Dev, UCHAR *Speed);
 ULONG   UsbIsoSlotUframes(USB_PIPE *Pipe);
 
 USB_DEV *UsbDevAttach(USB_HC *Hc, USB_DEV *Parent, int Port, UCHAR Speed);
@@ -372,14 +381,27 @@ void    HubRemoveChildren(USB_DEV *Dev);
 int     MscAttach(USB_DEV *Dev, const UCHAR *If, const UCHAR *End);
 void    MscDetach(USB_DEV *Dev);
 void    MscService(void);
+ULONG   MscResetInterfaces(USB_DEV *Dev);
+void    MscBeginDeviceReset(USB_DEV *Dev);
+int     MscRestoreDevice(USB_DEV *Dev);
+void    MscEndDeviceReset(USB_DEV *Dev, int Result);
 
 int     HidAttach(USB_DEV *Dev, const UCHAR *If, const UCHAR *End);
 void    HidDetach(USB_DEV *Dev);
 void    HidService(void);
 void    HidTick(void);
+ULONG   HidResetInterfaces(USB_DEV *Dev);
+void    HidBeginDeviceReset(USB_DEV *Dev);
+int     HidRestoreDevice(USB_DEV *Dev);
+void    HidEndDeviceReset(USB_DEV *Dev, int Result);
 
 int     AudioAttach(USB_DEV *Dev, const UCHAR *If, const UCHAR *End);
 void    AudioDetach(USB_DEV *Dev);
+void    CliArrival(USB_DEV *Dev);
+void    CliDetach(USB_DEV *Dev);
+int     CliBeginDeviceReset(USB_DEV *Dev);
+void    CliAbortDeviceReset(USB_DEV *Dev);
+void    CliEndDeviceReset(USB_DEV *Dev, int Result);
 void    AudioService(void);
 void    AudioTick(void);
 

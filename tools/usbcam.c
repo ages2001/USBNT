@@ -68,6 +68,10 @@ static HWND MainWnd, CamBox, FmtBox, StartBtn, PhotoBtn, RecBtn, FolderBtn, Jpeg
 static HWND BrightLbl, ContrastLbl, SourceBtn;
 static HFONT Font;
 static HANDLE Dev = INVALID_HANDLE_VALUE;
+/* frames are fetched on a handle of their own: a handle opened without FILE_FLAG_OVERLAPPED
+   runs one request at a time, so a control change (or a camera list) from the window waited
+   behind every frame request of the capture thread and the window froze */
+static HANDLE FrameDev = INVALID_HANDLE_VALUE;
 static HANDLE Heap;
 static USBNT_CAMERAS Cams;
 static FMT_ITEM FmtItems[USBNT_VID_FORMATS * USBNT_VID_FRAMES];
@@ -603,7 +607,12 @@ static BOOL NextFrame(ULONG *seq, ULONG timeout, BOOL *got)
     g.Id = CamId;
     g.LastSequence = *seq;
     g.TimeoutMs = timeout;
-    if (!DeviceIoControl(Dev, IOCTL_USBNT_VIDEO_FRAME, &g, sizeof(g), Raw, RawSize, &n, NULL)) {
+    if (FrameDev == INVALID_HANDLE_VALUE) {
+        FrameDev = CreateFileA(USBNT_WIN32_NAME, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               NULL, OPEN_EXISTING, 0, NULL);
+    }
+    if (!DeviceIoControl(FrameDev != INVALID_HANDLE_VALUE ? FrameDev : Dev, IOCTL_USBNT_VIDEO_FRAME, &g, sizeof(g),
+                         Raw, RawSize, &n, NULL)) {
         DWORD e = GetLastError();
         if (e == ERROR_FILE_NOT_FOUND || e == ERROR_DEV_NOT_EXIST || e == ERROR_BAD_UNIT || e == ERROR_NOT_READY ||
             e == ERROR_GEN_FAILURE || e == ERROR_BAD_COMMAND || e == ERROR_INVALID_HANDLE) {
@@ -1249,6 +1258,55 @@ static void ShowStatus(void)
     SetWindowTextA(StatusWnd, s);
 }
 
+/* brightness / contrast set by a thread of their own (with its own handle): the window never
+   waits for the camera, and while a slider is dragged only the newest value is sent */
+static HANDLE CtlEv, CtlDev = INVALID_HANDLE_VALUE;
+static volatile LONG CtlWant[2] = { 0x7FFFFFFF, 0x7FFFFFFF };  /* brightness, contrast; 0x7FFFFFFF none */
+static volatile LONG CtlCam;
+
+static DWORD WINAPI CtlThread(LPVOID p)
+{
+    (void)p;
+    for (;;) {
+        int k;
+        WaitForSingleObject(CtlEv, INFINITE);
+        for (k = 0; k < 2; k++) {
+            LONG v = InterlockedExchange((LONG *)&CtlWant[k], 0x7FFFFFFF);
+            USBNT_VID_CONTROL c;
+            DWORD got = 0;
+            if (v == 0x7FFFFFFF || CtlCam == 0) continue;
+            if (CtlDev == INVALID_HANDLE_VALUE) {
+                CtlDev = CreateFileA(USBNT_WIN32_NAME, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                     NULL, OPEN_EXISTING, 0, NULL);
+                if (CtlDev == INVALID_HANDLE_VALUE) continue;
+            }
+            Mz(&c, sizeof(c));
+            c.Id = (ULONG)CtlCam;
+            c.Selector = k == 0 ? USBNT_VCTL_BRIGHTNESS : USBNT_VCTL_CONTRAST;
+            c.Set = 1;
+            c.Value = v;
+            DeviceIoControl(CtlDev, IOCTL_USBNT_VIDEO_CONTROL, &c, sizeof(c), &c, sizeof(c), &got, NULL);
+        }
+    }
+    return 0;
+}
+
+static void ControlLater(ULONG sel, LONG value)
+{
+    if (Vfw >= 0 || (!CamId && (CurCam < 0 || IsVfwCam(CurCam)))) return;
+    if (CtlEv == NULL) {
+        DWORD tid;
+        CtlEv = CreateEventA(NULL, FALSE, FALSE, NULL);
+        if (CtlEv == NULL || CreateThread(NULL, 0, CtlThread, NULL, 0, &tid) == NULL) {
+            Control(sel, TRUE, value, NULL);
+            return;
+        }
+    }
+    CtlCam = (LONG)(CamId ? CamId : Cams.Cam[CurCam].Id);
+    InterlockedExchange((LONG *)&CtlWant[sel == USBNT_VCTL_BRIGHTNESS ? 0 : 1], value);
+    SetEvent(CtlEv);
+}
+
 static void Scroll(HWND sb, int code, int pos)
 {
     int mn, mx, cur = GetScrollPos(sb, SB_CTL), step;
@@ -1269,7 +1327,7 @@ static void Scroll(HWND sb, int code, int pos)
     if (cur < mn) cur = mn;
     if (cur > mx) cur = mx;
     SetScrollPos(sb, SB_CTL, cur, TRUE);
-    Control(sel, TRUE, cur, NULL);
+    ControlLater(sel, cur);
 }
 
 static LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)

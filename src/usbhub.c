@@ -293,6 +293,13 @@ static int HubResetPort(HUB *h, int Port, UCHAR *Speed)
     return USB_OK;
 }
 
+int HubResetChild(USB_DEV *Dev, UCHAR *Speed)
+{
+    USB_DEV *parent = Dev->Parent;
+    if (parent == NULL || parent->Gone || parent->Hub == NULL) return USB_ERR_NODEV;
+    return HubResetPort((HUB *)parent->Hub, Dev->Port, Speed);
+}
+
 static void HubServicePort(HUB *h, int Port)
 {
     USHORT st = 0, ch = 0;

@@ -1,0 +1,1250 @@
+{
+  "CHANGELOG.md": {
+    "bytes": 22791,
+    "sha256": "8dac8a4dfd0c8558e8af4b1a2ad56080a917a1f6a2725dc63543754236830a4f"
+  },
+  "LICENSE": {
+    "bytes": 35823,
+    "sha256": "230184f60bae2feaf244f10a8bac053c8ff33a183bcc365b4d8b876d2b7f4809"
+  },
+  "README.md": {
+    "bytes": 89587,
+    "sha256": "f283570c18ea2ae5d744fe35e420f9d88f11eb5673aff1e7d67c4d7ee584b374"
+  },
+  "RELEASE-1.3-STATUS.md": {
+    "bytes": 19152,
+    "sha256": "76502646f9a49c06201ab112cb9e8b34b0275a3663579ac3a4d8b03c2c44c519"
+  },
+  "build/archive_source.py": {
+    "bytes": 3230,
+    "sha256": "a4fa863138c2c939b4f26ab0a68f8de15218862acd6f894a2f669e791f4416a7"
+  },
+  "build/fixexe.py": {
+    "bytes": 963,
+    "sha256": "ffb9e283b8c6465f272f34acb0a30af100b55497001d578b0b3c6bcce3d953aa"
+  },
+  "build/fixpe.py": {
+    "bytes": 1257,
+    "sha256": "f86d8c3d2e6790b9482937d57adf2b92009b25cd7df65350df06d0303311008f"
+  },
+  "build/fixpe5.py": {
+    "bytes": 1314,
+    "sha256": "962b310b5a4207d81266f316a2f805b70a0bd39f61a29ea68a14cd67712d45bd"
+  },
+  "build/mkdist.sh": {
+    "bytes": 1846,
+    "sha256": "38965a28c66f8d59edad58088d0505f414922657a4828ff8c42f8cb013a534bb"
+  },
+  "build/mkinf.py": {
+    "bytes": 12377,
+    "sha256": "e894f9258c17e7651b8668bbdf09859a4c93a75d400d0c8c51cea0178ad27d6d"
+  },
+  "build/mkoem.py": {
+    "bytes": 4954,
+    "sha256": "3c7df8dd98208efecfae982bf9c54fb50fa1163061949d9c7ea8cb33fbfd6636"
+  },
+  "build/nt31/advapi32.exp": {
+    "bytes": 5330,
+    "sha256": "c8bb8de7bf0829650a3b90a6fc110680aff5b47d193f8bd649f68dd6f1efc7d9"
+  },
+  "build/nt31/comdlg32.exp": {
+    "bytes": 468,
+    "sha256": "161ae5e54e9b358371358d20f5b7823244a9cf2e8666a0398e39ee7d5cdd2ec5"
+  },
+  "build/nt31/gdi32.exp": {
+    "bytes": 5070,
+    "sha256": "99773131a6fe7e80a600b9e4adc918d1be5abbf1321a0cce19b32c0cae7ca3bd"
+  },
+  "build/nt31/hal.exp": {
+    "bytes": 1396,
+    "sha256": "39bca0fda051a1f6d47ebb139f67c62635198d86490bf12418e16c8caf19b27a"
+  },
+  "build/nt31/kernel32.exp": {
+    "bytes": 9260,
+    "sha256": "19e36683b3ec2fbe0ccfe6ca82dcfe775afc1622d026e8f466cefadc336f2409"
+  },
+  "build/nt31/ntoskrnl.exp": {
+    "bytes": 12602,
+    "sha256": "c606895473170f1e0200f5fd4aa9985723bf341c47d8e23d9f4c1abdfe52b0bc"
+  },
+  "build/nt31/user32.exp": {
+    "bytes": 9094,
+    "sha256": "475e6883c5acf837cc935273f9716d1f903f75cfd91fd1ca4eddf27e9c8505e8"
+  },
+  "build/nt31/winmm.exp": {
+    "bytes": 2579,
+    "sha256": "a53d60b06b2b2f3658fc73fc8640c769adf0c2210f5a405ee4f1c3a7a817998e"
+  },
+  "build/nt31rtm/advapi32.exp": {
+    "bytes": 5330,
+    "sha256": "c8bb8de7bf0829650a3b90a6fc110680aff5b47d193f8bd649f68dd6f1efc7d9"
+  },
+  "build/nt31rtm/comdlg32.exp": {
+    "bytes": 468,
+    "sha256": "161ae5e54e9b358371358d20f5b7823244a9cf2e8666a0398e39ee7d5cdd2ec5"
+  },
+  "build/nt31rtm/gdi32.exp": {
+    "bytes": 5070,
+    "sha256": "99773131a6fe7e80a600b9e4adc918d1be5abbf1321a0cce19b32c0cae7ca3bd"
+  },
+  "build/nt31rtm/hal.exp": {
+    "bytes": 1396,
+    "sha256": "39bca0fda051a1f6d47ebb139f67c62635198d86490bf12418e16c8caf19b27a"
+  },
+  "build/nt31rtm/kernel32.exp": {
+    "bytes": 9260,
+    "sha256": "19e36683b3ec2fbe0ccfe6ca82dcfe775afc1622d026e8f466cefadc336f2409"
+  },
+  "build/nt31rtm/ntoskrnl.exp": {
+    "bytes": 12602,
+    "sha256": "c606895473170f1e0200f5fd4aa9985723bf341c47d8e23d9f4c1abdfe52b0bc"
+  },
+  "build/nt31rtm/user32.exp": {
+    "bytes": 9078,
+    "sha256": "1a1496c0fef46f3a5721b3f3309e3442f5fa4c49fc6d38dc29848836960a51e4"
+  },
+  "build/nt31rtm/winmm.exp": {
+    "bytes": 2579,
+    "sha256": "a53d60b06b2b2f3658fc73fc8640c769adf0c2210f5a405ee4f1c3a7a817998e"
+  },
+  "build/nt35/advapi32.exp": {
+    "bytes": 5416,
+    "sha256": "07824c9612f67a79437acc3f8a12b0a7bfc7d0e253a3e981515d319e22d84ec5"
+  },
+  "build/nt35/comdlg32.exp": {
+    "bytes": 468,
+    "sha256": "161ae5e54e9b358371358d20f5b7823244a9cf2e8666a0398e39ee7d5cdd2ec5"
+  },
+  "build/nt35/gdi32.exp": {
+    "bytes": 5569,
+    "sha256": "2d95979efc65b53d4581935cf5e6eb18cefe9756358164a88599746a073a9618"
+  },
+  "build/nt35/hal.exp": {
+    "bytes": 1738,
+    "sha256": "4e7d194ed5f5523120f02fea9e51bb7879aaa3224407b86294e6ae6de0c1dc3e"
+  },
+  "build/nt35/kernel32.exp": {
+    "bytes": 10595,
+    "sha256": "00600356f4af22871076402449463106295d48f34c7c4cbb5f59b3c8a4d697f9"
+  },
+  "build/nt35/ntoskrnl.exp": {
+    "bytes": 15144,
+    "sha256": "8bf08a32ea801e7f49e2d1973971aee4eee8fcd4deeeaec511be26d94c6c5fcd"
+  },
+  "build/nt35/user32.exp": {
+    "bytes": 9225,
+    "sha256": "572d8dff6933d1c51bb81f6fed4827b1f0781b0e5aeac36ee6a4d32b9e56609c"
+  },
+  "build/nt35/winmm.exp": {
+    "bytes": 3118,
+    "sha256": "61c632279823318618d49f3903634f8f34ac90ec3fb043c8b83141c312b27ac6"
+  },
+  "build/nt351/advapi32.exp": {
+    "bytes": 5799,
+    "sha256": "b0189020620d69f473336b3b643f22c9ca60ab9188b59b69031b211febb9da39"
+  },
+  "build/nt351/comdlg32.exp": {
+    "bytes": 468,
+    "sha256": "161ae5e54e9b358371358d20f5b7823244a9cf2e8666a0398e39ee7d5cdd2ec5"
+  },
+  "build/nt351/gdi32.exp": {
+    "bytes": 5982,
+    "sha256": "fc5c3b97bd88fda504895c3d59cd0f4ccc78f15fa50a5f58671708e8c4ec2a10"
+  },
+  "build/nt351/hal.exp": {
+    "bytes": 1737,
+    "sha256": "40c33f5064758417c26e7f4bb5b149f43927662d8fc62972fec30b701f25eac1"
+  },
+  "build/nt351/kernel32.exp": {
+    "bytes": 11004,
+    "sha256": "3db6689d6e0e4a3ac3e6b3e84ba7e6a2e596a21a2c76e4f61ac6fe6890fec133"
+  },
+  "build/nt351/ntoskrnl.exp": {
+    "bytes": 17488,
+    "sha256": "e4e036eeb5032184d956c5022478b222c8abc55756c3a93a7e28a1319ddfa3fc"
+  },
+  "build/nt351/user32.exp": {
+    "bytes": 9259,
+    "sha256": "0470774caf61b8f174598ad2b5d4d83e9fa03110b92b41712498a71c195d4337"
+  },
+  "build/nt351/winmm.exp": {
+    "bytes": 3074,
+    "sha256": "32a9699c2aecb34be0a2c1de33d405c47a431a6ca289a3b3f4495729d78e5001"
+  },
+  "build/nt4/advapi32.exp": {
+    "bytes": 8041,
+    "sha256": "fad8148ed30eedc74a1237d17036868d028e1084b73a6b4fe28c58e47b51b05c"
+  },
+  "build/nt4/comdlg32.exp": {
+    "bytes": 314,
+    "sha256": "e87115e3943066053e40be9ca347b8f66931ea911c9abfc3948fa50e4e927ad8"
+  },
+  "build/nt4/gdi32.exp": {
+    "bytes": 6137,
+    "sha256": "0cddea6946c02d27a385c1339b2bb7383724f0684746fa66b3967042514ab6e2"
+  },
+  "build/nt4/hal.exp": {
+    "bytes": 1843,
+    "sha256": "9d7b612f2e15d9d3d7d087734a113e153d988172ff06163e438a707600b6b0c1"
+  },
+  "build/nt4/kernel32.exp": {
+    "bytes": 11936,
+    "sha256": "3e144a4723a6cd179e074692c9dc3d5efc0a9fbe281080db7b949ebe76c97be0"
+  },
+  "build/nt4/ntoskrnl.exp": {
+    "bytes": 20624,
+    "sha256": "08451b75e6edd9f8d9f640b161f177bbf98050d424b6dc75c1f4c1ee6dd5193e"
+  },
+  "build/nt4/user32.exp": {
+    "bytes": 10188,
+    "sha256": "f3007a1192f568099dfaf19d456c62412d4c7d8b03588a497961b4fe8480a18a"
+  },
+  "build/nt4/winmm.exp": {
+    "bytes": 3127,
+    "sha256": "b32945234bccf159867bf3f38db7051fec6b57ebd0da02afce53bb9d13feeaa8"
+  },
+  "build/ntbuild.sh": {
+    "bytes": 1831,
+    "sha256": "7896ce0893196c80708a882a1aa82b3b41afc9e360236a83da4dac9c1b878bfb"
+  },
+  "build/tlbuild.sh": {
+    "bytes": 3050,
+    "sha256": "6802be616c911d47336f221c71ef388620bfd41cf83114d00c654dab5cd42b7c"
+  },
+  "build/w2k/hal.exp": {
+    "bytes": 1997,
+    "sha256": "fd8c0acbe821faf1e7a08a0c039a2aad2cd5ee34d6dfa48ad68daac5dd1abc01"
+  },
+  "build/w2k/hidclass.exp": {
+    "bytes": 22,
+    "sha256": "a44b58e3fe5fdaabea1365e8ced795a59af125dafd15d8e0dc184b394cd0425e"
+  },
+  "build/w2k/ks.exp": {
+    "bytes": 5337,
+    "sha256": "e6651695fef45e6cb37307958325bf0de739359af5d9889900333c7ab0380ccd"
+  },
+  "build/w2k/ntoskrnl.exp": {
+    "bytes": 24984,
+    "sha256": "76bbf73e946bb705a0b2f54e4be9b4c872564e302251eb922e20ef7bee9c83b2"
+  },
+  "build/w2k/portcls.exp": {
+    "bytes": 1146,
+    "sha256": "24283025a3be0ac62829ce0d57cdc4829a0bdc4d16d2278fb57db94230cdbc9c"
+  },
+  "build/w2k/usbd.exp": {
+    "bytes": 815,
+    "sha256": "0bc324aa3a2157408f461671b3b72cca3f591246e726809b3afc36e2b89651c9"
+  },
+  "build/wdmbuild.sh": {
+    "bytes": 3837,
+    "sha256": "c1450b571c9d3ec0077e77793e7edf59155466e355dc0f6e947c54a11560213d"
+  },
+  "build/xp64/hal.exp": {
+    "bytes": 1356,
+    "sha256": "6bf5a6befe53879e1fc622b770531b9634393a42252caa698cd4a785c1c5ec2b"
+  },
+  "build/xp64/hidclass.exp": {
+    "bytes": 64,
+    "sha256": "44e12a077052857d99303d3f672b20b208875b0aa2a1ba1f486cfd1e36b287f4"
+  },
+  "build/xp64/ks.exp": {
+    "bytes": 5645,
+    "sha256": "32060907febc6dbd728ffdd611b17aa7026b4ba28fc86d2714e8b8f656a3476e"
+  },
+  "build/xp64/ntoskrnl.exp": {
+    "bytes": 32501,
+    "sha256": "1da20b835d9f44eee60f0d6b5f782c910e91cbdd3a6db8a29bc8495cddb24bd1"
+  },
+  "build/xp64/portcls.exp": {
+    "bytes": 718,
+    "sha256": "c5e782c65b688d7691eac776bc82a61ec20a25c9ee02a811c717e9d8c3b7644e"
+  },
+  "build/xp64/usbd.exp": {
+    "bytes": 736,
+    "sha256": "accca2c333ea00bee0eea51c15eb637054e44afb6309e8ca1d1ae07463dc43e9"
+  },
+  "harness/audio.c": {
+    "bytes": 9645,
+    "sha256": "1ab1ddb7e7b2062764ee7ee4019f50c92c3fcbc4fa6f2e4349771c4cc30a5d1d"
+  },
+  "harness/boot.S": {
+    "bytes": 339,
+    "sha256": "730c1dc6a3962a10dbaa53ed27ff509b983018e20da0ede7894220abb8babb3c"
+  },
+  "harness/build.sh": {
+    "bytes": 1103,
+    "sha256": "0be75a726b9a14c9addf9134dd8d18bbe3900d2865b5a63845fa5ccfc5ae511a"
+  },
+  "harness/harness.h": {
+    "bytes": 285,
+    "sha256": "49cab56c99c15cccdc3e5c8cf0bd86b75658e4b58abeef8ac285de9ea9b1ff19"
+  },
+  "harness/i2c.c": {
+    "bytes": 1558,
+    "sha256": "f8d7c4363b4166319fafe91a08282f178771b73d435578dcc8998b1177fe0273"
+  },
+  "harness/link.ld": {
+    "bytes": 189,
+    "sha256": "b872d86ab391a707dc5f1e6b59f37e0eb1b848f16268fb3521e782ed64ae88a9"
+  },
+  "harness/main.c": {
+    "bytes": 23620,
+    "sha256": "7ca1a43114fdf009f3b861fd47143dbe700a39894c5c0dcb511d00b7322be0fb"
+  },
+  "harness/os.c": {
+    "bytes": 10218,
+    "sha256": "f6f3aa79e113a12e8a5996e198634faf4659df4014b31401c9690cd2ac61fc3b"
+  },
+  "harness/ps2.c": {
+    "bytes": 3412,
+    "sha256": "00ca128ecd57b5ec318abf502a1f3812c955c4ca799e1a8be24ef506aa7879b5"
+  },
+  "harness/smbhar.c": {
+    "bytes": 5110,
+    "sha256": "5af0d6e323baa8509936b488d3caa8b25371c0f8aeaadcbca7801b4e9a079ea3"
+  },
+  "harness/stubhc.c": {
+    "bytes": 695,
+    "sha256": "2c3c0be1d9d93bfa152eae450a94ee5bb1aacaf9c01f3aa476e0767cef78593a"
+  },
+  "harness/video.c": {
+    "bytes": 6903,
+    "sha256": "9aaeb80fcb04d1e87e7e431f32ad06cdc52e27fa6ccef30ab1ba4b214f85c2f0"
+  },
+  "src/MAKEFILE": {
+    "bytes": 267,
+    "sha256": "0350066fc7cd89f3db46317311dec536364555c3d60a9c39226cac5a7e53531e"
+  },
+  "src/SOURCES": {
+    "bytes": 1067,
+    "sha256": "97d1c2565c143c2719be123668735c9f637f2bddb25741bc4408c31789f2e6af"
+  },
+  "src/acpi.c": {
+    "bytes": 4453,
+    "sha256": "46c8e5a8ed8cb93f865e598f7078653ae00393039b81efdcc1b424db1a67fb7c"
+  },
+  "src/acpi.h": {
+    "bytes": 484,
+    "sha256": "1adbbdc21466f039b82ab6562116b690d1e84cc7e9c933e8c1a6bec082b62019"
+  },
+  "src/aml.c": {
+    "bytes": 84301,
+    "sha256": "b3a69c15057cd981126e15971bcae9535969d3cd3e47334b21cd53e2436f9adc"
+  },
+  "src/aml.h": {
+    "bytes": 4762,
+    "sha256": "c67b7c82ce0d860659c9fb3123ac9effa5b79af21490f183db6fb6bf473e4546"
+  },
+  "src/dmapool.c": {
+    "bytes": 2595,
+    "sha256": "6a631f1b2dad16bec113343c26b23af283d8aa42462203d193cf217babeff636"
+  },
+  "src/gpio.c": {
+    "bytes": 12123,
+    "sha256": "735b50838c02a456615be5d6ffad39a5edba1af139c0151a476a035de8237d73"
+  },
+  "src/gpio.h": {
+    "bytes": 1171,
+    "sha256": "8d15affa671dd319ff0b0136c2332c80051689a1582f0d5eee11466fcf261b17"
+  },
+  "src/gpiotab.h": {
+    "bytes": 16907,
+    "sha256": "917a36530c72a3dbd81a31362b45c28fafade2b39bbfef9c373bfad55fc0185c"
+  },
+  "src/hcehci.c": {
+    "bytes": 36724,
+    "sha256": "f87669bda3d5315fb39a3602a811f5143e860f443b80e5b1193bf585671c6df2"
+  },
+  "src/hcohci.c": {
+    "bytes": 29261,
+    "sha256": "9775e2217d54502b277e1635445ee9b4ed3380b43ab2f0bb15b5e611019a6493"
+  },
+  "src/hcuhci.c": {
+    "bytes": 25240,
+    "sha256": "f5c3ca91c3c3b161feb6b3a5daf3d0e00ad4545f88092bcc1bb376cc733070aa"
+  },
+  "src/hcxhci.c": {
+    "bytes": 55934,
+    "sha256": "b31c7ef3ef0ea52c034158688497c2fe8ed8b0a06fc2ab888229e424ee6c6572"
+  },
+  "src/hidparse.c": {
+    "bytes": 20863,
+    "sha256": "edfe1ef71143d6e9c3ede2023707096e1df73941d6f0979a45e6447b11ea8470"
+  },
+  "src/i2chid.c": {
+    "bytes": 58431,
+    "sha256": "8ffbe1085f506ff0c9f540a64b1bbdd1fb9889e13472210846f9eecbe648db0a"
+  },
+  "src/lpssids.h": {
+    "bytes": 3182,
+    "sha256": "f70bdb7f54c277a18810c3a2ceb4835d8a65adf32bf6b4c07c9c9c811fde37f2"
+  },
+  "src/ntaudio.c": {
+    "bytes": 2247,
+    "sha256": "c4f82de9f94ccacae5e0bde5d873558947d9b1e034f2db3d6f859e1c34f11639"
+  },
+  "src/ntcli.c": {
+    "bytes": 15310,
+    "sha256": "05878caf66a99520a780e57d8fd559fbe58419634d38172dc69ade933c454192"
+  },
+  "src/ntdrv.h": {
+    "bytes": 5181,
+    "sha256": "625f49a514d2d7508ebcae053e81e69bd24263e40da34dae48648ca434d2916b"
+  },
+  "src/ntinput.c": {
+    "bytes": 50933,
+    "sha256": "70085044cc93ccb5ac41ec5dfe8b4f9bf110eadaea8465123d59447342ce744f"
+  },
+  "src/ntmain.c": {
+    "bytes": 9445,
+    "sha256": "87072d7449e3c940f49d70cf16df98e3836713cab5c5aa78b22cc768592ef311"
+  },
+  "src/ntos.c": {
+    "bytes": 28545,
+    "sha256": "5772989b536166c4ab352284d01ae4b443bb5860de6e95f9a25477ed8c957a97"
+  },
+  "src/ntps2.c": {
+    "bytes": 23897,
+    "sha256": "ebc205ad52c1c11e33caf1229ab835063082b9e4e9b967646f54e84e83cb53e1"
+  },
+  "src/ntscsi.c": {
+    "bytes": 23926,
+    "sha256": "680967ed011500d95f889f3167ff49afaed82cffba0b40ba99d70ea9814bbaa0"
+  },
+  "src/nvmehp.c": {
+    "bytes": 25825,
+    "sha256": "2e37958b6eb6cc56b0a3d2972c06845f2ae29bec46388eea39b27d1adcf73368"
+  },
+  "src/nvmehp.h": {
+    "bytes": 359,
+    "sha256": "d2256e530ed8d93b5a36f8a8065b1d886314efc5b54cb3265851ba79c5e0d8b3"
+  },
+  "src/pcireloc.c": {
+    "bytes": 23982,
+    "sha256": "b3b022a658948c7df863dbe067634a58ec30be21901178e45d6d9e267bd8e267"
+  },
+  "src/ps2pad.c": {
+    "bytes": 47605,
+    "sha256": "88c22d9be74660ddb6290f796cdae54a99d014057339cc6b0570294c78dd650f"
+  },
+  "src/ps2pad.h": {
+    "bytes": 3144,
+    "sha256": "b9d49f890703bc2d7af900af72a656328244baeae655b5e6d3a956ac4b5f0a1a"
+  },
+  "src/ptp.c": {
+    "bytes": 15374,
+    "sha256": "1c423f4154de99862469518245383030f43f5d38dd88f81ff633f07f7ed0c3ac"
+  },
+  "src/ptp.h": {
+    "bytes": 3908,
+    "sha256": "dc601112d1d39b26618a88afa318f0366bc18218264aa9b17a9fa6fccce3a572"
+  },
+  "src/rtsxpci.c": {
+    "bytes": 86207,
+    "sha256": "7f1cde7bf8c57cb04099b17b6c9a844b5d67ab75e445d9314029ae04bee706ce"
+  },
+  "src/rtsxpreg.h": {
+    "bytes": 34618,
+    "sha256": "52c51944f7da1c5c140d05eaff66bfcc3e2f3561b16830d1c25219e27183c75a"
+  },
+  "src/rtsxusb.c": {
+    "bytes": 31276,
+    "sha256": "454a4e637b947c2b79bb1505865535e0568acdf66751fdaf48df0d97121d0ba0"
+  },
+  "src/sdcard.c": {
+    "bytes": 19248,
+    "sha256": "957587adc1d663faa4495cf8072394a2ed7b0d3dee8c137826eea2cb2b6e866d"
+  },
+  "src/sdcard.h": {
+    "bytes": 3124,
+    "sha256": "9ebd3f914755fcc6ca86c0f4501e540027974c33cb4265aa96c762d901558e70"
+  },
+  "src/sdhci.c": {
+    "bytes": 13540,
+    "sha256": "90761ec496db9ffa39892a4fb9df7f68577f056fad6c31f4725294c1ce510d67"
+  },
+  "src/smbtp.c": {
+    "bytes": 45727,
+    "sha256": "e076c320f8d34884d48e206d45b65eb953eef5bbb48b4225019c3de6084190d7"
+  },
+  "src/smbtp.h": {
+    "bytes": 7514,
+    "sha256": "6b4ee3aba42966db9379c0212e092920506eee2b92839ba8625d53c014a7a066"
+  },
+  "src/smbtpdec.c": {
+    "bytes": 16244,
+    "sha256": "c43ee6b2835e13bd5b45900b1656381e2eb2afff3cd32884fe2601bc093841d1"
+  },
+  "src/smbus.c": {
+    "bytes": 23226,
+    "sha256": "3a2da762641a93fc104d2d7ecb0d9672c2b379c7acc7039a9c80503e320c4d93"
+  },
+  "src/tbt.c": {
+    "bytes": 85225,
+    "sha256": "1a456a94b5527e1531d029b3c8f599c70c1c8311c51cddc18e936f3c5af3f34f"
+  },
+  "src/tbt.h": {
+    "bytes": 748,
+    "sha256": "436405ee346d5006dca3e3fef121da45d67656e1fb99aba7133f2a7710041d63"
+  },
+  "src/usbaudio.c": {
+    "bytes": 72346,
+    "sha256": "f73ee249bdec50ee4a060f80750ba0eb7876b375a105c8a06305b4c4a613d92d"
+  },
+  "src/usbaudio.h": {
+    "bytes": 1599,
+    "sha256": "3e9b6a65ff53b939e80acaaafb06de09087686aa35d54ae3525b9577e864a6d4"
+  },
+  "src/usbblk.h": {
+    "bytes": 1603,
+    "sha256": "8d91f1dc3d6475703ef414311d42df92efa5483eac705aafec0d74dab13cf0e3"
+  },
+  "src/usbcore.c": {
+    "bytes": 74237,
+    "sha256": "db5098287ed8fd4c0ad5677635484caa514873710ddc56c875d3940554764f4b"
+  },
+  "src/usbdi.c": {
+    "bytes": 95802,
+    "sha256": "ec2f787a9b6dd40129d388317da0fbb33de4c87a92e85e299316d29bf8c21c4c"
+  },
+  "src/usbhid.c": {
+    "bytes": 30350,
+    "sha256": "e09e9264cc6659fbd1ca1cc8b94fe843001fe69fe08707d7501eb266debb8bd8"
+  },
+  "src/usbhub.c": {
+    "bytes": 11436,
+    "sha256": "c9fa8748e17acab38b42f62f043e65c9f0f299a5ec639570f182b0c1ed3fb3ff"
+  },
+  "src/usbinput.h": {
+    "bytes": 5669,
+    "sha256": "1964de5128c80be1fdae7e2016af06765046f7030ec8455cbd6dfe8a20cfb1a6"
+  },
+  "src/usbmsc.c": {
+    "bytes": 94968,
+    "sha256": "b746875513be8b1abd9ec24f52e2e538b542109615fd77ea4c194a2c2ca31c88"
+  },
+  "src/usbnt.h": {
+    "bytes": 17496,
+    "sha256": "a84353e227e9cc20a67fd42e1731547f702eafe2ea4fde29178420ef31efacf1"
+  },
+  "src/usbnt.rc": {
+    "bytes": 167,
+    "sha256": "b59feb259fb4e1d1a6cd4a43b129359db4d5fe20bf18e9584d8e65c528694e1d"
+  },
+  "src/usbntaud.h": {
+    "bytes": 6117,
+    "sha256": "d133544f16197031e8605b4789872a904739f5a40777ee2f9ac9708568e0c8ee"
+  },
+  "src/usbntcli.h": {
+    "bytes": 4642,
+    "sha256": "6720fc3729273dae2408dc7ac555069bee86d7c2cbee9fdb66e182be0a2172a6"
+  },
+  "src/usbntioc.h": {
+    "bytes": 12534,
+    "sha256": "9cd978c523f2a234256c3c72ec059519304866e08c6791d350c934595671c41c"
+  },
+  "src/usbntver.h": {
+    "bytes": 224,
+    "sha256": "a272e75e4363c012a2eb4608c45ea7d17a7e257dcac96b69ebbfd37d9d9e9bf2"
+  },
+  "src/usbos.h": {
+    "bytes": 3857,
+    "sha256": "95a7ad13ffbc9200eeb36d7fb65e7504b17a28b1aca5f8b7872991f2701f34f4"
+  },
+  "src/usbscsi.h": {
+    "bytes": 4062,
+    "sha256": "0c1ebc0ba9c334a93550e59e9330c120ce98251247d901b3e065e14297d62c6e"
+  },
+  "src/usbsleep.h": {
+    "bytes": 9011,
+    "sha256": "2f5f67a69439bea91f39750cfb88ce670146c8d5379e8fb4e8b8def541daf27b"
+  },
+  "src/usbutil.c": {
+    "bytes": 5586,
+    "sha256": "0359d9a1ecf56dcd33a51fe240f1da2c37232555ce25d0e38ebe42f1bb15e9f9"
+  },
+  "src/usbvideo.c": {
+    "bytes": 35831,
+    "sha256": "84b8eca241aab7f0578f289eafc3a2d7655f2c3330c0bc97a2efac77dbc7aab7"
+  },
+  "src/usbvideo.h": {
+    "bytes": 755,
+    "sha256": "830ec4344214524d5a32fb3c8686b4cf94ba55f85ae95ebd73b949a6a9a93b5d"
+  },
+  "src/version.rc": {
+    "bytes": 751,
+    "sha256": "4fdd2beb585413e489ac1ed79b8bf62ec3f5aca64321a0e926332987ec7f011f"
+  },
+  "src/wdm.h": {
+    "bytes": 8553,
+    "sha256": "7e5796564ff91ca69577a4af602f5427d8647eac33d5dc002f043ad7ba9008da"
+  },
+  "src/wdmbus.c": {
+    "bytes": 58724,
+    "sha256": "2030af3b266c8b0c7c6a236294ba9b8a6c7f4e381885c0929ba73fa3a16c6470"
+  },
+  "src/wdmflt.c": {
+    "bytes": 16270,
+    "sha256": "b1e20b87fba852f3e77ee0989f3684a20403ea95682cb058e5efba41c340c582"
+  },
+  "src/wdmmain.c": {
+    "bytes": 38745,
+    "sha256": "6e82c7efa947a2665b170c59fe03c00b228ab67369a6942f825b240a96267e0e"
+  },
+  "src/wdmps2.c": {
+    "bytes": 20524,
+    "sha256": "64653bfa01610bcb31c4031b97625e871935b59aae408cce48bed417d876af70"
+  },
+  "src/wdmtree.c": {
+    "bytes": 46838,
+    "sha256": "2902d8065def9c1fdc1d6e40f8b269f060aec5b6682f60f42ea93d1e90c94d5a"
+  },
+  "test/apps/captest.c": {
+    "bytes": 7864,
+    "sha256": "58af92c8a27ebfcf1510f1e9965d2a2fb044e16b3b7ff5249a7baa0499d80a5a"
+  },
+  "test/apps/clicktst.c": {
+    "bytes": 2117,
+    "sha256": "dfa1cd47b7d7bdf900044263bcb8a037b1ace148c9212102dece8c3634295e6a"
+  },
+  "test/apps/fstest.c": {
+    "bytes": 34924,
+    "sha256": "310b22980cad7177aaef199b2a792f03ecaaf6e748ca171c196790880ee83ccc"
+  },
+  "test/apps/inptest.c": {
+    "bytes": 5247,
+    "sha256": "ee2de0807600168a04a3423a4d6197c49c4569e91ce2a5d563b320107c86eda5"
+  },
+  "test/contigpf.py": {
+    "bytes": 2018,
+    "sha256": "b5ce101fdf0d2c3ef485a5b05e1363fe08b78784e946ed5cdfeb87da66235ca3"
+  },
+  "test/ddkgo.bat": {
+    "bytes": 874,
+    "sha256": "ae36d6a23dde83e2af8b41a8f48cfbc7bddcb46b325cb98728972d9e3ded0c37"
+  },
+  "test/host/cam/tavi.c": {
+    "bytes": 1297,
+    "sha256": "15d71128280e18e0bedf4355614ce5d90a2aef77d4a1368046fa41030adbd731"
+  },
+  "test/host/cam/tavi.py": {
+    "bytes": 2727,
+    "sha256": "7a5f1599f214a001ae11675b4c270855348870870c61b66ff6d0c571f26133c2"
+  },
+  "test/host/cam/tjpeg.c": {
+    "bytes": 1462,
+    "sha256": "8f559d7bf5da01c3fc6301591a5d5b4d72c9ad88ce154acb0da4be75e92bb48c"
+  },
+  "test/host/cam/tjpeg.py": {
+    "bytes": 4199,
+    "sha256": "986fb88c06ee3f2ce1fc4adbd4b88be7adc76a86ee41efb1beee3903877b99a4"
+  },
+  "test/host/mkfsimg.sh": {
+    "bytes": 773,
+    "sha256": "e2d5d068c40482605b526dcbb04c2e89c090767b8776066f55e6946240e93399"
+  },
+  "test/host/mkfsimg2.py": {
+    "bytes": 4432,
+    "sha256": "fb4d0cc7783d8fc095d643c2ada804f43637033566ca9b9d06586d14b17f9031"
+  },
+  "test/host/taml.c": {
+    "bytes": 16786,
+    "sha256": "32ac0458880b1ef11184a7e226fedaf6d6a88146d295b7ef18ea6227d68cb20a"
+  },
+  "test/host/tcontrollersleep.c": {
+    "bytes": 10888,
+    "sha256": "c8a2f586c0074fa6d9d749da3023e739f1b087fbe4f175be24246bb589f05ebb"
+  },
+  "test/host/tcontrollersleep.sh": {
+    "bytes": 286,
+    "sha256": "f07f5fbb5050fcabe4b341094bc89ec790dd70d87100c41e170ae97c67529a04"
+  },
+  "test/host/tfsdetect.c": {
+    "bytes": 1902,
+    "sha256": "ff221a0ce5edb23109834471dd337c7bffd06f65e2bdb508a00a833a10694e38"
+  },
+  "test/host/thidcapacity.c": {
+    "bytes": 4218,
+    "sha256": "65fecbc2919176a325884218cb40040b222597e221da0475796e2917e1a0cc04"
+  },
+  "test/host/thidcapacity.sh": {
+    "bytes": 471,
+    "sha256": "93540fe0ea86f17ee38f1b03dc6e0445073402dc240518b5214a7877974bfefe"
+  },
+  "test/host/thidparse.c": {
+    "bytes": 4813,
+    "sha256": "1412a403cfcaf7c6069cd0df91d81b078c2361393b5021ecb08a4c9b1aab4641"
+  },
+  "test/host/thidreset.c": {
+    "bytes": 5977,
+    "sha256": "9a83e6c5379aa220afb55b3f2fbe0de9b3dbf336101121dac96c2dec9d29ca1d"
+  },
+  "test/host/thidreset.sh": {
+    "bytes": 465,
+    "sha256": "a31ce11b39546ab74f498eec8a3bc55273d2562bc0d25041e202794923c1d903"
+  },
+  "test/host/thidrundown.c": {
+    "bytes": 6570,
+    "sha256": "d6efc52d20cb61156d4d7bf833e88704b4248e50b3f0c35409ec1d9e1a761ab6"
+  },
+  "test/host/thidrundown.sh": {
+    "bytes": 423,
+    "sha256": "c05513658bb61fdfd2fba43ca41c6a89418ff9c4f337ed4756f7dc991844cd46"
+  },
+  "test/host/tmscreset.c": {
+    "bytes": 5513,
+    "sha256": "c7f1bf6a7fb5cdf1f75321daeb8afd638071117ee246ff45c31e3a9046c7941d"
+  },
+  "test/host/tmscreset.sh": {
+    "bytes": 373,
+    "sha256": "be96f7a4073a08dec45363b4878dda0e174ad57a35d1dc8ea810307fb84c9926"
+  },
+  "test/host/tmscrundown.c": {
+    "bytes": 6750,
+    "sha256": "15df43f0f53d73e5c6c72b7c9b8263971a7e1bfab8a8caba628ad7025c99437b"
+  },
+  "test/host/tmscrundown.sh": {
+    "bytes": 402,
+    "sha256": "db1fe95aa0cf92f56e7973bf374a35988cd07cc0b88e9d8a828743afa2234ff6"
+  },
+  "test/host/tps2pad.c": {
+    "bytes": 14667,
+    "sha256": "9d64ac3ffd319c584214ef1e209f6fb4ac45893b37b07a37939a65ab0a5d48f0"
+  },
+  "test/host/trtsxreset.py": {
+    "bytes": 5289,
+    "sha256": "628975af7ce10d380510a10ece5f64bee86a1a320a91fa18d8678a55b1974c1d"
+  },
+  "test/host/tselectconfig.py": {
+    "bytes": 4924,
+    "sha256": "5d8fad66abfe7491aaa516107fc273e0d386a8cd5b120119afabb101983f7da3"
+  },
+  "test/host/tsmbtp.c": {
+    "bytes": 13170,
+    "sha256": "73325bd083085ded1153ff2ddccf8de76e42511254c0f1719ce5ac15c85973b2"
+  },
+  "test/host/tsyncrundown.py": {
+    "bytes": 5534,
+    "sha256": "64cd7f6605a972a998f3b32825068172efc91098f970ee7cd11cfd669cda2251"
+  },
+  "test/host/tuacrundown.c": {
+    "bytes": 5635,
+    "sha256": "bb9eb475558acf5c6b9650e520078e98c43323fc62356c6dcd7480db14812186"
+  },
+  "test/host/tuacrundown.sh": {
+    "bytes": 399,
+    "sha256": "25deacd01d7211a01f6971a0603cb86d3b5b8c0cc4c72300ccc16d6b23d0fcb5"
+  },
+  "test/host/tuaopen.c": {
+    "bytes": 6349,
+    "sha256": "b51a971bc92c6c020534c3effb34be821881e79d12b8ecece17a1eb8d540261e"
+  },
+  "test/host/tuaopen.sh": {
+    "bytes": 370,
+    "sha256": "7a40c72ec4fac6ba6e5f608e4d092187826f6d59650a429d3bffae10cc9ceac7"
+  },
+  "test/host/tuvcreset.py": {
+    "bytes": 5041,
+    "sha256": "731ff746e2c375d1ea9682c31d2a880882be9d79aa7a97a3cfe868ba4d31d208"
+  },
+  "test/host/tuvcrundown.c": {
+    "bytes": 4601,
+    "sha256": "a1f836a46f4e8f192c9bad848c7f1c19a8dd03fbca019ee0ee950f7086ce710c"
+  },
+  "test/host/tuvcrundown.sh": {
+    "bytes": 399,
+    "sha256": "0acf5d817c925f47ba501d63230aaf59171491d97e88c8f9d923afc07210142f"
+  },
+  "test/mkimg.py": {
+    "bytes": 1342,
+    "sha256": "5c24ab977e3eb0cdb8bb0f6fd43b16244250e3e3118c684b53edf58f7a46ab86"
+  },
+  "test/mkpart.py": {
+    "bytes": 6459,
+    "sha256": "30349ac9835b34dad84b6a7e481cd09f6df8fd882ca314ec6780e99fb72ab9ac"
+  },
+  "test/ntcam.py": {
+    "bytes": 11720,
+    "sha256": "7f8f06b58453a1831aa4668c881337f49ead236c083735ab45d0e22f8e458aa7"
+  },
+  "test/nthotplug31.py": {
+    "bytes": 5968,
+    "sha256": "992c392d0590f01b00729db0715d24b1b7ac0f7abeceedf4cf3c4ee393b1e77a"
+  },
+  "test/ntinput.py": {
+    "bytes": 11748,
+    "sha256": "7f2d9c16126e595ca81f7b3b1405413dbf1e632330355c81d2b5cc4eb07bcd75"
+  },
+  "test/ntlook.py": {
+    "bytes": 3441,
+    "sha256": "7267d24db329f7fb57ce0ba14e21fd151111d7363dbd7c1459e7ff9ae5175f95"
+  },
+  "test/ntmon.py": {
+    "bytes": 2685,
+    "sha256": "cb7b585d8327c8c0f0adc7263f1c1744f1d58322e967c3e83c83476500b5e038"
+  },
+  "test/ntmouse.py": {
+    "bytes": 14793,
+    "sha256": "0695271f946cef5937009ff764d23bd8eb388516a905fc27c483b115df1878e3"
+  },
+  "test/ntmsc.py": {
+    "bytes": 6511,
+    "sha256": "1c17ba8228e4df9d3ca1881edff01d1b28d911441e3e9583a69ddc375c5308c6"
+  },
+  "test/ntmsclate.py": {
+    "bytes": 2434,
+    "sha256": "68972eaed9e5a2c73b0961859ee9d6c9a7abcc6c4f68575293249497c70ddfba"
+  },
+  "test/ntnvme.py": {
+    "bytes": 14413,
+    "sha256": "76353e42d8f968d9f66375196d01f49d38ea3e3f50d35dd46b148268903e2c2e"
+  },
+  "test/ntpad.py": {
+    "bytes": 8567,
+    "sha256": "820eca6c664f2150201756f47b2f4cae9c74b409290ffdc314c5e183140c9fbd"
+  },
+  "test/ntpart.py": {
+    "bytes": 10940,
+    "sha256": "e2ea242bf6bb04d783268b5898640dc14b04761221c928c40b446d6834193936"
+  },
+  "test/ntsd.py": {
+    "bytes": 9446,
+    "sha256": "db38f4cdafdc199eeb68b838ffcc9a7f0b37fcae9a87b10c0c948322a5d000f1"
+  },
+  "test/ntsetup.py": {
+    "bytes": 4693,
+    "sha256": "ac951cbf6b9002a59a3e37af920ca6e09f4b4c599abc44843f115752d96a3993"
+  },
+  "test/nttree.py": {
+    "bytes": 3917,
+    "sha256": "41fbb03f6c2ac315321bef007c63df03d9046a4f98f16efa5044bfb92f4a2f0f"
+  },
+  "test/ntvm.py": {
+    "bytes": 7336,
+    "sha256": "2b33927798e469ef72b7b8e48c6ecf78260c2c6750cfb9a20c157e54bf027236"
+  },
+  "test/qemu/README.txt": {
+    "bytes": 8144,
+    "sha256": "9dad309e2e55baa5aa2f68e2f6cfd2c36811f3ed77c8966e0d88384c42e8fb27"
+  },
+  "test/qemu/i2c_hid_dev.c": {
+    "bytes": 24521,
+    "sha256": "1730d9c38273b135e3bb95b34ae96a00b3d06ceaf62665fe8ec5e5e6e838465c"
+  },
+  "test/qemu/ps2-kbd-absent.patch": {
+    "bytes": 3082,
+    "sha256": "9c1d70101a7d77c440b5941a870aebd37c6fbf2841d70320dbccf3ca59530db4"
+  },
+  "test/qemu/ps2-mouse-bat.patch": {
+    "bytes": 2716,
+    "sha256": "ecfda4e8b8485f5c536284199a4367fdfb54466e80aa8bf66fe7e9b82ebec32b"
+  },
+  "test/qemu/smbus-touchpad.patch": {
+    "bytes": 27018,
+    "sha256": "1532c5fde39feef4b3570b3adb02f740b8ae8b1d7ae0dc0d1d9fdb0b9eac5938"
+  },
+  "test/qemu/tp-ps2pad.patch": {
+    "bytes": 19874,
+    "sha256": "8f58c031ce78b1f4664e9fa628a1ddada750d640faa0cbabb9af34bbd9c8d9e8"
+  },
+  "test/qemu/usb-audio-test.patch": {
+    "bytes": 41093,
+    "sha256": "d1d8f57ba69936dfc4719123432eb5536b88910913ab0f2293d207d68e889f10"
+  },
+  "test/qemu/usb-uvc-uvc10.patch": {
+    "bytes": 2046,
+    "sha256": "8a5e878e3bbc4c1470773f91235676e40592e51447528b2fe5523ce42854ff17"
+  },
+  "test/qemu/usbnt-qemu-test.patch": {
+    "bytes": 218402,
+    "sha256": "0765f3a19d8d6b4a16bae4e1e6e201950dd25cef991ae05c729cd9f095ce973f"
+  },
+  "test/qharn.py": {
+    "bytes": 4837,
+    "sha256": "586822e091118682a96316f8873302639ec9b3e6a96bb980221acd6650866f29"
+  },
+  "test/runall.sh": {
+    "bytes": 3148,
+    "sha256": "64a22e86af6c52d08851a45c648ba891b27cad11aa50c3e5248962e122c8b205"
+  },
+  "test/tacpitp.py": {
+    "bytes": 6807,
+    "sha256": "d3d92cebf2fdea56b773b6664bec3b8c2bdf000ce7d543105e0ca34cf9934860"
+  },
+  "test/tbasic.py": {
+    "bytes": 1911,
+    "sha256": "b66d9767c7bab18c2173e682be663ecb0182c11c6732a03366a04e3878ced5c3"
+  },
+  "test/tbig.py": {
+    "bytes": 1790,
+    "sha256": "e2da22facbf66ffbe8e019ae2a0333d55a35c078347329640fbbcd37d0dab790"
+  },
+  "test/tcompan.py": {
+    "bytes": 2527,
+    "sha256": "6eb7236f5510f342bb3940b08e3fcf13adb5c6064c6e8102661d357518e6ef48"
+  },
+  "test/tddk.py": {
+    "bytes": 1378,
+    "sha256": "c5fb50f620d01a479dac7bdda70bf2205e52b9e6ca8f175509226b7bb881a6ae"
+  },
+  "test/tgui.py": {
+    "bytes": 3029,
+    "sha256": "168335001dab9c5e645eafb020e6c8e37789bc27c3e26f4eee22c52cdab2ecbc"
+  },
+  "test/thcrestart.py": {
+    "bytes": 1809,
+    "sha256": "b87158efea093c63359dd64150c2c742056e93261b8518b7b875471c3acd7364"
+  },
+  "test/thidreset.py": {
+    "bytes": 3312,
+    "sha256": "d2eb1e94e89f070b24ddea19cacbfded1678965c1210636c03f059ae432a8e95"
+  },
+  "test/thotpci.py": {
+    "bytes": 4217,
+    "sha256": "403a18c2bb0eb6ac61af33dca31d67748da14666587cb711c5d4a986e4c1a0cf"
+  },
+  "test/thotplug.py": {
+    "bytes": 3545,
+    "sha256": "344191359a57edc4c3011897be8410b0acd24f39907e93fdc65b59f46cbb8eba"
+  },
+  "test/ti2c.py": {
+    "bytes": 15938,
+    "sha256": "29e0abfbe9f1c25584bade10b11e4597911609c735f02aea00bb5d361f6a5e76"
+  },
+  "test/tinst.py": {
+    "bytes": 3471,
+    "sha256": "04c4d19dd913bed255ed082a21e6fae891f1415f56eca74a24e3bdd6af662d65"
+  },
+  "test/tmisc.py": {
+    "bytes": 1945,
+    "sha256": "f4630543fdaa7b7d06acd79e0708a86ca4fd960164c4086b674f3128228ce441"
+  },
+  "test/tmixedfixture.py": {
+    "bytes": 1641,
+    "sha256": "ffdea74ac8c32717fabe9e23f7b2ad4a5ca8b1339d3677a6e0cd35c9a78fd402"
+  },
+  "test/tmouse.py": {
+    "bytes": 610,
+    "sha256": "5aebcfe5681b1cd967aa4dfecc575518c2749e3d62151ca232de64046c8baf61"
+  },
+  "test/tmouse5.py": {
+    "bytes": 2414,
+    "sha256": "4566d474796af8555c8648cdcb77fb28b144acd940e6fc7ad7844d25e43fa4eb"
+  },
+  "test/tmscreset.py": {
+    "bytes": 2474,
+    "sha256": "99910709b6bfe68f2fb9f367cbcf3780a802da47cb16c8845147c84f0c8c6d8a"
+  },
+  "test/tnlite.py": {
+    "bytes": 15841,
+    "sha256": "6d4222c8a73e630a740f7552d7aa4672053ffe7cf01e599298f52395180d51c7"
+  },
+  "test/tnt.py": {
+    "bytes": 4551,
+    "sha256": "cfed0d44f8a03a68eacf82edfdea34df03bc97d00f6087ce42c7dffe50bf09f3"
+  },
+  "test/tnvme.py": {
+    "bytes": 5558,
+    "sha256": "b93e4ab8a41b48c7263392a33486712ba126d70df0827f826f2b558ba2e8fda3"
+  },
+  "test/toemboot.py": {
+    "bytes": 21215,
+    "sha256": "d7aabbcf4af1d1a3bde2726d43c33c6612a57d78e0fd26a949443bc89b76c613"
+  },
+  "test/toemfmt.py": {
+    "bytes": 14597,
+    "sha256": "f945f464bb6faf7fcd963f83aefec5ca42756e12c53a7acbacf77521e58e2e5b"
+  },
+  "test/tps2.py": {
+    "bytes": 3215,
+    "sha256": "78407cf0c83fa6638153600975b55200831b32bfe2d7df9f56e0883676690831"
+  },
+  "test/trtsx.py": {
+    "bytes": 4778,
+    "sha256": "290bb9a63e5316c9446aaa7d029a3b3e6c904e9e0d582ca3712a7283fe0956d4"
+  },
+  "test/trtsxreset.py": {
+    "bytes": 2312,
+    "sha256": "f8208339afbc79f9e11a52b678e8effd78d16b872c18ee4193f2442d6645707b"
+  },
+  "test/tsd.py": {
+    "bytes": 4076,
+    "sha256": "7b9003e5458c1ecad12c0b4dfcda53720923c34a440dafcf143b6b12a924188c"
+  },
+  "test/tsmbus.py": {
+    "bytes": 12498,
+    "sha256": "ef14f6bcfb27a1bec3e8149a747f01ba97309742601500c83b21ca9ceb0427f8"
+  },
+  "test/ttbt.py": {
+    "bytes": 14081,
+    "sha256": "a40935a7e5fa7d7cfb6d6113171a3d939b3aa5cabda980e9ba1d1c31d54aa2e2"
+  },
+  "test/ttxtsetup.py": {
+    "bytes": 18206,
+    "sha256": "9cc379cc437876654a343897eacca94e1552053d993d17c21bfe3f38fa62fb75"
+  },
+  "test/tuac.py": {
+    "bytes": 6547,
+    "sha256": "d02c4ccd981bef652542b5c32122d7d39b6a3ffcc30a2f288a7c571c682a261c"
+  },
+  "test/tuacreset.py": {
+    "bytes": 8143,
+    "sha256": "a490743064049721027b46d40768db5cb5953377b5891d56709a17d481c54b93"
+  },
+  "test/tuvc.py": {
+    "bytes": 5024,
+    "sha256": "6fe6edc1449368520f31e57bd585885d2fff370d35b32be1ac07ef2b9e950c80"
+  },
+  "test/tuvcreset.py": {
+    "bytes": 6720,
+    "sha256": "2d60e98f14a06b67a9ee79aab3c504dcc1c928085a812af1e11d3d961f6c71d4"
+  },
+  "test/tyank.py": {
+    "bytes": 2005,
+    "sha256": "ac04237a9d1a6158d28d90d2fc025ab627552178f1e907a9aa0141f3bf9247b3"
+  },
+  "test/vm5.py": {
+    "bytes": 9788,
+    "sha256": "8f158bf0d70c9814deb7318ef64b2fc66b39a0589d1d66eb2f0938e907a9c680"
+  },
+  "test/vmc.sh": {
+    "bytes": 441,
+    "sha256": "c27e55dba438d575db8d346835070a560e4df044acb66653f2e54e30f57443b4"
+  },
+  "test/vmd.py": {
+    "bytes": 1150,
+    "sha256": "a9abf472352f43e68e5b9cfb3ead79b755e0ac1763af3fdd778d165ac73a7033"
+  },
+  "test/w5cam.py": {
+    "bytes": 3018,
+    "sha256": "d304c1a3585828381b56580a4dc1f480319c42f77884cc3bb0e250dfedb6e21e"
+  },
+  "test/w5mouse.py": {
+    "bytes": 9030,
+    "sha256": "ae3440c48d2d26e393167319f85f916e55dea13b9f24de17c4ea0772e8968174"
+  },
+  "test/w5native.py": {
+    "bytes": 8879,
+    "sha256": "fe58bb50919380b2d46b1f9d4cf344dcada96af507ac4e0284a580217bf014f4"
+  },
+  "test/w5pad.py": {
+    "bytes": 5960,
+    "sha256": "d6718b21df3677757605717ae6ea26c1295457831546d69d4f50b1a6ab8532b3"
+  },
+  "test/w5part.py": {
+    "bytes": 20870,
+    "sha256": "57e21200ee7d839be0182ef99bb6ba98f4aa17fa08becc61a7d5977df5700715"
+  },
+  "test/w5tree.py": {
+    "bytes": 9844,
+    "sha256": "9dd72e0ca17f982358159233317c0ce279d6c98b93c208f05063596c2fae0264"
+  },
+  "test/w5usb.py": {
+    "bytes": 6772,
+    "sha256": "e0b0f292b154d666e589aa485a8708bc68551fc6e94cdca351a533570d5c22ea"
+  },
+  "test/w5usbdi.py": {
+    "bytes": 4090,
+    "sha256": "0aec9b77dc153068389271cc4a760c6aa14dd04cb40ec5ddf0375beb5a7fe9e8"
+  },
+  "test/w5wincam.py": {
+    "bytes": 6622,
+    "sha256": "59726651bdf4cbf27e771b6b80a388dcec885ae41a620e120d3e93a8befeb44b"
+  },
+  "tools/avi.c": {
+    "bytes": 5612,
+    "sha256": "a14d8f6c90150d87d2003d843925b54676abcd16093acae7c7e26941cf5f6ec5"
+  },
+  "tools/avi.h": {
+    "bytes": 1809,
+    "sha256": "3aff2fdf90474b6c06fa6621d2e4c1939490c0fbf242ce439eda211484514780"
+  },
+  "tools/devmap.c": {
+    "bytes": 11315,
+    "sha256": "b8543349650262f704056aeb5c9efeb912bf00218643428a2aa9251eefaf8b79"
+  },
+  "tools/devmap.h": {
+    "bytes": 1504,
+    "sha256": "ec18af4f9a22403ba0b072440daf0b59fd27debe71b410b30442d6a502cc0b42"
+  },
+  "tools/fsdetect.c": {
+    "bytes": 16201,
+    "sha256": "b90778f12d92551da0de9fa60c7723a7eb2bbdbcd28c8a85e4143d705e37bdfe"
+  },
+  "tools/fsdetect.h": {
+    "bytes": 1078,
+    "sha256": "c091764de4b66853091d17ca44b349600eb31c36cfc8040a0ab644351f9ab5a4"
+  },
+  "tools/jpegdec.c": {
+    "bytes": 28895,
+    "sha256": "9f7ee610469396a2df8375d3084634102039a01a2ae843d7744fe9904cb9e216"
+  },
+  "tools/jpegdec.h": {
+    "bytes": 1949,
+    "sha256": "138e472e1f49cd6110579bf0b0d7bf103ef3c32f71c31b24a915e9ead18b04b9"
+  },
+  "tools/mktools.bat": {
+    "bytes": 1288,
+    "sha256": "a9b32a6769b020ad5315efded443334b5de00b32e18932f66af99c2f985d9dee"
+  },
+  "tools/pnpeject.c": {
+    "bytes": 4178,
+    "sha256": "0228b5d80a91c42f61cb97a1e9a48aea1f61bb68fa1c805e4b84a9e771bdfd76"
+  },
+  "tools/pnpeject.h": {
+    "bytes": 297,
+    "sha256": "7e7c29eed6e93d8b22ae6769a2468ebd2b9895475dae18319531c48965c744bc"
+  },
+  "tools/pnpinst.c": {
+    "bytes": 48100,
+    "sha256": "93663967bda26517da21efc067cd8a2792cd190dff902b168f0deb17895108d6"
+  },
+  "tools/res/as_all.cur": {
+    "bytes": 326,
+    "sha256": "fbea9b75d688bd5df2b96db4e3a3f925a62209690d00c673652079a35f8caf5c"
+  },
+  "tools/res/as_e.cur": {
+    "bytes": 326,
+    "sha256": "2879f8b87b738dc9178bbbf388837933b03eee60625e49ee11a35c8d81f9d54c"
+  },
+  "tools/res/as_ew.cur": {
+    "bytes": 326,
+    "sha256": "91f9ecf605d1d84796475af32963945cd8b03a64bc80ae5ab51b3afce640c8f4"
+  },
+  "tools/res/as_n.cur": {
+    "bytes": 326,
+    "sha256": "369f6ca65a65753a4797ecc916971baea4cafe45e15a5408cfb5d8af084dd5f4"
+  },
+  "tools/res/as_ne.cur": {
+    "bytes": 326,
+    "sha256": "551ce6431e8997bd03d75d2a0cb0adcf2019cc60618a8afae259d1e61e019567"
+  },
+  "tools/res/as_ns.cur": {
+    "bytes": 326,
+    "sha256": "779b3ec50846d2344b4f72ca295908e9dc4d3a53937ed320a7b82fc0f02de31a"
+  },
+  "tools/res/as_nw.cur": {
+    "bytes": 326,
+    "sha256": "1c53d84920812ef4c22785ae068d48b66381364b00af6a4d5c0f5ee56bfb1d40"
+  },
+  "tools/res/as_s.cur": {
+    "bytes": 326,
+    "sha256": "88434220580cd775134fdd02ca6c677110fbaa5facc4cb3edc548e7a44260eda"
+  },
+  "tools/res/as_se.cur": {
+    "bytes": 326,
+    "sha256": "a30ce3e7af2c1783b9035b91399e13c76e85d0fce69dd9b0e4153ab78fb0a7b0"
+  },
+  "tools/res/as_sw.cur": {
+    "bytes": 326,
+    "sha256": "dd3c2c68c1386fcf6f12536924956bb4ce54c0c864e789d9c80655db1c999ccc"
+  },
+  "tools/res/as_w.cur": {
+    "bytes": 326,
+    "sha256": "959b400a5c01177b45a086c627cfb341c8f78a158c53ea56bcf8472ab9f00fce"
+  },
+  "tools/res/mkicons.py": {
+    "bytes": 24323,
+    "sha256": "ea0e7c19acaf331b8506fa2273698f5da38becb58a3cfda9ea6c77d79a4768d7"
+  },
+  "tools/res/treeicons.bmp": {
+    "bytes": 2422,
+    "sha256": "9e708dc95f0c6319d99ec60066d6e2c84c508fbc494d08c9be9d6e3ed0da8159"
+  },
+  "tools/res/treemask.bmp": {
+    "bytes": 638,
+    "sha256": "aa20de120694856bb1aed1ba5da3afba8a8412b45fb9666797b2b1a265964e8b"
+  },
+  "tools/res/usbcam.ico": {
+    "bytes": 1078,
+    "sha256": "a93ea293b404121b2da1d6928a70670fbc6adc68cf20a81f02deb735a6edf927"
+  },
+  "tools/res/usbcam.rc": {
+    "bytes": 181,
+    "sha256": "372467072054e898b39762b3f0089722e0a4a74849e7492f4e808a82afba6707"
+  },
+  "tools/res/usbeject.ico": {
+    "bytes": 1078,
+    "sha256": "efb3320a6b3526133d1a673b89363b12350165d9d9f3ddea15bd8b58995390d0"
+  },
+  "tools/res/usbeject.rc": {
+    "bytes": 192,
+    "sha256": "c403e809b0796a4172172403d535c39155030d417e3a76b80458d3ab38a24ae9"
+  },
+  "tools/res/usbinst.ico": {
+    "bytes": 1078,
+    "sha256": "da8609bb85dd6fac63802a17aca72498e5af45a26b13709ae8b20b6e8e58d835"
+  },
+  "tools/res/usbinst.rc": {
+    "bytes": 202,
+    "sha256": "2ace4f7e61483b315dfdf9f24093a5277baf7c7585b708199c3d2660738c4a28"
+  },
+  "tools/res/usbinst2.ico": {
+    "bytes": 1078,
+    "sha256": "5bd37d29065e4aad673cd8cf83d914514e779a8c920300a904d950f8fc1ac992"
+  },
+  "tools/res/usbmon.ico": {
+    "bytes": 1078,
+    "sha256": "6a590b553503fe26cbbc171e5dda496e34165fa4ec5a14b53e92ced7b8e06e50"
+  },
+  "tools/res/usbmon.rc": {
+    "bytes": 453,
+    "sha256": "b8820dee22e48ae0d65f6a4fa16553c5b94fc75d5857098a265881c0a16e16ec"
+  },
+  "tools/res/usbntcap.h": {
+    "bytes": 268,
+    "sha256": "9dc6963d8c487e19896bf0208dd3d370cdd8ebf80645933da8f310b850469cc5"
+  },
+  "tools/res/usbntcap.rc": {
+    "bytes": 1636,
+    "sha256": "adaa3aa32116b6497679f59442490ea981db556c903686887cb3485c148b8bfd"
+  },
+  "tools/res/usbtree.ico": {
+    "bytes": 1078,
+    "sha256": "b560f2719ab1a3d4a2b892576e45b46eb661ab8c3e5482b58f8fec916e25f301"
+  },
+  "tools/res/usbtree.rc": {
+    "bytes": 236,
+    "sha256": "2f2f27f2dddcc7db6f4671eeb6e6628231861eb38adb2fd9ae2cfb7d6daa06e0"
+  },
+  "tools/res/wheeltst.ico": {
+    "bytes": 1078,
+    "sha256": "79fa6766e25207c88b2878ebf8ff2f7ed7f196500894415df8aba6f71a9db1ae"
+  },
+  "tools/res/wheeltst.rc": {
+    "bytes": 182,
+    "sha256": "3f74ab03d49979144fb5fa9c028c1692794729b2c260af067e20c36cfe425fb2"
+  },
+  "tools/usbcam.c": {
+    "bytes": 69493,
+    "sha256": "cb72f62e860a14871326c793f7dbe0e995d26a660ac82cf464a337b3e5211359"
+  },
+  "tools/usbeject.c": {
+    "bytes": 10133,
+    "sha256": "a855a6badb3a45c9771e2cbae108b982d7d783e827e0f05d55f8565ac8dd658a"
+  },
+  "tools/usbinst.c": {
+    "bytes": 30966,
+    "sha256": "30f6b31ecf3d3b492998f2b84f2640739a04e1ebdf5513943a3f1dab941edd29"
+  },
+  "tools/usbmon.c": {
+    "bytes": 62683,
+    "sha256": "30d32ad03c958541201c4000b076bb468ea6e126fccc66bec281e7e9829a5afd"
+  },
+  "tools/usbntcap.c": {
+    "bytes": 34512,
+    "sha256": "4623f5b4bb9d426407a1ab9a11b24181764e654621d60087b04d4573bedbae2e"
+  },
+  "tools/usbntcap.def": {
+    "bytes": 43,
+    "sha256": "e413351e3607ff516cba4dcf3ea855cc4c9aaa0b757577cf687beef614e08f46"
+  },
+  "tools/usbtree.c": {
+    "bytes": 45882,
+    "sha256": "cb1f4409373dfb601e2539e58ec2ceb5011e9fffa2a0948d17116d3b01c9e87d"
+  },
+  "tools/wheeltst.c": {
+    "bytes": 8989,
+    "sha256": "210c160258c1af28175e030c1406f716e3e15ecac89c8e14d90da05d4e050c7a"
+  }
+}

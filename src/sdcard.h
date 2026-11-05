@@ -53,6 +53,9 @@ typedef struct _SD_CARD SD_CARD;
 SD_CARD *SdAttach(const char *Name, ULONG Identity, ULONG MaxBlocks, ULONG MaxClock, const SD_HOST_OPS *Ops,
                   void *Ctx);
 void     SdDetach(SD_CARD *Card);
+void     SdBeginReset(SD_CARD *Card);
+int      SdRestoreReset(SD_CARD *Card);
+void     SdEndReset(SD_CARD *Card, int Result);
 /* poll the card detect switch (worker), returns TRUE when a card is present */
 BOOLEAN  SdPoll(SD_CARD *Card);
 /* the host saw an insert/remove interrupt */
@@ -71,5 +74,9 @@ BOOLEAN  UsbPciExt(UCHAR Bus, UCHAR Dev, UCHAR Fn, ULONG Off, ULONG *Val, BOOLEA
 int      RtsxUsbAttach(USB_DEV *Dev, const UCHAR *If, const UCHAR *End);
 void     RtsxUsbDetach(USB_DEV *Dev);
 void     RtsxUsbService(void);
+ULONG    RtsxUsbResetInterfaces(USB_DEV *Dev);
+void     RtsxUsbBeginDeviceReset(USB_DEV *Dev);
+int      RtsxUsbRestoreDevice(USB_DEV *Dev);
+void     RtsxUsbEndDeviceReset(USB_DEV *Dev, int Result);
 
 #endif

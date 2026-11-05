@@ -82,9 +82,15 @@ typedef struct _UVC_DEV {
     const UCHAR *BulkEp;
     /* stream */
     BOOLEAN     Running, Stopping, Gone;
+    BOOLEAN     Resetting, Resume;
+    USBNT_VID_START Request;
+    ULONG       ControlSet;
+    LONG        ControlValue[32];
     USB_PIPE    Pipe;
     UVC_XFER    X[NXFER];
     ULONG       Pending;
+    ULONG       Callbacks;
+    ULONG       Submitting;
     UCHAR      *Frame[3];
     ULONG       FrameAlloc;
     ULONG       Expected;           /* bytes of an uncompressed frame, 0 = any */
@@ -301,21 +307,14 @@ void UvcDetach(USB_DEV *Dev)
     for (i = 0; i < MAX_CAMS; i++) {
         UVC_DEV *u = Cams[i];
         if (u == NULL || u->Dev != Dev) continue;
-        u->Gone = TRUE;
-        OsEventSet(&u->FrameEv);
-        StopNow(u);
         {
             OS_IRQL irql = OsLock();
-            Cams[i] = NULL;
+            u->Gone = TRUE;
+            Cams[i] = NULL;                 /* close reader admission before rundown */
             OsUnlock(irql);
         }
-        {
-            ULONG t0 = OsTimeMs();          /* readers of a frame leave first */
-            while (u->Readers && OsTimeMs() - t0 < 3000) {
-                OsEventSet(&u->FrameEv);
-                OsSleepMs(5);
-            }
-        }
+        OsEventSet(&u->FrameEv);
+        StopNow(u);
         UsbLog(LOG_INFO, "device %u: video camera removed\n", Dev->Index);
         OsFree(u);
     }
@@ -331,6 +330,7 @@ static UVC_DEV *Find(ULONG Id)
 void UvcList(USBNT_CAMERAS *Out)
 {
     int i;
+    OS_IRQL irql = OsLock();
     UsbMemSet(Out, 0, sizeof(*Out));
     Out->Version = USBNT_VIDEO_VERSION;
     for (i = 0; i < MAX_CAMS; i++) {
@@ -339,6 +339,7 @@ void UvcList(USBNT_CAMERAS *Out)
         Out->Cam[Out->Count].Streaming = Cams[i]->Running;
         Out->Count++;
     }
+    OsUnlock(irql);
 }
 
 /* ------------------------------------------------------------------ */
@@ -432,6 +433,9 @@ static void XferDone(USB_XFER *X)
     BOOLEAN again;
     ULONG i;
 
+    irql = OsLock();
+    u->Callbacks++;
+    OsUnlock(irql);
     if (X->Status != USB_ERR_ABORTED && X->Status != USB_ERR_NODEV && !u->Stopping) {
         if (X->Iso != NULL) {
             for (i = 0; i < x->NPkt; i++) {
@@ -451,6 +455,9 @@ static void XferDone(USB_XFER *X)
         u->Retry = 1;                                   /* the worker tries again */
         OsWakeWorker();
     }
+    irql = OsLock();
+    u->Callbacks--;
+    OsUnlock(irql);                         /* last use of the camera */
 }
 
 static int Submit(UVC_XFER *x)
@@ -460,12 +467,17 @@ static int Submit(UVC_XFER *x)
     ULONG i;
     int r;
     irql = OsLock();
+    if (!u->Running || u->Stopping || u->Gone || u->Dev->Gone) {
+        OsUnlock(irql);
+        return USB_ERR_NODEV;
+    }
     if (x->Busy) {                                  /* already queued (worker and completion race) */
         OsUnlock(irql);
         return USB_OK;
     }
     x->Busy = 1;
     u->Pending++;
+    u->Submitting++;
     OsUnlock(irql);
     UsbMemSet(&x->X, 0, sizeof(x->X));
     x->X.Pipe = &u->Pipe;
@@ -496,6 +508,9 @@ static int Submit(UVC_XFER *x)
             UsbLog(LOG_ERR, "video %u: submit failed (%d)\n", u->Dev->Index, r);
         }
     }
+    irql = OsLock();
+    u->Submitting--;
+    OsUnlock(irql);                         /* covers preparation, submit and error logging */
     return r;
 }
 
@@ -512,27 +527,38 @@ static void FreeBuffers(UVC_DEV *u)
     }
 }
 
+/* The worker owns stop/start. Never free a collected callback or frame reader
+   merely because a deadline expired. Submissions must leave before cancellation. */
 static void StopNow(UVC_DEV *u)
 {
-    ULONG t0 = OsTimeMs();
-    if (!u->Running && u->Pipe.Opened == 0) {
-        FreeBuffers(u);
-        return;
-    }
+    OS_IRQL irql;
+    ULONG busy;
+    irql = OsLock();
     u->Stopping = TRUE;
-    UsbCancelPipe(&u->Pipe);
-    while (u->Pending && OsTimeMs() - t0 < 1000) OsSleepMs(5);
-    UsbClosePipe(&u->Pipe);
-    if (!u->Dev->Gone && u->NAlts) UsbSetInterface(u->Dev, u->VsIf, 0);
     u->Running = FALSE;
-    u->Stopping = FALSE;
-    t0 = OsTimeMs();                    /* a reader may be copying the last frame */
-    while (u->Readers && OsTimeMs() - t0 < 2000) {
-        OsEventSet(&u->FrameEv);
-        OsSleepMs(2);
+    OsUnlock(irql);
+    OsEventSet(&u->FrameEv);
+    for (;;) {
+        irql = OsLock();
+        busy = u->Submitting;
+        OsUnlock(irql);
+        if (!busy) break;
+        OsSleepMs(1);
     }
+    UsbClosePipe(&u->Pipe);
+    for (;;) {
+        irql = OsLock();
+        busy = u->Pending + u->Callbacks + u->Readers;
+        OsUnlock(irql);
+        if (!busy) break;
+        OsEventSet(&u->FrameEv);
+        UsbPollAll();
+        OsSleepMs(1);
+    }
+    if (!u->Dev->Gone && u->NAlts) UsbSetInterface(u->Dev, u->VsIf, 0);
     FreeBuffers(u);
     u->Pub.Streaming = 0;
+    /* StartNow reopens admission only after new buffers and pipes are ready. */
 }
 
 static int VsCtl(UVC_DEV *u, UCHAR req, UCHAR cs, UCHAR *buf, USHORT len)
@@ -694,7 +720,11 @@ static int StartNow(UVC_DEV *u, const USBNT_VID_START *In, USBNT_VID_STATUS *Out
     u->Running = TRUE;
     u->Stopping = FALSE;
     u->Pub.Streaming = 1;
-    for (i = 0; i < NXFER && u->X[i].Buf != NULL; i++) Submit(&u->X[i]);
+    for (i = 0; i < NXFER && u->X[i].Buf != NULL; i++) {
+        r = Submit(&u->X[i]);
+        if (r != USB_OK) { StopNow(u); return r; }
+    }
+    u->Request = *In;
     Out->Result = 0;
     Out->FourCC = u->FourCC;
     Out->Width = u->Width;
@@ -708,14 +738,17 @@ static int ControlNow(UVC_DEV *u, USBNT_VID_CONTROL *c)
 {
     UCHAR b[4];
     USHORT len = (USHORT)(c->Selector == USBNT_VCTL_POWERLINE ? 1 : 2);
-    USHORT val = (USHORT)(c->Selector << 8), idx = (USHORT)((u->PuId << 8) | u->VcIf);
+    USHORT val, idx = (USHORT)((u->PuId << 8) | u->VcIf);
     ULONG got = 0;
     int r;
-    if (!u->PuId || !(u->Pub.Controls & (1UL << c->Selector))) return USB_ERR_PARAM;
+    if (c->Selector >= 32 || !u->PuId || !(u->Pub.Controls & (1UL << c->Selector))) return USB_ERR_PARAM;
+    val = (USHORT)(c->Selector << 8);
     if (c->Set) {
         b[0] = (UCHAR)c->Value; b[1] = (UCHAR)(c->Value >> 8);
         r = UsbControl(u->Dev, USB_RT_OUT | USB_RT_CLASS | USB_RT_INTERFACE, SET_CUR, val, idx, len, b, 500, &got);
         if (r != USB_OK) return r;
+        u->ControlSet |= 1UL << c->Selector;
+        u->ControlValue[c->Selector] = c->Value;
     }
 #define RD(req, dst) do { b[0] = b[1] = 0; if (UsbControl(u->Dev, USB_RT_IN | USB_RT_CLASS | USB_RT_INTERFACE, req, val, idx, \
         len, b, 500, &got) == USB_OK) dst = len == 1 ? b[0] : (LONG)(SHORT)(b[0] | (b[1] << 8)); } while (0)
@@ -753,6 +786,10 @@ static int Execute(UVC_REQ *c)
 {
     UVC_DEV *u = Find(c->Id);
     if (u == NULL || u->Gone) return USB_ERR_NODEV;
+    if (u->Resetting) {
+        if (c->Op == 2) { u->Resume = FALSE; return USB_OK; }
+        return USB_ERR_BUSY;
+    }
     switch (c->Op) {
     case 1: return StartNow(u, c->In, c->Out);
     case 2: StopNow(u); return USB_OK;
@@ -790,7 +827,7 @@ void UvcService(void)
     for (i = 0; i < MAX_CAMS; i++) {
         UVC_DEV *u = Cams[i];
         ULONG k;
-        if (u == NULL || !u->Retry || !u->Running || u->Stopping) continue;
+        if (u == NULL || u->Resetting || !u->Retry || !u->Running || u->Stopping) continue;
         u->Retry = 0;
         for (k = 0; k < NXFER; k++) {
             if (u->X[k].Buf != NULL && !u->X[k].Busy && Submit(&u->X[k]) != USB_OK) u->Retry = 1;
@@ -885,6 +922,7 @@ LONG UvcGetFrame(const USBNT_VID_GET *Get, UCHAR *Out, ULONG Size)
     if (Size < sizeof(USBNT_VID_FRAME_HDR)) return USB_ERR_PARAM;
     irql = OsLock();
     u = Find(Get->Id);
+    if (u != NULL && (u->Gone || u->Resetting || u->Stopping || !u->Running)) u = NULL;
     if (u != NULL) u->Readers++;
     OsUnlock(irql);
     if (u == NULL) return USB_ERR_NODEV;
@@ -893,4 +931,78 @@ LONG UvcGetFrame(const USBNT_VID_GET *Get, UCHAR *Out, ULONG Size)
     u->Readers--;
     OsUnlock(irql);
     return r;
+}
+
+/* Shared physical reset: retain camera IDs and the frame sequence, but stop
+   admission/readers before releasing endpoints or replacing frame buffers. */
+ULONG UvcResetInterfaces(USB_DEV *Dev)
+{
+    ULONG mask = 0;
+    int i;
+    for (i = 0; i < MAX_CAMS; i++) {
+        UVC_DEV *u = Cams[i];
+        if (u == NULL || u->Dev != Dev || u->Gone) continue;
+        if (u->VcIf < 32) mask |= 1UL << u->VcIf;
+        if (u->VsIf < 32) mask |= 1UL << u->VsIf;
+    }
+    return mask;
+}
+
+void UvcBeginDeviceReset(USB_DEV *Dev)
+{
+    int i;
+    for (i = 0; i < MAX_CAMS; i++) {
+        UVC_DEV *u = Cams[i];
+        OS_IRQL irql;
+        if (u == NULL || u->Dev != Dev || u->Gone) continue;
+        irql = OsLock();
+        if (!u->Resetting) u->Resume = u->Running;
+        u->Resetting = TRUE;
+        OsUnlock(irql);
+        StopNow(u);
+    }
+}
+
+int UvcRestoreDevice(USB_DEV *Dev)
+{
+    int i, r;
+    ULONG k;
+    for (i = 0; i < MAX_CAMS; i++) {
+        UVC_DEV *u = Cams[i];
+        USBNT_VID_STATUS status;
+        if (u == NULL || u->Dev != Dev) continue;
+        if (u->Gone || Dev->Gone || !u->Resetting) return USB_ERR_NODEV;
+        for (k = 0; k < 32; k++) if (u->ControlSet & (1UL << k)) {
+            USBNT_VID_CONTROL control;
+            UsbMemSet(&control, 0, sizeof(control));
+            control.Id = u->Id;
+            control.Selector = k;
+            control.Set = 1;
+            control.Value = u->ControlValue[k];
+            r = ControlNow(u, &control);
+            if (r != USB_OK) return r;
+        }
+        if (u->Resume) {
+            r = StartNow(u, &u->Request, &status);
+            if (r != USB_OK) return r;
+        }
+    }
+    return USB_OK;
+}
+
+void UvcEndDeviceReset(USB_DEV *Dev, int Result)
+{
+    int i;
+    for (i = 0; i < MAX_CAMS; i++) {
+        UVC_DEV *u = Cams[i];
+        if (u == NULL || u->Dev != Dev) continue;
+        if (Result != USB_OK) StopNow(u);
+        else {
+            OS_IRQL irql = OsLock();
+            u->Resetting = FALSE;
+            u->Resume = FALSE;
+            OsUnlock(irql);
+        }
+    }
+    OsWakeWorker();
 }

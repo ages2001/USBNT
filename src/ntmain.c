@@ -69,6 +69,8 @@ static NTSTATUS NTAPI DispatchInternal(PDEVICE_OBJECT Dev, PIRP Irp)
         return NtInputIoctl(Dev, Irp);
     case EXT_AUDIO:
         return NtAudioInternal(Dev, Irp);
+    case EXT_CLIENT:
+        return NtCliInternal(Dev, Irp);
     default:
         return Complete(Irp, STATUS_INVALID_DEVICE_REQUEST);
     }
@@ -186,6 +188,9 @@ static VOID NTAPI WorkerThread(PVOID Ctx)
         t.HighPart = -1;
         KeWaitForSingleObject(&NtWorkerEvent, Executive, KernelMode, FALSE, &t);
         UsbWorkerIteration();
+#ifndef USB_WDM
+        NtClockCheck();
+#endif
         NtPs2Service();
         NtInputService();
         if (!reported && OsTimeMs() - start > 20000) {
@@ -262,6 +267,7 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT Drv, PUNICODE_STRING RegistryPath)
     if (!OsGetConfig("DisableAudio", 0)) {
         NtAudioCreate(Drv);
     }
+    NtCliCreate(Drv);
 
     if (OsGetConfig("UseInterrupts", 0)) {
         ConnectInterrupts();

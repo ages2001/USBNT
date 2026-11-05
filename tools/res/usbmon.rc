@@ -10,3 +10,8 @@
 109 CURSOR "as_nw.cur"
 110 CURSOR "as_se.cur"
 111 CURSOR "as_sw.cur"
+
+#define USBNT_FILE_TYPE VFT_APP
+#define USBNT_FILE_DESCRIPTION "USBNT input and device monitor"
+#define USBNT_FILE_NAME "usbmon.exe"
+#include "../../src/version.rc"

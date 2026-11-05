@@ -90,6 +90,7 @@ PDRIVER_CANCEL NtSetCancelRoutine(PIRP Irp, PDRIVER_CANCEL Routine);
 #define EXT_MOUSE       3
 #define EXT_CTL         4
 #define EXT_AUDIO       5
+#define EXT_CLIENT      6
 
 typedef struct _NT_EXT {
     ULONG           Kind;
@@ -103,6 +104,7 @@ void    NtReloadConfig(void);
 void    NtKernelInit(PDRIVER_OBJECT Drv);
 PVOID   NtKernelExport(const char *Name);
 PVOID   NtHalExport(const char *Name);
+void    NtClockCheck(void);
 extern  UNICODE_STRING NtRegistryPath;
 extern  KEVENT NtWorkerEvent;
 extern  PKTHREAD NtWorkerThread;
@@ -117,6 +119,8 @@ extern ULONG NtScsiPortNumber;
 /* ntaudio.c */
 NTSTATUS NtAudioCreate(PDRIVER_OBJECT Drv);
 NTSTATUS NtAudioInternal(PDEVICE_OBJECT Dev, PIRP Irp);
+NTSTATUS NtCliCreate(PDRIVER_OBJECT Drv);
+NTSTATUS NtCliInternal(PDEVICE_OBJECT Dev, PIRP Irp);
 
 /* ntinput.c */
 NTSTATUS NtInputCreate(PDRIVER_OBJECT Drv);

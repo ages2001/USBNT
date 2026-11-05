@@ -1,1 +1,6 @@
 1 ICON "usbeject.ico"
+
+#define USBNT_FILE_TYPE VFT_APP
+#define USBNT_FILE_DESCRIPTION "USBNT device eject utility"
+#define USBNT_FILE_NAME "usbeject.exe"
+#include "../../src/version.rc"

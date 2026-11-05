@@ -16,6 +16,9 @@
  */
 
 #include "wdm.h"
+#include "sdcard.h"
+#include "usbvideo.h"
+#include "usbaudio.h"
 #include <usb.h>
 #include <usbioctl.h>
 #include <usbbusif.h>
@@ -67,6 +70,9 @@ struct _UD_FUNC {
     BOOLEAN         Whole;              /* the whole device */
     BOOLEAN         Dead;               /* unplugged (or the port cycled) */
     BOOLEAN         Started;
+    BOOLEAN         Resetting;          /* device-wide queue gate during physical reset */
+    BOOLEAN         ResetFailed;        /* no transfers until a successful reset */
+    BOOLEAN         Suspended;          /* function D3: no new transfers */
     BOOLEAN         GoneReported;       /* the bus relations no longer have it */
     BOOLEAN         NameDone;           /* the device node's name was looked at */
     UCHAR           ChildNames;         /* composite device: times the names of usbccgp's functions were set */
@@ -75,6 +81,7 @@ struct _UD_FUNC {
     UCHAR           Speed;
     PDEVICE_OBJECT  Pdo;
     LONG            Pending;            /* requests not completed */
+    BOOLEAN         Retiring;           /* REMOVE seen; pending work retains function */
     UCHAR           DevDesc[18];
     UCHAR          *Cfg;                /* configuration descriptor as the function sees it */
     ULONG           CfgLen;
@@ -126,6 +133,7 @@ static KSPIN_LOCK UdLock;
 static BOOLEAN UdInit;
 static LIST_ENTRY Cancelled;            /* IRPs the cancel routine finished: the worker completes them */
 static UD_FUNC *Funcs;
+static void ReapRetired(void);
 static UD_EP0 Ep0[USB_MAX_DEVICES];
 static ULONG WinBuild;
 static volatile LONG Kick;              /* the worker has queued work to look at */
@@ -453,6 +461,12 @@ static BOOLEAN StartReq(UD_REQ *r)
     USB_XFER *x = &r->X;
     int st;
 
+    if (f->Resetting) return FALSE;
+    if (f->ResetFailed || f->Suspended) {
+        r->X.Status = USB_ERR_IO;
+        r->OnWire = 2;
+        return TRUE;
+    }
     if (dev == NULL) {
         r->X.Status = USB_ERR_NODEV;
         r->OnWire = 2;
@@ -718,6 +732,19 @@ static NTSTATUS Control(UD_FUNC *F, PIRP Irp, PURB Urb, UCHAR Type, UCHAR Req, U
         Urb->UrbControlTransfer.TransferBufferLength = n;
         return Succeed(Irp, Urb);
     }
+    /* USBNT runs a device in the one configuration it chose (ChooseConfig);
+       a whole-device function sees that one as configuration index 0. */
+    if (F->Whole && In && Type == 0x80 && Req == USB_REQ_GET_DESCRIPTOR && Value == (USB_DT_CONFIG << 8) &&
+        F->Dev->ConfigIndex != 0 && F->Dev->Config != NULL) {
+        UCHAR *dst = ClientBuffer(Buf, Mdl);
+        ULONG n = Len < F->Dev->ConfigLen ? Len : F->Dev->ConfigLen;
+        if (dst == NULL) {
+            return Fail(Irp, Urb, USBD_STATUS_INSUFFICIENT_RESOURCES);
+        }
+        RtlCopyMemory(dst, F->Dev->Config, n);
+        Urb->UrbControlTransfer.TransferBufferLength = n;
+        return Succeed(Irp, Urb);
+    }
     r = NewReq(F, Irp, Urb, 0);
     if (r == NULL) {
         return Fail(Irp, Urb, USBD_STATUS_INSUFFICIENT_RESOURCES);
@@ -943,6 +970,8 @@ typedef struct _UD_JOB {
     PIO_WORKITEM    Wi;
 } UD_JOB;
 
+#define UD_JOB_POWER ((ULONG)-1)
+
 static void SelectConfig(UD_JOB *J)
 {
     UD_FUNC *f = J->F;
@@ -952,6 +981,24 @@ static void SelectConfig(UD_JOB *J)
     UCHAR *end = (UCHAR *)u + u->UrbHeader.Length;
     NTSTATUS st = STATUS_SUCCESS;
 
+    /* Validate every interface before touching hardware or closing current pipes.
+       A composite client must never change a native sibling's alternate setting. */
+    if (u->UrbHeader.Length < FIELD_OFFSET(struct _URB_SELECT_CONFIGURATION, Interface)) goto invalid;
+    if (s->ConfigurationDescriptor != NULL) {
+        UCHAR *cursor = (UCHAR *)&s->Interface;
+        while (cursor < end) {
+            const UCHAR *desc;
+            ULONG base = FIELD_OFFSET(USBD_INTERFACE_INFORMATION, Pipes);
+            if ((ULONG)(end - cursor) < base) goto invalid;
+            info = (PUSBD_INTERFACE_INFORMATION)cursor;
+            if (!info->Length) break;       /* optional terminator */
+            if (info->Length < base || info->Length > (ULONG)(end - cursor) ||
+                info->InterfaceNumber >= 32 || !Owns(f, info->InterfaceNumber)) goto invalid;
+            desc = FindIface(f->Dev, info->InterfaceNumber, info->AlternateSetting);
+            if (desc == NULL || info->Length < base + desc[4] * sizeof(USBD_PIPE_INFORMATION)) goto invalid;
+            cursor += info->Length;
+        }
+    }
     ClosePipes(f, 0xFF);
     if (s->ConfigurationDescriptor == NULL) {
         if (f->Whole) {
@@ -988,6 +1035,10 @@ static void SelectConfig(UD_JOB *J)
     if (!NT_SUCCESS(st)) {
         UsbLog(LOG_ERR, "usbdi: device %u: configuration failed (%x)\n", f->DevIndex, st);
     }
+    return;
+invalid:
+    u->UrbHeader.Status = USBD_STATUS_INAVLID_CONFIGURATION_DESCRIPTOR;
+    J->St = STATUS_INVALID_PARAMETER;
 }
 
 static void SelectIface(UD_JOB *J)
@@ -1037,6 +1088,7 @@ static void PipeRequest(UD_JOB *J)
 {
     UD_PIPE *p = PipeOf(J->F, J->Urb->UrbPipeRequest.PipeHandle);
     USHORT fn = J->Urb->UrbHeader.Function;
+    int status = USB_OK;
 
     if (p == NULL) {
         J->Urb->UrbHeader.Status = USBD_STATUS_INVALID_PIPE_HANDLE;
@@ -1048,36 +1100,155 @@ static void PipeRequest(UD_JOB *J)
     } else {
         AbortPipe(p);
         if (fn != URB_FUNCTION_SYNC_RESET_PIPE && p->Type != USB_EP_ISOCH) {
-            UsbClearHalt(&p->P);            /* clears the halt on the device and the data toggle */
+            status = UsbClearHalt(&p->P); /* device clear and host DATA0 reset */
         } else {
-            UsbResetPipeToggle(&p->P);
+            status = UsbResetPipeToggle(&p->P);
         }
     }
-    J->Urb->UrbHeader.Status = USBD_STATUS_SUCCESS;
-    J->St = STATUS_SUCCESS;
+    J->Urb->UrbHeader.Status = UsbdStatus(status, J->F);
+    J->St = NtStatusOf(J->Urb->UrbHeader.Status);
 }
 
-/* IOCTL_INTERNAL_USB_RESET_PORT: the device is configured again as it was */
+/* Preserve public pipe handles across a real port reset. All functions on a
+ * composite device share the port; gate/drain every one before touching it. */
 static void ResetPort(UD_JOB *J)
 {
-    UD_FUNC *f = J->F;
+    USB_DEV *dev = J->F->Dev;
+    UD_FUNC *f;
+    LIST_ENTRY done;
+    KIRQL irql;
+    int i, r = USB_OK;
+    UCHAR config = dev->ConfigValue;
+
+    /* Native HID/storage/card readers/video/audio participate in rundown/restore. Other classes and
+       hubs must not lose their live endpoint contexts to a shared reset. */
+    if ((dev->NativeIf & ~(HidResetInterfaces(dev) | MscResetInterfaces(dev) | RtsxUsbResetInterfaces(dev) | UvcResetInterfaces(dev) | AudioResetInterfaces(dev))) || dev->IsHub) { J->St = STATUS_NOT_SUPPORTED; return; }
+    if (!CliBeginDeviceReset(dev)) { J->St = STATUS_DEVICE_BUSY; return; }
+    KeAcquireSpinLock(&UdLock, &irql);
+    for (f = Funcs; f != NULL; f = f->Next) {
+        if (f->Dev == dev && !f->Dead) { f->Resetting = TRUE; if (f->Config) config = f->Config; }
+    }
+    KeReleaseSpinLock(&UdLock, irql);
+    HidBeginDeviceReset(dev);
+    MscBeginDeviceReset(dev);
+    RtsxUsbBeginDeviceReset(dev);
+    UvcBeginDeviceReset(dev);
+    AudioBeginDeviceReset(dev);
+    for (f = Funcs; f != NULL; f = f->Next) {
+        if (f->Dev != dev || f->Dead) continue;
+        for (i = 0; i < UD_PIPES; i++) if (f->Pipe[i].Used) {
+            AbortPipe(&f->Pipe[i]);
+            UsbClosePipe(&f->Pipe[i].P);
+        }
+    }
+    InitializeListHead(&done);
+    KeAcquireSpinLock(&UdLock, &irql);
+    while (!IsListEmpty(&Ep0[dev->Index].Wait)) {
+        UD_REQ *request = CONTAINING_RECORD(RemoveHeadList(&Ep0[dev->Index].Wait), UD_REQ, Link);
+        Finish(request, USBD_STATUS_CANCELED, &done);
+    }
+    KeReleaseSpinLock(&UdLock, irql);
+    CompleteList(&done);
+    UsbCancelPipe(&dev->Ep0);
+    r = UsbResetDevice(dev);
+    if (r == USB_OK) r = UsbControl(dev, USB_RT_OUT | USB_RT_STD | USB_RT_DEVICE,
+                                  USB_REQ_SET_CONFIGURATION, config, 0, 0, NULL, 1000, NULL);
+    if (r == USB_OK) r = HidRestoreDevice(dev);
+    if (r == USB_OK) r = MscRestoreDevice(dev);
+    if (r == USB_OK) r = RtsxUsbRestoreDevice(dev);
+    if (r == USB_OK) r = UvcRestoreDevice(dev);
+    if (r == USB_OK) r = AudioRestoreDevice(dev);
+    for (f = Funcs; r == USB_OK && f != NULL; f = f->Next) {
+        if (f->Dev != dev || f->Dead) continue;
+        for (i = 0; r == USB_OK && i < 32; i++) {
+            if (f->Iface[i].F != NULL && f->Iface[i].Alt != 0)
+                r = UsbSetInterface(dev, f->Iface[i].Num, f->Iface[i].Alt);
+        }
+    }
+    for (f = Funcs; r == USB_OK && f != NULL; f = f->Next) {
+        if (f->Dev != dev || f->Dead) continue;
+        for (i = 0; r == USB_OK && i < UD_PIPES; i++) if (f->Pipe[i].Used) {
+            USB_PIPE *pipe = &f->Pipe[i].P;
+            pipe->Toggle = pipe->Halted = 0;
+            pipe->IsoNext = 0;
+            r = dev->Hc->Ops->PipeOpen(pipe);
+            if (r == USB_OK) pipe->Opened = 1;
+            else dev->Hc->Ops->PipeClose(pipe); /* release partial allocation */
+        }
+    }
+    if (r != USB_OK) {
+        for (f = Funcs; f != NULL; f = f->Next) if (f->Dev == dev && !f->Dead)
+            for (i = 0; i < UD_PIPES; i++) if (f->Pipe[i].Used) UsbClosePipe(&f->Pipe[i].P);
+    }
+    AudioEndDeviceReset(dev, r);
+    UvcEndDeviceReset(dev, r);
+    RtsxUsbEndDeviceReset(dev, r);
+    MscEndDeviceReset(dev, r);
+    HidEndDeviceReset(dev, r);
+    KeAcquireSpinLock(&UdLock, &irql);
+    Ep0[dev->Index].Reset = Ep0[dev->Index].Retry = FALSE;
+    for (f = Funcs; f != NULL; f = f->Next) if (f->Dev == dev && !f->Dead) {
+        f->ResetFailed = (BOOLEAN)(r != USB_OK);
+        f->Resetting = FALSE;
+    }
+    Kick = 1;
+    KeReleaseSpinLock(&UdLock, irql);
+    OsWakeWorker();
+    CliEndDeviceReset(dev, r);
+    J->St = NtStatusOf(UsbdStatus(r, J->F));
+}
+
+/* Controller sleep shares these private Windows function/pipe objects. */
+#include "usbsleep.h"
+
+/* Function D3 leaves the shared port powered for other functions. Drain this
+ * function only; preserve endpoint contexts/data toggles for D0. Controller
+ * sleep/re-enumeration belongs to the parent FDO, not to this logical idle. */
+static void SetFunctionPower(UD_JOB *J)
+{
+    UD_FUNC *f = J->F, *sibling;
+    USB_DEV *dev = f->Dev;
+    PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(J->Irp);
+    DEVICE_POWER_STATE state = sp->Parameters.Power.State.DeviceState;
+    LIST_ENTRY done;
+    PLIST_ENTRY link, next;
+    KIRQL irql;
+    BOOLEAN cancelEp0 = FALSE;
     int i;
 
-    for (i = 0; i < UD_PIPES; i++) {
-        if (f->Pipe[i].Used) {
-            AbortPipe(&f->Pipe[i]);
-            UsbResetPipeToggle(&f->Pipe[i].P);
-        }
-    }
-    if (f->Whole && f->Config) {
-        UsbControl(f->Dev, USB_RT_OUT | USB_RT_STD | USB_RT_DEVICE, USB_REQ_SET_CONFIGURATION, f->Config, 0, 0, NULL,
-                   1000, NULL);
-        for (i = 0; i < 32; i++) {
-            if (f->Iface[i].F != NULL && f->Iface[i].Alt != 0) {
-                UsbSetInterface(f->Dev, f->Iface[i].Num, f->Iface[i].Alt);
+    InitializeListHead(&done);
+    KeAcquireSpinLock(&UdLock, &irql);
+    if (state == PowerDeviceD3) {
+        /* Prevent a completed EP0 request from starting a sibling request
+         * between the ownership check and UsbCancelPipe below. */
+        for (sibling = Funcs; sibling != NULL; sibling = sibling->Next)
+            if (sibling->Dev == dev && !sibling->Dead) sibling->Resetting = TRUE;
+        f->Suspended = TRUE;
+        for (link = Ep0[dev->Index].Wait.Flink; link != &Ep0[dev->Index].Wait; link = next) {
+            UD_REQ *r = CONTAINING_RECORD(link, UD_REQ, Link);
+            next = link->Flink;
+            if (r->F == f) {
+                RemoveEntryList(link);
+                Finish(r, USBD_STATUS_CANCELED, &done);
             }
         }
+        cancelEp0 = Ep0[dev->Index].Active != NULL && Ep0[dev->Index].Active->F == f;
+    } else {
+        f->Suspended = FALSE;
     }
+    KeReleaseSpinLock(&UdLock, irql);
+    CompleteList(&done);
+    if (state == PowerDeviceD3) {
+        for (i = 0; i < UD_PIPES; i++) if (f->Pipe[i].Used) AbortPipe(&f->Pipe[i]);
+        if (cancelEp0) UsbCancelPipe(&dev->Ep0);
+        KeAcquireSpinLock(&UdLock, &irql);
+        for (sibling = Funcs; sibling != NULL; sibling = sibling->Next)
+            if (sibling->Dev == dev && !sibling->Dead) sibling->Resetting = FALSE;
+        KeReleaseSpinLock(&UdLock, irql);
+    }
+    Kick = 1;
+    OsWakeWorker();
+    PoSetPowerState(f->Pdo, DevicePowerState, sp->Parameters.Power.State);
     J->St = STATUS_SUCCESS;
 }
 
@@ -1092,8 +1263,27 @@ static void JobW(void *A)
         j->St = STATUS_NO_SUCH_DEVICE;
         return;
     }
+    if (j->F->Dev->Sleeping) {
+        if (j->Urb != NULL) j->Urb->UrbHeader.Status = USBD_STATUS_XACT_ERROR;
+        j->St = STATUS_DEVICE_NOT_READY;
+        return;
+    }
+    if (j->Code == UD_JOB_POWER) {
+        SetFunctionPower(j);
+        return;
+    }
+    if (j->F->Suspended) {
+        if (j->Urb != NULL) j->Urb->UrbHeader.Status = USBD_STATUS_XACT_ERROR;
+        j->St = STATUS_DEVICE_NOT_READY;
+        return;
+    }
     if (j->Code == IOCTL_INTERNAL_USB_RESET_PORT) {
         ResetPort(j);
+        return;
+    }
+    if (j->F->ResetFailed) {
+        j->Urb->UrbHeader.Status = USBD_STATUS_XACT_ERROR;
+        j->St = STATUS_UNSUCCESSFUL;
         return;
     }
     switch (j->Urb->UrbHeader.Function) {
@@ -1117,6 +1307,7 @@ static VOID NTAPI JobWork(PDEVICE_OBJECT Dev, PVOID Ctx)
     (void)Dev;
     WdmRunInWorker(JobW, j);
     j->Irp->IoStatus.Status = j->St;
+    if (j->Code == UD_JOB_POWER) PoStartNextPowerIrp(j->Irp);
     IoCompleteRequest(j->Irp, IO_NO_INCREMENT);
     InterlockedDecrement(&j->F->Pending);
     ExFreePool(j);
@@ -1140,6 +1331,7 @@ static NTSTATUS Job(UD_FUNC *F, PIRP Irp, PURB Urb, ULONG Code)
         }
         WdmRunInWorker(JobW, &jj);
         Irp->IoStatus.Status = jj.St;
+        if (Code == UD_JOB_POWER) PoStartNextPowerIrp(Irp);
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
         return jj.St;
     }
@@ -1149,6 +1341,7 @@ static NTSTATUS Job(UD_FUNC *F, PIRP Irp, PURB Urb, ULONG Code)
             ExFreePool(j);
         }
         Irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+        if (Code == UD_JOB_POWER) PoStartNextPowerIrp(Irp);
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -1762,13 +1955,33 @@ static void PartName(UD_FUNC *F, WCHAR *P, const char *Cls, UCHAR First, UCHAR C
 
 /* the name a device or function of one gets: its product string, else the manufacturer's and what it is,
    else what it is and its ids; a function says which interface(s): "UD-3900 - Audio Control (Interface 0)" */
+/* a few well known USB NICs whose interface is vendor specific, so the
+   class alone does not say "Ethernet"; keep a meaningful name for them */
+static const char *UsbVendorDeviceName(USHORT Vid, USHORT Pid)
+{
+    if (Vid == 0x0BDA) {                /* Realtek USB LAN (RTL8150..8159) */
+        switch (Pid) {
+        case 0x8150: case 0x8151: case 0x8152: case 0x8153: case 0x8154:
+        case 0x8155: case 0x8156: case 0x8157: case 0x8159:
+            return "Realtek USB Ethernet";
+        }
+    }
+    return NULL;
+}
+
 static void FuncName(UD_FUNC *F, WCHAR *P)
 {
     UCHAR c, s, pr;
     const char *cls;
+    const char *known;
 
     ClassOf(F, &c, &s, &pr);
     cls = UsbClassName(c, s, pr);
+    known = UsbVendorDeviceName(GET16(F->DevDesc + 8), GET16(F->DevDesc + 10));
+    if (F->Whole && known != NULL) {
+        WStr(P, known);
+        return;
+    }
     if (F->Whole) {
         if (F->Product[0]) {
             WStr(P, F->Product);
@@ -1977,11 +2190,27 @@ NTSTATUS UsbdiPower(UD_FUNC *F, PIRP Irp)
     PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(Irp);
     NTSTATUS st = Irp->IoStatus.Status;
 
-    (void)F;
     switch (sp->MinorFunction) {
     case IRP_MN_SET_POWER:
     case IRP_MN_QUERY_POWER:
-        st = STATUS_SUCCESS;
+        if (F->Dead || F->Dev == NULL) {
+            st = STATUS_NO_SUCH_DEVICE;
+        } else if (sp->Parameters.Power.Type == DevicePowerState) {
+            DEVICE_POWER_STATE state = sp->Parameters.Power.State.DeviceState;
+            if (state != PowerDeviceD0 && state != PowerDeviceD3) {
+                st = STATUS_NOT_SUPPORTED; /* D1/D2 are not advertised */
+            } else if (sp->MinorFunction == IRP_MN_SET_POWER) {
+                return Job(F, Irp, NULL, UD_JOB_POWER);
+            } else {
+                st = STATUS_SUCCESS;
+            }
+        } else if (sp->Parameters.Power.Type == SystemPowerState &&
+                   sp->Parameters.Power.State.SystemState > PowerSystemUnspecified &&
+                   sp->Parameters.Power.State.SystemState < PowerSystemMaximum) {
+            st = STATUS_SUCCESS; /* parent owns controller system power */
+        } else {
+            st = STATUS_INVALID_PARAMETER;
+        }
         break;
     case IRP_MN_WAIT_WAKE:
         st = STATUS_NOT_SUPPORTED;          /* no remote wake */
@@ -2057,12 +2286,42 @@ void UsbdiInit(void)
     UdInit = TRUE;
 }
 
+/* PnP instance IDs are stable across attachment generations. Do not publish
+ * a replacement while the old PDO with that ID is still being removed. The
+ * worker retries Plan after FreeW unlinks the old function. A new generation
+ * must not race an old miniport's REMOVE/unload in the same BusRelations. */
+static BOOLEAN SameInstance(UD_FUNC *F, USB_DEV *Dev, UCHAR First, BOOLEAN Whole)
+{
+    int i;
+    BOOLEAN oldSerial, newSerial;
+
+    if (F->Whole != Whole || (!Whole && F->First != First) ||
+        GET16(F->DevDesc + 8) != GET16(Dev->DevDesc + 8) ||
+        GET16(F->DevDesc + 10) != GET16(Dev->DevDesc + 10)) return FALSE;
+    oldSerial = (BOOLEAN)(Whole && SerialOk(F->Serial));
+    newSerial = (BOOLEAN)(Whole && SerialOk(Dev->Serial));
+    if (oldSerial != newSerial) return FALSE;
+    if (oldSerial) {
+        for (i = 0; i < (int)sizeof(F->Serial); i++) {
+            UCHAR a = (UCHAR)F->Serial[i], b = (UCHAR)Dev->Serial[i];
+            if (a >= 'a' && a <= 'z') a -= 'a' - 'A';
+            if (b >= 'a' && b <= 'z') b -= 'a' - 'A';
+            if (a != b) return FALSE;
+            if (a == 0) return TRUE;
+        }
+        return FALSE;
+    }
+    return F->HcIndex == Dev->Hc->Index && F->RootPort == Dev->RootPort &&
+           F->Port == Dev->Port && F->Depth == Dev->Depth;
+}
+
 static BOOLEAN Covered(USB_DEV *Dev, UCHAR First, BOOLEAN Whole)
 {
     UD_FUNC *f;
     int i;
 
     for (f = Funcs; f != NULL; f = f->Next) {
+        if (f->Dead && SameInstance(f, Dev, First, Whole)) return TRUE;
         if (!f->Dead && f->Dev == Dev && f->Gen == Dev->Gen && f->Whole == Whole && (Whole || f->First == First)) {
             return TRUE;
         }
@@ -2226,6 +2485,7 @@ BOOLEAN UsbdiService(void)
             }
         }
     }
+    ReapRetired();
     /* the functions usbccgp made of a composite device: names (ChildNames) */
     for (f = Funcs; f != NULL; f = f->Next) {
         if (f->Whole && f->Started && f->Cfg != NULL && f->ChildNames < 2 && Composite(f) &&
@@ -2369,14 +2629,11 @@ BOOLEAN UsbdiWanted(UD_FUNC *F)
     return F != NULL && !F->Dead;
 }
 
-static void FreeW(void *A)
+static void DestroyFunc(UD_FUNC *F)
 {
-    UD_FUNC *F = (UD_FUNC *)A, **pp;
+    UD_FUNC **pp;
     KIRQL irql;
 
-    if (F->Dev != NULL) {
-        ClosePipes(F, 0xFF);
-    }
     KeAcquireSpinLock(&UdLock, &irql);
     for (pp = &Funcs; *pp != NULL; pp = &(*pp)->Next) {
         if (*pp == F) {
@@ -2385,20 +2642,39 @@ static void FreeW(void *A)
         }
     }
     KeReleaseSpinLock(&UdLock, irql);
-    if (F->Cfg != NULL) {
-        ExFreePool(F->Cfg);
-    }
+    if (F->Cfg != NULL) ExFreePool(F->Cfg);
     ExFreePool(F);
 }
 
-/* the PDO is deleted: the function goes (in the worker, which walks the list) */
+/* Completed REMOVE may leave deferred work owning F. Only the USB worker
+   unlinks/frees functions; the final Pending decrement relinquishes F. */
+static void ReapRetired(void)
+{
+    UD_FUNC *f = Funcs;
+    while (f != NULL) {
+        UD_FUNC *next = f->Next;
+        if (f->Retiring && InterlockedCompareExchange(&f->Pending, 0, 0) == 0) DestroyFunc(f);
+        f = next;
+    }
+}
+
+static void FreeW(void *A)
+{
+    UD_FUNC *f = (UD_FUNC *)A;
+
+    f->Dead = TRUE;
+    f->Started = FALSE;
+    if (f->Dev != NULL) ClosePipes(f, 0xFF);
+    f->Dev = NULL;
+    f->Retiring = TRUE;
+    if (InterlockedCompareExchange(&f->Pending, 0, 0) == 0) DestroyFunc(f);
+}
+
+/* The PDO is deleted. Close admission/pipes in the worker; pending work keeps
+   its function allocation until the worker observes final rundown. Never
+   block the worker or free a live function after an arbitrary timeout. */
 void UsbdiFreeFunc(UD_FUNC *F)
 {
-    int t;
-
-    for (t = 0; t < 500 && F->Pending > 0; t++) {
-        OsSleepMs(10);                      /* requests still finishing */
-    }
     WdmRunInWorker(FreeW, F);
 }
 

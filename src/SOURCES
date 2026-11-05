@@ -27,6 +27,7 @@ SOURCES=usbutil.c \
         ntscsi.c \
         ntinput.c \
         ntaudio.c \
+        ntcli.c \
         ntps2.c \
         sdcard.c \
         sdhci.c \
@@ -43,4 +44,5 @@ SOURCES=usbutil.c \
         tbt.c \
         smbus.c \
         smbtp.c \
-        smbtpdec.c
+        smbtpdec.c \
+        usbnt.rc

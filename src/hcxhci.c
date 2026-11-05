@@ -192,6 +192,7 @@ typedef struct _XHC {
     ULONG      *ScratchArr;
     ULONG       ScratchPhys;
     ULONG       ScratchCount;
+    void      **ScratchBuf;    /* virtual addresses for release after halt */
     volatile ULONG CmdBusy;
     ULONG       CmdTrbPhys;
     ULONG       CmdCode;
@@ -199,6 +200,7 @@ typedef struct _XHC {
     OS_EVENT    CmdEvent;
     UCHAR       PortProto[USB_MAX_PORTS + 1];
     UCHAR       SsGbps[16];     /* link rate per protocol speed id */
+    USHORT      HciVersion;     /* HCIVERSION: 0x0096 controllers count the TD size in KB */
     XSLOT      *Slots[XHCI_MAX_SLOTS + 1];
     BOOLEAN     UseIrq;
 } XHC;
@@ -634,6 +636,7 @@ static int XhciStart(USB_HC *Hc)
 
     hcs1 = MmioRd32(x->Cap + XCAP_HCSPARAMS1);
     hcs2 = MmioRd32(x->Cap + XCAP_HCSPARAMS2);
+    x->HciVersion = (USHORT)(MmioRd32(x->Cap) >> 16);
     hcc = MmioRd32(x->Cap + XCAP_HCCPARAMS1);
     if (hcs1 == 0xFFFFFFFF) {
         return USB_ERR_NODEV;
@@ -708,9 +711,12 @@ static int XhciStart(USB_HC *Hc)
         if (x->ScratchArr == NULL) {
             return USB_ERR_NOMEM;
         }
+        x->ScratchBuf = (void **)OsAlloc(x->ScratchCount * sizeof(void *));
+        if (x->ScratchBuf == NULL) return USB_ERR_NOMEM;
         for (i = 0; i < x->ScratchCount; i++) {
             ULONG pp;
-            if (OsDmaAlloc(USB_PAGE_SIZE, &pp) == NULL) {
+            x->ScratchBuf[i] = OsDmaAlloc(USB_PAGE_SIZE, &pp);
+            if (x->ScratchBuf[i] == NULL) {
                 return USB_ERR_NOMEM;
             }
             x->ScratchArr[i * 2] = pp;
@@ -1386,7 +1392,11 @@ static int XhciSubmit(USB_XFER *X)
                 chunk = run;
             }
             after = X->Length - off - chunk;
-            tds = (after + maxp - 1) / maxp;
+            if (x->HciVersion != 0 && x->HciVersion < 0x100) {
+                tds = (X->Length - off) >> 10;          /* xHCI 0.96: bytes left (this TRB too), in KB */
+            } else {
+                tds = (after + maxp - 1) / maxp;        /* xHCI 1.0+: packets left after this TRB */
+            }
             if (tds > 31) {
                 tds = 31;
             }
@@ -1460,6 +1470,12 @@ static void HandleTransferEvent(XHC *x, ULONG *ev)
         r = &ep->Ring;
         pipe = ep->Pipe;
         idx = RingIndex(r, ptr);
+    }
+    /* a short packet reported as success with bytes left: Fresco Logic FL1100 and others
+       (Linux XHCI_TRUST_TX_LENGTH, now the default there); without this a short packet on any
+       but the last TRB of a transfer was never seen and the transfer timed out */
+    if (cc == CC_SUCCESS && resid != 0) {
+        cc = CC_SHORT_PACKET;
     }
     if ((cc == CC_RING_UNDERRUN || cc == CC_RING_OVERRUN) && ep->Pipe != NULL) {
         ep->Pipe->IsoLate = 1;
@@ -1748,6 +1764,32 @@ static int XhciStreamsOpen(USB_PIPE *Pipe, USB_PIPE *Child, int Count)
     return USB_OK;
 }
 
+/* Called only after every device/pipe is detached. Verify that DMA is
+ * halted before returning private allocations; retain them on uncertainty. */
+static int XhciRelease(USB_HC *Hc)
+{
+    XHC *x = XHCP(Hc);
+    ULONG i, size;
+    if (x == NULL) return USB_OK;
+    if (Hc->Running || !(OpRd(x, XOP_USBSTS) & STS_HCH) || OpRd(x, XOP_USBSTS) == 0xFFFFFFFF) return USB_ERR_IO;
+    if (x->CmdBusy) return USB_ERR_BUSY;
+    for (i = 1; i <= XHCI_MAX_SLOTS; i++) if (x->Slots[i] != NULL) return USB_ERR_BUSY;
+    RingFree(&x->Cmd);
+    UsbDmaFree(x->Evt, EVENT_TRBS * 16);
+    UsbDmaFree(x->Erst, 64);
+    UsbDmaFree(x->Dcbaa, 2048);
+    if (x->ScratchBuf != NULL) {
+        for (i = 0; i < x->ScratchCount; i++) if (x->ScratchBuf[i] != NULL) OsDmaFree(x->ScratchBuf[i], USB_PAGE_SIZE);
+        OsFree(x->ScratchBuf);
+    }
+    size = x->ScratchCount * 8;
+    if (size <= USB_PAGE_SIZE) UsbDmaFree(x->ScratchArr, size < 64 ? 64 : size);
+    else if (x->ScratchArr != NULL) OsDmaFree(x->ScratchArr, size);
+    OsFree(x);
+    Hc->Priv = NULL;
+    return USB_OK;
+}
+
 const HCD_OPS XhciOps = {
     "xHCI",
     XhciStart,
@@ -1767,5 +1809,6 @@ const HCD_OPS XhciOps = {
     XhciPipeReset,
     XhciPoll,
     XhciInterrupt,
-    XhciStreamsOpen
+    XhciStreamsOpen,
+    XhciRelease
 };

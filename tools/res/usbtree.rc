@@ -1,3 +1,8 @@
 1 ICON "usbtree.ico"
 100 BITMAP "treeicons.bmp"
 101 BITMAP "treemask.bmp"
+
+#define USBNT_FILE_TYPE VFT_APP
+#define USBNT_FILE_DESCRIPTION "USBNT device tree"
+#define USBNT_FILE_NAME "usbtree.exe"
+#include "../../src/version.rc"

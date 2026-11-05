@@ -8,19 +8,20 @@ mkdir -p $OUT; rm -f $OUT/*.o
 CC=i686-w64-mingw32-gcc
 CF="-c -O2 -march=i486 -mtune=generic -std=gnu89 -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -Wdeclaration-after-statement \
  -fno-builtin -ffreestanding -fno-stack-protector -fno-asynchronous-unwind-tables -mno-stack-arg-probe -mno-sse -mno-mmx \
- -D_X86_=1 -DNDEBUG -I/usr/share/mingw-w64/include/ddk -I$SRC"
+ -D_X86_=1 -DNDEBUG -I${MINGW_DDK_INCLUDE:-/usr/share/mingw-w64/include/ddk} -I$SRC"
 # every parameter the driver reads must be in the registry table of ntos.c
 for n in $(grep -oh 'OsGetConfig("[A-Za-z0-9]*"' $SRC/*.c | sed 's/OsGetConfig("//;s/"//' | sort -u); do
   grep -q "{ \"$n\"," $SRC/ntos.c || { echo "parameter $n is missing in the Config table of ntos.c"; exit 1; }
 done
 OBJS=""
-for f in usbutil dmapool usbcore usbhub usbmsc usbhid hidparse hcxhci hcehci hcuhci hcohci usbaudio ntos ntmain ntscsi ntinput ntaudio ntps2 sdcard sdhci rtsxusb rtsxpci usbvideo i2chid acpi aml gpio ptp ps2pad nvmehp tbt smbus smbtp smbtpdec; do
+for f in usbutil dmapool usbcore usbhub usbmsc usbhid hidparse hcxhci hcehci hcuhci hcohci usbaudio ntos ntmain ntscsi ntinput ntaudio ntcli ntps2 sdcard sdhci rtsxusb rtsxpci usbvideo i2chid acpi aml gpio ptp ps2pad nvmehp tbt smbus smbtp smbtpdec; do
   $CC $CF $SRC/$f.c -o $OUT/$f.o
   OBJS="$OBJS $OUT/$f.o"
 done
-$CC -nostdlib -o $OUT/usbnt.sys $OBJS \
+i686-w64-mingw32-windres -I$SRC -O coff $SRC/usbnt.rc -o $OUT/usbnt.res.o
+$CC -nostdlib -o $OUT/usbnt.sys $OBJS $OUT/usbnt.res.o \
   -Wl,--subsystem,native -Wl,--image-base,0x10000 -Wl,--entry,_DriverEntry@8 \
-  -Wl,--file-alignment,0x200 -Wl,--section-alignment,0x1000 -Wl,--enable-reloc-section \
+  -Wl,--file-alignment,0x1000 -Wl,--section-alignment,0x1000 -Wl,--enable-reloc-section \
   -Wl,--major-subsystem-version,3,--minor-subsystem-version,10 \
   -Wl,--major-os-version,3,--minor-os-version,10 -Wl,--major-image-version,1 \
   -Wl,--no-insert-timestamp -Wl,-s \

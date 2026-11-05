@@ -428,3 +428,16 @@ ULONGLONG OsEntropy(void)
     return ((ULONGLONG)hi << 32) | lo;
 }
 void OsScsiMediaChange(int Slot) { (void)Slot; }
+
+/* The bare-metal controller/class harness has no NT kernel clients. Keep
+ * the core's notification hooks linkable and observable here. Generic
+ * interface lifetime/transfer tests use the production ntcli.c host harness
+ * and actual NT guests; these notifications are not interface coverage. */
+void CliArrival(USB_DEV *Dev)
+{
+    HarnessPrintf("harness: client arrival notification %u\n", Dev->Index);
+}
+void CliDetach(USB_DEV *Dev)
+{
+    HarnessPrintf("harness: client removal notification %u\n", Dev->Index);
+}

@@ -33,3 +33,8 @@ BEGIN
     DEFPUSHBUTTON   "OK", IDOK, 108, 108, 50, 14
     PUSHBUTTON      "Cancel", IDCANCEL, 162, 108, 50, 14
 END
+
+#define USBNT_FILE_TYPE VFT_DLL
+#define USBNT_FILE_DESCRIPTION "USBNT video capture driver"
+#define USBNT_FILE_NAME "usbntcap.dll"
+#include "../../src/version.rc"

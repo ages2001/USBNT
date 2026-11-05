@@ -158,6 +158,19 @@ void UsbPollAll(void)
     RunCompletions(list);
 }
 
+/* The worker has already stopped DMA and closed every endpoint. Serialize
+ * with an in-progress UsbPollAll before releasing private controller memory.
+ * Callers using hardware ISRs must separately disconnect/drain those ISRs. */
+int UsbReleaseController(USB_HC *Hc)
+{
+    OS_IRQL irql = OsLock();
+    BOOLEAN running = (BOOLEAN)(Hc->Running != 0);
+    OsUnlock(irql);
+    if (running) return USB_ERR_BUSY;
+    if (Hc->Ops->Release == NULL) return USB_ERR_PARAM;
+    return Hc->Ops->Release(Hc);
+}
+
 BOOLEAN UsbInterruptAll(void)
 {
     BOOLEAN ours = FALSE;
@@ -247,16 +260,35 @@ void UsbCancelPipe(USB_PIPE *Pipe)
     UsbPollAll();
 }
 
+typedef struct _SYNC_CONTEXT {
+    OS_EVENT *Event;
+    ULONG Done;                         /* guarded by OsLock, final callback access */
+} SYNC_CONTEXT;
+
 static void SyncDone(USB_XFER *Xfer)
 {
-    OsEventSet((OS_EVENT *)Xfer->Context);
+    SYNC_CONTEXT *context = (SYNC_CONTEXT *)Xfer->Context;
+    OS_IRQL irql;
+
+    /* Signaling alone is not rundown: OsEventSet may still access Event after
+       the waiting CPU observes it. Publish Done only after its last access. */
+    OsEventSet(context->Event);
+    irql = OsLock();
+    context->Done = 1;
+    OsUnlock(irql);                      /* no further context/Xfer access */
 }
 
 static int XferSync(USB_XFER *X, ULONG TimeoutMs)
 {
     OS_EVENT *ev = (OS_EVENT *)X->Context;
-    int r;
+    SYNC_CONTEXT context;
+    OS_IRQL irql;
+    ULONG done;
+    int r, timedout = 0;
 
+    context.Event = ev;
+    context.Done = 0;
+    X->Context = &context;
     OsEventReset(ev);
     r = UsbSubmit(X);
     if (r == USB_ERR_BUSY && X->Pipe->Type == USB_EP_CONTROL) {
@@ -268,19 +300,27 @@ static int XferSync(USB_XFER *X, ULONG TimeoutMs)
         }
     }
     if (r != USB_OK) {
+        X->Context = ev;
         return r;
     }
     if (!OsEventWait(ev, TimeoutMs)) {
+        timedout = 1;
         UsbCancelPipe(X->Pipe);
-        OsEventWait(ev, 100);
-        if (X->Busy) {
-            return USB_ERR_TIMEOUT;
-        }
-        if (X->Status == USB_ERR_ABORTED) {
-            return USB_ERR_TIMEOUT;
-        }
     }
-    return X->Status;
+    /* Cancellation can race a completion already collected on another CPU.
+       Busy == 0 does not mean that callback released the stack event or DMA.
+       Keep their owner alive until completion, including after I/O timeout. */
+    for (;;) {
+        irql = OsLock();
+        done = context.Done;
+        OsUnlock(irql);
+        if (done) break;
+        UsbPollAll();
+        OsSleepMs(1);
+    }
+    r = X->Status;
+    X->Context = ev;                    /* reusable control/segmented transfer */
+    return timedout && r == USB_ERR_ABORTED ? USB_ERR_TIMEOUT : r;
 }
 
 /*
@@ -507,8 +547,76 @@ int UsbResetPipeToggle(USB_PIPE *Pipe)
     if (Pipe->Dev->Hc->Ops->PipeReset != NULL) {
         r = Pipe->Dev->Hc->Ops->PipeReset(Pipe);
     }
-    Pipe->Toggle = 0;
-    Pipe->Halted = 0;
+    if (r == USB_OK) {
+        Pipe->Toggle = 0;
+        Pipe->Halted = 0;
+    }
+    return r;
+}
+
+/* Reset the physical USB port and rebuild the controller's default endpoint.
+ * The worker serializes address-zero access. The caller drains every client
+ * and closes all non-control endpoints before entering; it restores the saved
+ * configuration/interfaces and pipes afterwards. No arrival/removal is faked.
+ */
+int UsbResetDevice(USB_DEV *Dev)
+{
+    const HCD_OPS *ops = Dev->Hc->Ops;
+    UCHAR address = Dev->Address, speed = Dev->Speed, descriptor[18];
+    ULONG got = 0;
+    int r;
+
+    if (Dev->Gone || !Dev->Hc->Running || Dev->Hc->Removed) return USB_ERR_NODEV;
+    UsbClosePipe(&Dev->Ep0);
+    if (ops->DevFree != NULL) ops->DevFree(Dev);
+    r = Dev->Parent ? HubResetChild(Dev, &speed) : ops->PortReset(Dev->Hc, Dev->Port, &speed);
+    if (r == USB_PORT_HANDOFF) r = USB_ERR_NODEV;
+    if (r != USB_OK) return r;
+    /* A different speed may need new endpoint/TT descriptors: require PnP. */
+    if (speed != Dev->Speed) return USB_ERR_NODEV;
+    if (!Dev->Parent) ops->PortClearChange(Dev->Hc, Dev->Port);
+    OsSleepMs(20);
+    Dev->Address = 0;
+    Dev->Ep0.Toggle = 0;
+    Dev->Ep0.Halted = 0;
+    Dev->Ep0.Cur = Dev->Ep0.Tail = NULL;
+    Dev->Ep0.HcPriv = NULL;
+    r = ops->DevInit(Dev);
+    if (r != USB_OK) goto fail;
+    r = ops->PipeOpen(&Dev->Ep0);
+    if (r != USB_OK) {
+        ops->PipeClose(&Dev->Ep0);
+        goto fail;
+    }
+    Dev->Ep0.Opened = 1;
+    if (ops->DevSetAddress != NULL) {
+        r = ops->DevSetAddress(Dev);
+    } else {
+        /* Keep the previous address reserved in AddrMap throughout reset. */
+        r = UsbControl(Dev, USB_RT_OUT | USB_RT_STD | USB_RT_DEVICE,
+                       USB_REQ_SET_ADDRESS, address, 0, 0, NULL, 1000, NULL);
+        if (r == USB_OK) {
+            OsSleepMs(10);
+            Dev->Address = address;
+        }
+    }
+    if (r != USB_OK) goto fail;
+    OsSleepMs(2);
+    if (ops->DevUpdate != NULL) {
+        r = ops->DevUpdate(Dev);
+        if (r != USB_OK) goto fail;
+    }
+    r = UsbGetDescriptor(Dev, USB_DT_DEVICE, 0, 0, descriptor, sizeof(descriptor), &got);
+    if (r == USB_OK) {
+        int i;
+        if (got != sizeof(descriptor)) r = USB_ERR_IO;
+        else for (i = 0; i < 18; i++) if (descriptor[i] != Dev->DevDesc[i]) { r = USB_ERR_NODEV; break; }
+    }
+    if (r == USB_OK) return USB_OK;
+fail:
+    UsbClosePipe(&Dev->Ep0);
+    if (ops->DevFree != NULL) ops->DevFree(Dev);
+    if (ops->DevSetAddress == NULL) Dev->Address = address;
     return r;
 }
 
@@ -552,11 +660,13 @@ int UsbClearHalt(USB_PIPE *Pipe)
 {
     int r;
 
-    UsbResetPipeToggle(Pipe);
     r = UsbControl(Pipe->Dev, USB_RT_OUT | USB_RT_STD | USB_RT_ENDPOINT, USB_REQ_CLEAR_FEATURE,
                    USB_FEATURE_ENDPOINT_HALT, (USHORT)(Pipe->Endpoint | (Pipe->DirIn ? 0x80 : 0)),
                    0, NULL, 1000, NULL);
-    return r;
+    /* Synchronize the host DATA0 state only after the device accepted the
+       clear. A failed control/reset must not publish a usable endpoint. */
+    if (r != USB_OK) return r;
+    return UsbResetPipeToggle(Pipe);
 }
 
 /* ------------------------------------------------------------------ */
@@ -629,18 +739,20 @@ void UsbNotifyChange(void)
 }
 
 /* Reads string descriptor Index as ASCII */
-static void ReadString(USB_DEV *Dev, UCHAR Index, USHORT Lang, char *Out, ULONG Size)
+static int ReadString(USB_DEV *Dev, UCHAR Index, USHORT Lang, char *Out, ULONG Size)
 {
     UCHAR buf[128];
     ULONG got = 0;
     ULONG i;
     ULONG n = 0;
 
+    int r;
+
     Out[0] = 0;
-    if (Index == 0 || UsbGetDescriptor(Dev, USB_DT_STRING, Index, Lang, buf, sizeof(buf), &got) != USB_OK ||
-        got < 4) {
-        return;
-    }
+    if (Index == 0) return USB_OK;
+    r = UsbGetDescriptor(Dev, USB_DT_STRING, Index, Lang, buf, sizeof(buf), &got);
+    if (r != USB_OK) return r;
+    if (got < 4 || buf[1] != USB_DT_STRING || buf[0] < 4) return USB_ERR_IO;
     if (got > buf[0]) {
         got = buf[0];
     }
@@ -666,6 +778,7 @@ static void ReadString(USB_DEV *Dev, UCHAR Index, USHORT Lang, char *Out, ULONG 
         n--;
     }
     Out[n] = 0;
+    return USB_OK;
 }
 
 static void ReadStrings(USB_DEV *Dev)
@@ -689,6 +802,37 @@ static void ReadStrings(USB_DEV *Dev)
     ReadString(Dev, Dev->DevDesc[14], lang, Dev->Mfg, sizeof(Dev->Mfg));
     ReadString(Dev, Dev->DevDesc[15], lang, Dev->Product, sizeof(Dev->Product));
     ReadString(Dev, Dev->DevDesc[16], lang, Dev->Serial, sizeof(Dev->Serial));
+}
+
+/* Compare the same normalized strings used to create the existing PDO IDs.
+ * Cached strings are never changed. Transport errors remain retryable. Devices without unique serials remain indistinguishable when all
+ * descriptors match, as with ordinary USB port identity. */
+int UsbCheckDeviceStrings(USB_DEV *Dev)
+{
+    UCHAR langs[32];
+    char text[48];
+    const char *old;
+    ULONG got = 0, i, n;
+    USHORT lang = 0x0409;
+    int r;
+    if (Dev->DevDesc[14] || Dev->DevDesc[15] || Dev->DevDesc[16]) {
+        r = UsbGetDescriptor(Dev, USB_DT_STRING, 0, 0, langs, sizeof(langs), &got);
+        if (r != USB_OK) return r;
+        if (got < 4 || langs[0] < 4 || langs[1] != USB_DT_STRING) return USB_ERR_IO;
+        lang = GET16(langs + 2);
+        for (i = 2; i + 1 < got && i + 1 < langs[0]; i += 2)
+            if (GET16(langs + i) == 0x0409) lang = 0x0409;
+    }
+    for (n = 0; n < 3; n++) {
+        old = n == 0 ? Dev->Mfg : (n == 1 ? Dev->Product : Dev->Serial);
+        r = ReadString(Dev, Dev->DevDesc[14 + n], lang, text, n == 1 ? 48 : 32);
+        if (r != USB_OK) return r;
+        for (i = 0; ; i++) {
+            if (old[i] != text[i]) return USB_ERR_NODEV;
+            if (!text[i]) break;
+        }
+    }
+    return USB_OK;
 }
 
 ULONG UsbPdoMode;
@@ -781,6 +925,86 @@ static void BindInterfaces(USB_DEV *Dev)
     }
 }
 
+/* The whole configuration descriptor at Index (OsAlloc), NULL on failure. */
+static UCHAR *ReadConfig(USB_DEV *Dev, UCHAR Index, USHORT *Len)
+{
+    UCHAR head[9], *cfg;
+    ULONG got = 0;
+    USHORT total;
+
+    if (UsbGetDescriptor(Dev, USB_DT_CONFIG, Index, 0, head, 9, &got) != USB_OK || got < 9 ||
+        head[1] != USB_DT_CONFIG) {
+        return NULL;
+    }
+    total = GET16(head + 2);
+    if (total < 9) {
+        return NULL;
+    }
+    if (total > USB_DEV_DATA_MAX) {
+        total = USB_DEV_DATA_MAX;
+    }
+    cfg = (UCHAR *)OsAlloc(total);
+    if (cfg == NULL) {
+        return NULL;
+    }
+    got = 0;
+    if (UsbGetDescriptor(Dev, USB_DT_CONFIG, Index, 0, cfg, total, &got) != USB_OK || got < 9) {
+        OsFree(cfg);
+        return NULL;
+    }
+    *Len = (USHORT)got;
+    return cfg;
+}
+
+/* bInterfaceClass / bInterfaceSubClass of the first interface, or -1. */
+static int FirstIfClass(const UCHAR *Cfg, USHORT Len, UCHAR *Sub)
+{
+    const UCHAR *d = UsbFindDesc(Cfg, Cfg + Len, USB_DT_INTERFACE);
+    if (d == NULL || d[0] < 9) {
+        return -1;
+    }
+    *Sub = d[6];
+    return d[5];
+}
+
+/* Configuration choice.  USB_CONFIG 0 unless the first configuration is a
+   CDC networking one (ECM 0x06, NCM 0x0D) and a later configuration is
+   vendor specific: no OS path USBNT serves has a CDC networking driver,
+   and the vendor mode of such adapters (Realtek r8152 family and others)
+   is the one the vendor drivers use.  Linux chooses the vendor
+   configuration of these adapters the same way (r8152 cfgselector: "the
+   vendor mode is not always config #1").  UsbVendorConfig = 0 disables. */
+static void ChooseConfig(USB_DEV *Dev)
+{
+    UCHAR n = Dev->DevDesc[17], i, sub = 0;
+    int cls;
+
+    if (n < 2 || Dev->Config == NULL || !OsGetConfig("UsbVendorConfig", 1)) {
+        return;
+    }
+    cls = FirstIfClass(Dev->Config, Dev->ConfigLen, &sub);
+    if (cls != 0x02 || (sub != 0x06 && sub != 0x0D)) {
+        return;
+    }
+    for (i = 1; i < n && i < 8; i++) {
+        USHORT len = 0;
+        UCHAR *cfg = ReadConfig(Dev, i, &len), s2 = 0;
+        if (cfg == NULL) {
+            continue;
+        }
+        if (FirstIfClass(cfg, len, &s2) == 0xFF) {
+            UsbLog(LOG_INFO, "device %u: vendor configuration %u (index %u) instead of CDC %02x\n",
+                   Dev->Index, cfg[5], i, sub);
+            OsFree(Dev->Config);
+            Dev->Config = cfg;
+            Dev->ConfigLen = len;
+            Dev->ConfigIndex = i;
+            return;
+        }
+        OsFree(cfg);
+    }
+}
+
 static int Enumerate(USB_DEV *Dev)
 {
     const HCD_OPS *ops = Dev->Hc->Ops;
@@ -867,6 +1091,7 @@ static int Enumerate(USB_DEV *Dev)
         return (r != USB_OK) ? r : USB_ERR_IO;
     }
 
+    Dev->ConfigIndex = 0;
     r = UsbGetDescriptor(Dev, USB_DT_CONFIG, 0, 0, buf, 9, &got);
     if (r != USB_OK || got < 9) {
         UsbLog(LOG_ERR, "device %u: config descriptor failed (%d)\n", Dev->Index, r);
@@ -888,6 +1113,7 @@ static int Enumerate(USB_DEV *Dev)
         return (r != USB_OK) ? r : USB_ERR_IO;
     }
     Dev->ConfigLen = (USHORT)got;
+    ChooseConfig(Dev);
     Dev->ConfigValue = Dev->Config[5];
 
     r = UsbControl(Dev, USB_RT_OUT | USB_RT_STD | USB_RT_DEVICE, USB_REQ_SET_CONFIGURATION,
@@ -909,6 +1135,7 @@ static int Enumerate(USB_DEV *Dev)
     BindInterfaces(Dev);
     Dev->Gen = ++DevGen;
     Dev->Ready = 1;
+    CliArrival(Dev);                    /* offer the device to generic clients */
     UsbNotifyChange();
     return USB_OK;
 }
@@ -975,6 +1202,7 @@ USB_DEV *UsbDevAttach(USB_HC *Hc, USB_DEV *Parent, int Port, UCHAR Speed)
         MscDetach(d);
         HidDetach(d);
         AudioDetach(d);
+        CliDetach(d);
         DevRelease(d);
         return NULL;
     }
@@ -996,6 +1224,7 @@ void UsbDevDetach(USB_DEV *Dev)
     AudioDetach(Dev);
     HidDetach(Dev);
     MscDetach(Dev);
+    CliDetach(Dev);
     RtsxUsbDetach(Dev);
     UvcDetach(Dev);
     HubDetach(Dev);
@@ -1007,6 +1236,10 @@ void UsbDevDetach(USB_DEV *Dev)
 void UsbPortPoll(USB_HC *Hc)
 {
     int port;
+
+    /* EHCI stop temporarily routes its ports to companions. They must not
+       enumerate a second owner while retained EHCI children are asleep. */
+    if (Hc->Sleeping || (Hc->Ehci != NULL && !Hc->Ehci->Removed && Hc->Ehci->Sleeping)) return;
 
     for (port = 1; port <= Hc->NumPorts; port++) {
         ULONG st = Hc->Ops->PortStatus(Hc, port);
@@ -1068,7 +1301,6 @@ static int NHp;
 void UsbWorkerIteration(void)
 {
     int i;
-
     for (i = 0; i < UsbHcCount; i++) {
         USB_HC *hc = UsbHcs[i];
         if (hc->Running) {
@@ -1223,13 +1455,15 @@ BOOLEAN UsbPciExt(UCHAR Bus, UCHAR Dev, UCHAR Fn, ULONG Off, ULONG *Val, BOOLEAN
     return TRUE;
 }
 
-static USB_HC *AddController(UCHAR Bus, UCHAR Dev, UCHAR Fn, UCHAR ProgIf)
+static USB_HC *AddControllerAt(UCHAR Bus, UCHAR Dev, UCHAR Fn, UCHAR ProgIf, USB_HC *Replace)
 {
     USB_HC *hc;
+    OS_IRQL irql;
     ULONG bar;
     ULONG cmd;
 
-    if (UsbHcCount >= USB_MAX_HC) {
+    if ((Replace == NULL && UsbHcCount >= USB_MAX_HC) ||
+        (Replace != NULL && (Replace->Index >= UsbHcCount || UsbHcs[Replace->Index] != Replace))) {
         return NULL;
     }
     hc = (USB_HC *)OsAlloc(sizeof(USB_HC));
@@ -1239,7 +1473,7 @@ static USB_HC *AddController(UCHAR Bus, UCHAR Dev, UCHAR Fn, UCHAR ProgIf)
     hc->Bus = Bus;
     hc->Dev = Dev;
     hc->Fn = Fn;
-    hc->Index = (UCHAR)UsbHcCount;
+    hc->Index = Replace != NULL ? Replace->Index : (UCHAR)UsbHcCount;
     hc->VendorId = (USHORT)OsPciRead(Bus, Dev, Fn, 0, 2);
     hc->DeviceId = (USHORT)OsPciRead(Bus, Dev, Fn, 2, 2);
     hc->IrqLine = (UCHAR)OsPciRead(Bus, Dev, Fn, 0x3C, 1);
@@ -1292,11 +1526,23 @@ static USB_HC *AddController(UCHAR Bus, UCHAR Dev, UCHAR Fn, UCHAR ProgIf)
     cmd &= ~0x0400UL;
     OsPciWrite(Bus, Dev, Fn, 4, cmd, 2);
 
-    UsbHcs[UsbHcCount++] = hc;
+    /* Publish under the polling lock: no poll can retain the old table
+       entry when the PnP caller subsequently frees it. */
+    irql = OsLock();
+    UsbHcs[hc->Index] = hc;
+    if (Replace == NULL) UsbHcCount++;
+    OsUnlock(irql);
     UsbLog(LOG_INFO, "found %s at %02x:%02x.%u (%04x:%04x) irq %u %s %08x\n",
            hc->Ops->Name, Bus, Dev, Fn, hc->VendorId, hc->DeviceId, hc->IrqLine,
            hc->Type == HC_UHCI ? "io" : "mem", hc->Type == HC_UHCI ? hc->IoBase : hc->MmioPhys);
     return hc;
+}
+
+/* Discovery adds a slot; PnP replacement reuses its stopped slot even when
+ * the table is full. A failed allocation leaves the old entry available. */
+static USB_HC *AddController(UCHAR Bus, UCHAR Dev, UCHAR Fn, UCHAR ProgIf)
+{
+    return AddControllerAt(Bus, Dev, Fn, ProgIf, NULL);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1893,16 +2139,15 @@ int UsbPnpStart(UCHAR Bus, UCHAR Dev, UCHAR Fn)
             IntelRouteToXhci(Bus, Dev, Fn);
         }
         old = FindHc(Bus, Dev, Fn, FALSE);
-        hc = AddController(Bus, Dev, Fn, pi);
+        if (old != NULL) {
+            for (i = 1; i <= old->NumPorts; i++) if (old->RootDev[i] != NULL) return USB_ERR_BUSY;
+            if (old->Ops->Release == NULL) return USB_ERR_IO;
+            r = UsbReleaseController(old);
+            if (r != USB_OK) return r;
+        }
+        hc = AddControllerAt(Bus, Dev, Fn, pi, old);
         if (hc == NULL) {
             return USB_ERR_NOMEM;
-        }
-        if (old != NULL) {
-            /* started again (resume, rebalance): the new one takes the old place in the list */
-            UsbHcs[old->Index] = hc;
-            hc->Index = old->Index;
-            UsbHcCount--;
-            OsFree(old);
         }
         /* companions and their EHCI find each other whatever comes first */
         for (i = 0; i < UsbHcCount; i++) {
@@ -1915,6 +2160,12 @@ int UsbPnpStart(UCHAR Bus, UCHAR Dev, UCHAR Fn)
             } else if (c->Type == HC_EHCI && (hc->Type == HC_UHCI || hc->Type == HC_OHCI)) {
                 hc->Ehci = c;
             }
+        }
+        /* Companion pointers now refer to the replacement, so no controller
+         * retains the old allocation when it is released. */
+        if (old != NULL) {
+            if (old->Mmio != NULL) OsUnmapMmio(old->Mmio, old->MmioLen);
+            OsFree(old);
         }
         r = hc->Ops->Start(hc);
         if (r != USB_OK) {
